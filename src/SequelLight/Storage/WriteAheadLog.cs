@@ -5,9 +5,6 @@ using System.IO.Pipelines;
 
 namespace SequelLight.Storage;
 
-/// <summary>
-/// WAL entry types written to disk.
-/// </summary>
 public enum WalEntryType : byte
 {
     Put = 1,
@@ -15,7 +12,7 @@ public enum WalEntryType : byte
 }
 
 /// <summary>
-/// Write-Ahead Log for crash recovery. Entries are length-prefixed with a simple checksum.
+/// Write-Ahead Log for crash recovery. Entries are length-prefixed with a CRC32 checksum.
 ///
 /// Format per entry:
 ///   [4 bytes: total entry length (excluding this field)]
@@ -25,6 +22,9 @@ public enum WalEntryType : byte
 ///   [4 bytes: value length] (only for Put)
 ///   [M bytes: value]        (only for Put)
 ///   [4 bytes: CRC32 checksum of all preceding bytes in this entry]
+///
+/// Append methods write into the PipeWriter buffer without flushing.
+/// The caller must call <see cref="FlushAsync"/> to persist a batch.
 /// </summary>
 public sealed class WriteAheadLog : IAsyncDisposable
 {
@@ -57,16 +57,18 @@ public sealed class WriteAheadLog : IAsyncDisposable
         return new WriteAheadLog(filePath, stream);
     }
 
-    public async ValueTask AppendPutAsync(byte[] key, byte[] value)
+    /// <summary>
+    /// Writes a Put entry into the internal buffer. Does not flush.
+    /// </summary>
+    public void AppendPut(byte[] key, byte[] value)
     {
-        // entry body: type(1) + keyLen(4) + key(N) + valueLen(4) + value(M)
         int bodyLen = 1 + 4 + key.Length + 4 + value.Length;
-        int totalLen = 4 + bodyLen + 4; // length prefix + body + crc
+        int totalLen = 4 + bodyLen + 4;
 
         var span = _writer.GetSpan(totalLen);
         int offset = 0;
 
-        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], bodyLen + 4); // include crc in length
+        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], bodyLen + 4);
         offset += 4;
 
         int crcStart = offset;
@@ -82,15 +84,16 @@ public sealed class WriteAheadLog : IAsyncDisposable
         value.CopyTo(span[offset..]);
         offset += value.Length;
 
-        uint crc = Crc32C(span[crcStart..offset]);
+        uint crc = Crc32.HashToUInt32(span[crcStart..offset]);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
-        offset += 4;
 
         _writer.Advance(totalLen);
-        var result = await _writer.FlushAsync().ConfigureAwait(false);
     }
 
-    public async ValueTask AppendDeleteAsync(byte[] key)
+    /// <summary>
+    /// Writes a Delete entry into the internal buffer. Does not flush.
+    /// </summary>
+    public void AppendDelete(byte[] key)
     {
         int bodyLen = 1 + 4 + key.Length;
         int totalLen = 4 + bodyLen + 4;
@@ -109,14 +112,15 @@ public sealed class WriteAheadLog : IAsyncDisposable
         key.CopyTo(span[offset..]);
         offset += key.Length;
 
-        uint crc = Crc32C(span[crcStart..offset]);
+        uint crc = Crc32.HashToUInt32(span[crcStart..offset]);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
-        offset += 4;
 
         _writer.Advance(totalLen);
-        await _writer.FlushAsync().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Flushes all buffered entries to the underlying stream and syncs to disk.
+    /// </summary>
     public async ValueTask FlushAsync()
     {
         await _writer.FlushAsync().ConfigureAwait(false);
@@ -174,21 +178,17 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
         if (entryLen <= 0 || buffer.Length < 4 + entryLen) return false;
 
-        // Read the full entry (excluding the 4-byte length prefix)
         var entryBytes = ArrayPool<byte>.Shared.Rent(entryLen);
         try
         {
             buffer.Slice(4, entryLen).CopyTo(entryBytes);
             var span = entryBytes.AsSpan(0, entryLen);
 
-            int bodyLen = entryLen - 4; // body is everything except trailing CRC
+            int bodyLen = entryLen - 4;
             uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(span[bodyLen..]);
-            uint computedCrc = Crc32C(span[..bodyLen]);
+            uint computedCrc = Crc32.HashToUInt32(span[..bodyLen]);
             if (storedCrc != computedCrc)
-            {
-                // Corrupt entry — stop replay
                 return false;
-            }
 
             int offset = 0;
             entryType = (WalEntryType)span[offset++];
@@ -212,9 +212,6 @@ public sealed class WriteAheadLog : IAsyncDisposable
             ArrayPool<byte>.Shared.Return(entryBytes);
         }
     }
-
-    private static uint Crc32C(ReadOnlySpan<byte> data) =>
-        System.IO.Hashing.Crc32.HashToUInt32(data);
 
     public async ValueTask DisposeAsync()
     {

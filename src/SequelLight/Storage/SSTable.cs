@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using Microsoft.Win32.SafeHandles;
 
 namespace SequelLight.Storage;
 
@@ -49,7 +50,7 @@ public sealed class SSTableWriter : IAsyncDisposable
         _stream = stream;
         _targetBlockSize = targetBlockSize;
         _pool = pool;
-        _blockBuffer = pool.Rent(targetBlockSize * 2); // extra room for overflow
+        _blockBuffer = pool.Rent(targetBlockSize * 2);
         _blockStartPos = 0;
     }
 
@@ -65,7 +66,6 @@ public sealed class SSTableWriter : IAsyncDisposable
         if (_blockFirstKey is null)
             _blockFirstKey = key;
 
-        // Determine prefix compression
         int shared = 0;
         if (_entryCount % PrefixResetInterval != 0)
             shared = KeyComparer.CommonPrefixLength(key, _prevKey);
@@ -74,11 +74,9 @@ public sealed class SSTableWriter : IAsyncDisposable
         int valueLen = value?.Length ?? 0;
         int entrySize = 2 + 2 + suffixLen + 4 + (value is null ? 0 : valueLen);
 
-        // Check if we need to flush the current block
         if (_blockOffset > 0 && _blockOffset + entrySize > _targetBlockSize)
         {
             await FlushBlockAsync().ConfigureAwait(false);
-            // Reset for new block — this key starts a new block, no prefix sharing
             _blockFirstKey = key;
             shared = 0;
             suffixLen = key.Length;
@@ -114,45 +112,47 @@ public sealed class SSTableWriter : IAsyncDisposable
 
     public async ValueTask FinishAsync()
     {
-        // Flush any remaining data block
         if (_blockOffset > 0)
             await FlushBlockAsync().ConfigureAwait(false);
 
-        // Write index block
+        // Compute total index block size
         long indexOffset = _stream.Position;
         int indexCount = _index.Count;
-
-        var pool = ArrayPool<byte>.Shared;
+        int indexSize = 0;
         foreach (var entry in _index)
+            indexSize += 4 + entry.FirstKey.Length + 8 + 4;
+
+        int totalSize = indexSize + 16; // index + footer
+        var buf = ArrayPool<byte>.Shared.Rent(totalSize);
+        try
         {
-            int indexEntrySize = 4 + entry.FirstKey.Length + 8 + 4;
-            var buf = pool.Rent(indexEntrySize);
-            try
+            int off = 0;
+            foreach (var entry in _index)
             {
-                var span = buf.AsSpan(0, indexEntrySize);
-                int off = 0;
-                BinaryPrimitives.WriteInt32LittleEndian(span[off..], entry.FirstKey.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), entry.FirstKey.Length);
                 off += 4;
-                entry.FirstKey.CopyTo(span[off..]);
+                entry.FirstKey.CopyTo(buf.AsSpan(off));
                 off += entry.FirstKey.Length;
-                BinaryPrimitives.WriteInt64LittleEndian(span[off..], entry.Offset);
+                BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off), entry.Offset);
                 off += 8;
-                BinaryPrimitives.WriteInt32LittleEndian(span[off..], entry.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), entry.Length);
+                off += 4;
+            }
 
-                await _stream.WriteAsync(buf.AsMemory(0, indexEntrySize)).ConfigureAwait(false);
-            }
-            finally
-            {
-                pool.Return(buf);
-            }
+            // Footer
+            BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off), indexOffset);
+            off += 8;
+            BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), indexCount);
+            off += 4;
+            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off), Magic);
+            off += 4;
+
+            await _stream.WriteAsync(buf.AsMemory(0, totalSize)).ConfigureAwait(false);
         }
-
-        // Write footer: index_offset(8) + index_count(4) + magic(4)
-        Span<byte> footer = stackalloc byte[16];
-        BinaryPrimitives.WriteInt64LittleEndian(footer, indexOffset);
-        BinaryPrimitives.WriteInt32LittleEndian(footer[8..], indexCount);
-        BinaryPrimitives.WriteUInt32LittleEndian(footer[12..], Magic);
-        await _stream.WriteAsync(footer.ToArray().AsMemory()).ConfigureAwait(false);
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
 
         await _stream.FlushAsync().ConfigureAwait(false);
     }
@@ -202,41 +202,44 @@ public sealed class SSTableWriter : IAsyncDisposable
 }
 
 /// <summary>
-/// Reads an SSTable file. Supports point lookups and full scans.
+/// Reads an SSTable file. Uses SafeFileHandle + RandomAccess for thread-safe
+/// concurrent reads (no seeking required). Safe to cache and share across transactions.
 /// </summary>
 public sealed class SSTableReader : IAsyncDisposable
 {
     private const uint Magic = 0x53535401;
-    private readonly FileStream _stream;
-    private readonly MemoryPool<byte> _pool;
+    private readonly SafeFileHandle _handle;
     private IndexEntry[] _index = Array.Empty<IndexEntry>();
     private readonly string _filePath;
 
-    private SSTableReader(string filePath, FileStream stream, MemoryPool<byte> pool)
+    public byte[] MinKey { get; private set; } = Array.Empty<byte>();
+    public byte[] MaxKey { get; private set; } = Array.Empty<byte>();
+
+    private SSTableReader(string filePath, SafeFileHandle handle)
     {
         _filePath = filePath;
-        _stream = stream;
-        _pool = pool;
+        _handle = handle;
     }
 
     public string FilePath => _filePath;
     public int BlockCount => _index.Length;
 
-    public static async ValueTask<SSTableReader> OpenAsync(string filePath, MemoryPool<byte>? pool = null)
+    public static async ValueTask<SSTableReader> OpenAsync(string filePath)
     {
-        var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: 4096, useAsync: true);
-        var reader = new SSTableReader(filePath, stream, pool ?? MemoryPool<byte>.Shared);
+        var handle = File.OpenHandle(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            FileOptions.Asynchronous);
+        var reader = new SSTableReader(filePath, handle);
         await reader.ReadFooterAndIndexAsync().ConfigureAwait(false);
         return reader;
     }
 
     private async ValueTask ReadFooterAndIndexAsync()
     {
+        long fileLength = RandomAccess.GetLength(_handle);
+
         // Read footer (last 16 bytes)
-        _stream.Seek(-16, SeekOrigin.End);
         var footerBuf = new byte[16];
-        await _stream.ReadExactlyAsync(footerBuf).ConfigureAwait(false);
+        await RandomAccess.ReadAsync(_handle, footerBuf, fileLength - 16).ConfigureAwait(false);
 
         long indexOffset = BinaryPrimitives.ReadInt64LittleEndian(footerBuf);
         int indexCount = BinaryPrimitives.ReadInt32LittleEndian(footerBuf.AsSpan(8));
@@ -245,65 +248,209 @@ public sealed class SSTableReader : IAsyncDisposable
         if (magic != Magic)
             throw new InvalidDataException("Invalid SSTable file: bad magic number");
 
-        // Read index block
-        _stream.Seek(indexOffset, SeekOrigin.Begin);
-        _index = new IndexEntry[indexCount];
-
-        var headerBuf = new byte[16]; // reuse for reading fixed-size fields
-        for (int i = 0; i < indexCount; i++)
+        // Read entire index block in a single I/O
+        int indexBlockLen = (int)(fileLength - 16 - indexOffset);
+        var indexBuf = ArrayPool<byte>.Shared.Rent(indexBlockLen);
+        try
         {
-            await _stream.ReadExactlyAsync(headerBuf.AsMemory(0, 4)).ConfigureAwait(false);
-            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(headerBuf);
+            await RandomAccess.ReadAsync(_handle, indexBuf.AsMemory(0, indexBlockLen), indexOffset).ConfigureAwait(false);
+            _index = new IndexEntry[indexCount];
+            int off = 0;
 
-            var key = new byte[keyLen];
-            await _stream.ReadExactlyAsync(key).ConfigureAwait(false);
+            for (int i = 0; i < indexCount; i++)
+            {
+                int keyLen = BinaryPrimitives.ReadInt32LittleEndian(indexBuf.AsSpan(off));
+                off += 4;
+                var key = indexBuf.AsSpan(off, keyLen).ToArray();
+                off += keyLen;
+                long offset = BinaryPrimitives.ReadInt64LittleEndian(indexBuf.AsSpan(off));
+                off += 8;
+                int length = BinaryPrimitives.ReadInt32LittleEndian(indexBuf.AsSpan(off));
+                off += 4;
+                _index[i] = new IndexEntry(key, offset, length);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(indexBuf);
+        }
 
-            await _stream.ReadExactlyAsync(headerBuf.AsMemory(0, 12)).ConfigureAwait(false);
-            long offset = BinaryPrimitives.ReadInt64LittleEndian(headerBuf);
-            int length = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(8));
+        // MinKey = first key of first block
+        MinKey = _index[0].FirstKey;
+        // MaxKey = last key in the last block
+        MaxKey = await ReadLastKeyInBlockAsync(_index.Length - 1).ConfigureAwait(false);
+    }
 
-            _index[i] = new IndexEntry(key, offset, length);
+    private async ValueTask<byte[]> ReadLastKeyInBlockAsync(int blockIndex)
+    {
+        var idx = _index[blockIndex];
+        var blockBytes = ArrayPool<byte>.Shared.Rent(idx.Length);
+        try
+        {
+            await RandomAccess.ReadAsync(_handle, blockBytes.AsMemory(0, idx.Length), idx.Offset).ConfigureAwait(false);
+            return DecodeLastKey(blockBytes.AsSpan(0, idx.Length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(blockBytes);
         }
     }
 
+    private static byte[] DecodeLastKey(ReadOnlySpan<byte> block)
+    {
+        int offset = 0;
+        byte[] prevKey = Array.Empty<byte>();
+        byte[] lastKey = Array.Empty<byte>();
+
+        while (offset + 4 <= block.Length)
+        {
+            ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+            offset += 2;
+            ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+            offset += 2;
+
+            if (offset + suffixLen + 4 > block.Length) break;
+
+            var key = new byte[shared + suffixLen];
+            if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
+            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
+            offset += suffixLen;
+
+            int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
+            offset += 4;
+            if (valueLen > 0) offset += valueLen;
+
+            lastKey = key;
+            prevKey = key;
+        }
+
+        return lastKey;
+    }
+
     /// <summary>
-    /// Looks up a key. Returns the value if found, null for tombstone.
-    /// Throws KeyNotFoundException if not present.
+    /// Looks up a key by binary-searching the block index, then decoding entries
+    /// inline within the target block. Stops as soon as the key is found or passed.
+    /// No full-block materialization.
     /// </summary>
     public async ValueTask<(byte[]? Value, bool Found)> GetAsync(byte[] key)
     {
         int blockIdx = FindBlock(key);
         if (blockIdx < 0) return (null, false);
 
-        // Could be in blockIdx or blockIdx - 1 (if key is between blocks)
-        // We search blockIdx (the block whose firstKey <= key)
-        var entries = await ReadBlockAsync(blockIdx).ConfigureAwait(false);
-        foreach (var (k, v) in entries)
+        var idx = _index[blockIdx];
+        var blockBytes = ArrayPool<byte>.Shared.Rent(idx.Length);
+        try
         {
-            int cmp = k.AsSpan().SequenceCompareTo(key);
-            if (cmp == 0) return (v, true);
-            if (cmp > 0) break; // past it
+            await RandomAccess.ReadAsync(_handle, blockBytes.AsMemory(0, idx.Length), idx.Offset).ConfigureAwait(false);
+            return FindInBlock(blockBytes.AsSpan(0, idx.Length), key);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(blockBytes);
+        }
+    }
+
+    /// <summary>
+    /// Decodes entries one at a time from a block, comparing against the target key.
+    /// Returns immediately on match or overshoot — avoids allocating values for non-matching entries.
+    /// </summary>
+    private static (byte[]? Value, bool Found) FindInBlock(ReadOnlySpan<byte> block, byte[] targetKey)
+    {
+        int offset = 0;
+        byte[] prevKey = Array.Empty<byte>();
+
+        while (offset + 4 <= block.Length)
+        {
+            ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+            offset += 2;
+            ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+            offset += 2;
+
+            int keyLen = shared + suffixLen;
+            if (offset + suffixLen + 4 > block.Length) break;
+
+            var key = new byte[keyLen];
+            if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
+            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
+            offset += suffixLen;
+
+            int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
+            offset += 4;
+
+            int cmp = key.AsSpan().SequenceCompareTo(targetKey);
+            if (cmp == 0)
+            {
+                byte[]? value = valueLen == -1 ? null : block.Slice(offset, valueLen).ToArray();
+                return (value, true);
+            }
+            if (cmp > 0) return (null, false);
+
+            // Skip past value bytes without allocating
+            if (valueLen > 0) offset += valueLen;
+            prevKey = key;
         }
 
         return (null, false);
     }
 
     /// <summary>
-    /// Scans all entries in order.
+    /// Scans all entries in sorted order. Decodes lazily per entry from each block.
     /// </summary>
     public async IAsyncEnumerable<(byte[] Key, byte[]? Value)> ScanAsync()
     {
         for (int i = 0; i < _index.Length; i++)
         {
-            var entries = await ReadBlockAsync(i).ConfigureAwait(false);
-            foreach (var entry in entries)
-                yield return entry;
+            var idx = _index[i];
+            var blockBytes = ArrayPool<byte>.Shared.Rent(idx.Length);
+            try
+            {
+                await RandomAccess.ReadAsync(_handle, blockBytes.AsMemory(0, idx.Length), idx.Offset).ConfigureAwait(false);
+                int offset = 0;
+                byte[] prevKey = Array.Empty<byte>();
+
+                while (offset + 4 <= idx.Length)
+                {
+                    var block = blockBytes.AsSpan(0, idx.Length);
+                    ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                    offset += 2;
+                    ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                    offset += 2;
+
+                    int keyLen = shared + suffixLen;
+                    if (offset + suffixLen + 4 > idx.Length) break;
+
+                    var key = new byte[keyLen];
+                    if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
+                    block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
+                    offset += suffixLen;
+
+                    int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
+                    offset += 4;
+
+                    byte[]? value;
+                    if (valueLen == -1)
+                    {
+                        value = null;
+                    }
+                    else
+                    {
+                        value = block.Slice(offset, valueLen).ToArray();
+                        offset += valueLen;
+                    }
+
+                    yield return (key, value);
+                    prevKey = key;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(blockBytes);
+            }
         }
     }
 
     /// <summary>
-    /// Finds the block index whose firstKey is the largest key &lt;= the given key.
-    /// Returns -1 if key is less than all block first keys.
+    /// Binary search for the block whose firstKey is the largest key &lt;= the given key.
     /// </summary>
     private int FindBlock(byte[] key)
     {
@@ -328,71 +475,10 @@ public sealed class SSTableReader : IAsyncDisposable
         return result;
     }
 
-    private async ValueTask<List<(byte[] Key, byte[]? Value)>> ReadBlockAsync(int blockIndex)
+    public ValueTask DisposeAsync()
     {
-        var entry = _index[blockIndex];
-        var blockData = _pool.Rent(entry.Length);
-        try
-        {
-            _stream.Seek(entry.Offset, SeekOrigin.Begin);
-            await _stream.ReadExactlyAsync(blockData.Memory[..entry.Length]).ConfigureAwait(false);
-
-            return DecodeBlock(blockData.Memory.Span[..entry.Length]);
-        }
-        finally
-        {
-            blockData.Dispose();
-        }
-    }
-
-    private static List<(byte[] Key, byte[]? Value)> DecodeBlock(ReadOnlySpan<byte> block)
-    {
-        var results = new List<(byte[], byte[]?)>();
-        int offset = 0;
-        byte[] prevKey = Array.Empty<byte>();
-        int entryIdx = 0;
-
-        while (offset + 4 <= block.Length) // at least shared(2) + suffix(2)
-        {
-            ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
-            ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
-
-            if (offset + suffixLen + 4 > block.Length) break;
-
-            var key = new byte[shared + suffixLen];
-            if (shared > 0)
-                prevKey.AsSpan(0, shared).CopyTo(key);
-            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
-            offset += suffixLen;
-
-            int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
-            offset += 4;
-
-            byte[]? value;
-            if (valueLen == -1)
-            {
-                value = null;
-            }
-            else
-            {
-                if (offset + valueLen > block.Length) break;
-                value = block.Slice(offset, valueLen).ToArray();
-                offset += valueLen;
-            }
-
-            results.Add((key, value));
-            prevKey = key;
-            entryIdx++;
-        }
-
-        return results;
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await _stream.DisposeAsync().ConfigureAwait(false);
+        _handle.Dispose();
+        return ValueTask.CompletedTask;
     }
 
     private readonly record struct IndexEntry(byte[] FirstKey, long Offset, int Length);

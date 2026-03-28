@@ -18,9 +18,6 @@ public sealed class MemTable
         _data = ImmutableSortedDictionary.Create<byte[], MemEntry>(KeyComparer.Instance);
     }
 
-    /// <summary>
-    /// Current number of entries (including tombstones).
-    /// </summary>
     public int Count => _data.Count;
 
     /// <summary>
@@ -35,26 +32,25 @@ public sealed class MemTable
     public ImmutableSortedDictionary<byte[], MemEntry> Snapshot() => _data;
 
     /// <summary>
-    /// Tries to atomically apply a batch of writes. Returns true if successful,
-    /// false if the memtable was concurrently modified (caller should retry or abort).
+    /// Tries to atomically replace the memtable via CAS.
+    /// <paramref name="sizeDelta"/> is the net change in approximate size caused by the mutations.
+    /// Returns false if the memtable was concurrently modified.
     /// </summary>
     public bool TryApply(
         ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
-        ImmutableSortedDictionary<byte[], MemEntry> newData)
+        ImmutableSortedDictionary<byte[], MemEntry> newData,
+        int sizeDelta)
     {
         var original = Interlocked.CompareExchange(ref _data, newData, expectedSnapshot);
         if (!ReferenceEquals(original, expectedSnapshot))
             return false;
 
-        int size = 0;
-        foreach (var kvp in newData)
-            size += kvp.Key.Length + (kvp.Value.Value?.Length ?? 0);
-        Interlocked.Exchange(ref _approximateSize, size);
+        Interlocked.Add(ref _approximateSize, sizeDelta);
         return true;
     }
 
     /// <summary>
-    /// Atomically replaces the memtable contents with an empty dictionary and returns the old data.
+    /// Atomically replaces the memtable with an empty dictionary and returns the old data.
     /// Used during flush to SSTable.
     /// </summary>
     public ImmutableSortedDictionary<byte[], MemEntry> SwapOut()

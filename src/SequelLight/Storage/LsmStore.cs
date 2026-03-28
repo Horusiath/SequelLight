@@ -1,27 +1,13 @@
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 
 namespace SequelLight.Storage;
 
 public sealed class LsmStoreOptions
 {
-    /// <summary>
-    /// Directory where data files are stored.
-    /// </summary>
     public required string Directory { get; init; }
-
-    /// <summary>
-    /// Maximum approximate size of the memtable in bytes before flushing.
-    /// </summary>
     public int MemTableFlushThreshold { get; init; } = 4 * 1024 * 1024; // 4 MiB
-
-    /// <summary>
-    /// Target block size for SSTables.
-    /// </summary>
     public int SSTableBlockSize { get; init; } = SSTableWriter.DefaultBlockSize;
-
-    /// <summary>
-    /// Compaction strategy.
-    /// </summary>
     public ICompactionStrategy CompactionStrategy { get; init; } = new LevelTieredCompaction();
 }
 
@@ -36,10 +22,10 @@ public sealed class LsmStore : IAsyncDisposable
     private WriteAheadLog? _wal;
     private long _sequenceNumber;
 
-    // SSTable tracking — lock-free via Interlocked
     private volatile ImmutableList<SSTableInfo> _sstables = ImmutableList<SSTableInfo>.Empty;
+    private readonly ConcurrentDictionary<string, SSTableReader> _readerCache = new();
     private int _nextFileId;
-    private int _compacting; // 0 = idle, 1 = compacting
+    private int _compacting;
 
     private LsmStore(LsmStoreOptions options)
     {
@@ -61,26 +47,28 @@ public sealed class LsmStore : IAsyncDisposable
         var sstFiles = System.IO.Directory.GetFiles(_options.Directory, "*.sst");
         Array.Sort(sstFiles, StringComparer.Ordinal);
 
+        int maxFileId = 0;
         var sstList = ImmutableList.CreateBuilder<SSTableInfo>();
         foreach (var file in sstFiles)
         {
-            var info = await ReadSSTableInfoAsync(file).ConfigureAwait(false);
-            if (info is not null)
-                sstList.Add(info);
+            var reader = await SSTableReader.OpenAsync(file).ConfigureAwait(false);
+            _readerCache[file] = reader;
+
+            int level = ParseLevel(file);
+            int fileId = ParseFileId(file);
+            if (fileId > maxFileId) maxFileId = fileId;
+
+            sstList.Add(new SSTableInfo
+            {
+                FilePath = file,
+                Level = level,
+                FileSize = new FileInfo(file).Length,
+                MinKey = reader.MinKey,
+                MaxKey = reader.MaxKey,
+            });
         }
         _sstables = sstList.ToImmutable();
-
-        // Parse max file ID from existing files
-        foreach (var file in sstFiles)
-        {
-            var name = Path.GetFileNameWithoutExtension(file);
-            if (name.Length > 1 && int.TryParse(name.AsSpan(1), out int id)) // format: L{level}_{id}
-            {
-                // Actually format is {id}_L{level}, let's just parse numeric prefix
-            }
-        }
-        // Simpler: use timestamp-based IDs
-        _nextFileId = (int)(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() % int.MaxValue);
+        _nextFileId = maxFileId + 1;
 
         // Replay WAL
         var walPath = Path.Combine(_options.Directory, "wal.log");
@@ -89,76 +77,56 @@ public sealed class LsmStore : IAsyncDisposable
             var snapshot = _memTable.Snapshot();
             var recovered = snapshot;
             long maxSeq = 0;
+            int sizeDelta = 0;
 
             await WriteAheadLog.ReplayAsync(walPath, (type, key, value) =>
             {
                 maxSeq++;
+                if (recovered.TryGetValue(key, out var existing))
+                    sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
+
                 var entry = type == WalEntryType.Put
                     ? new MemEntry(value, maxSeq)
                     : new MemEntry(null, maxSeq);
+
+                sizeDelta += key.Length + (value?.Length ?? 0);
                 recovered = recovered.SetItem(key, entry);
                 return ValueTask.CompletedTask;
             }).ConfigureAwait(false);
 
             if (maxSeq > 0)
             {
-                _memTable.TryApply(snapshot, recovered);
+                _memTable.TryApply(snapshot, recovered, sizeDelta);
                 _sequenceNumber = maxSeq;
             }
         }
 
-        // Open WAL for new writes
         _wal = WriteAheadLog.Create(walPath);
     }
 
-    private static async ValueTask<SSTableInfo?> ReadSSTableInfoAsync(string filePath)
+    private static int ParseLevel(string filePath)
     {
-        try
-        {
-            await using var reader = await SSTableReader.OpenAsync(filePath).ConfigureAwait(false);
-            byte[]? minKey = null, maxKey = null;
-
-            await foreach (var (key, _) in reader.ScanAsync())
-            {
-                minKey ??= key;
-                maxKey = key;
-            }
-
-            if (minKey is null) return null;
-
-            // Parse level from filename: {id}_L{level}.sst
-            int level = 0;
-            var name = Path.GetFileNameWithoutExtension(filePath);
-            int lIdx = name.IndexOf("_L", StringComparison.Ordinal);
-            if (lIdx >= 0 && int.TryParse(name.AsSpan(lIdx + 2), out int parsedLevel))
-                level = parsedLevel;
-
-            return new SSTableInfo
-            {
-                FilePath = filePath,
-                Level = level,
-                FileSize = new FileInfo(filePath).Length,
-                MinKey = minKey!,
-                MaxKey = maxKey!,
-            };
-        }
-        catch
-        {
-            return null;
-        }
+        var name = Path.GetFileNameWithoutExtension(filePath);
+        int lIdx = name.IndexOf("_L", StringComparison.Ordinal);
+        if (lIdx >= 0 && int.TryParse(name.AsSpan(lIdx + 2), out int level))
+            return level;
+        return 0;
     }
 
-    /// <summary>
-    /// Begins a read-only transaction. The transaction sees a consistent snapshot.
-    /// </summary>
+    private static int ParseFileId(string filePath)
+    {
+        var name = Path.GetFileNameWithoutExtension(filePath);
+        int uIdx = name.IndexOf('_');
+        if (uIdx > 0 && int.TryParse(name.AsSpan(0, uIdx), out int id))
+            return id;
+        return 0;
+    }
+
     public ReadOnlyTransaction BeginReadOnly()
     {
-        return new ReadOnlyTransaction(_memTable.Snapshot(), _sstables);
+        return new ReadOnlyTransaction(this, _memTable.Snapshot(), _sstables);
     }
 
-    /// <summary>
-    /// Begins a read-write transaction.
-    /// </summary>
     public ReadWriteTransaction BeginReadWrite()
     {
         var snapshot = _memTable.Snapshot();
@@ -169,25 +137,24 @@ public sealed class LsmStore : IAsyncDisposable
     internal async ValueTask<bool> CommitAsync(
         ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
         ImmutableSortedDictionary<byte[], MemEntry> newSnapshot,
-        List<(byte[] Key, byte[]? Value)> walWrites)
+        List<(byte[] Key, byte[]? Value)> walWrites,
+        int sizeDelta)
     {
         if (walWrites.Count == 0) return true;
 
-        // Write to WAL first for durability
+        // Batch all WAL writes, then flush once
         foreach (var (key, value) in walWrites)
         {
             if (value is not null)
-                await _wal!.AppendPutAsync(key, value).ConfigureAwait(false);
+                _wal!.AppendPut(key, value);
             else
-                await _wal!.AppendDeleteAsync(key).ConfigureAwait(false);
+                _wal!.AppendDelete(key);
         }
         await _wal!.FlushAsync().ConfigureAwait(false);
 
-        // CAS apply
-        if (!_memTable.TryApply(expectedSnapshot, newSnapshot))
+        if (!_memTable.TryApply(expectedSnapshot, newSnapshot, sizeDelta))
             return false;
 
-        // Check if flush is needed
         if (_memTable.ApproximateSize >= _options.MemTableFlushThreshold)
             await FlushMemTableAsync().ConfigureAwait(false);
 
@@ -197,16 +164,17 @@ public sealed class LsmStore : IAsyncDisposable
     internal async ValueTask<(byte[]? Value, bool Found)> GetFromSSTAsync(
         byte[] key, ImmutableList<SSTableInfo> sstables)
     {
-        // Search SSTables from newest to oldest (higher file ID = newer)
+        // Search from newest to oldest
         for (int i = sstables.Count - 1; i >= 0; i--)
         {
             var info = sstables[i];
-            // Quick range check
             if (KeyComparer.Instance.Compare(key, info.MinKey) < 0 ||
                 KeyComparer.Instance.Compare(key, info.MaxKey) > 0)
                 continue;
 
-            await using var reader = await SSTableReader.OpenAsync(info.FilePath).ConfigureAwait(false);
+            if (!_readerCache.TryGetValue(info.FilePath, out var reader))
+                continue; // compacted away
+
             var (value, found) = await reader.GetAsync(key).ConfigureAwait(false);
             if (found) return (value, true);
         }
@@ -219,44 +187,48 @@ public sealed class LsmStore : IAsyncDisposable
         var frozen = _memTable.SwapOut();
         if (frozen.Count == 0) return;
 
-        // Write new SSTable
         int fileId = Interlocked.Increment(ref _nextFileId);
         string sstPath = Path.Combine(_options.Directory, $"{fileId:D10}_L0.sst");
 
         await using (var writer = SSTableWriter.Create(sstPath, _options.SSTableBlockSize))
         {
             foreach (var kvp in frozen)
-            {
                 await writer.WriteEntryAsync(kvp.Key, kvp.Value.Value).ConfigureAwait(false);
-            }
             await writer.FinishAsync().ConfigureAwait(false);
         }
 
-        var info = await ReadSSTableInfoAsync(sstPath).ConfigureAwait(false);
-        if (info is not null)
+        // Open reader and cache it
+        var reader = await SSTableReader.OpenAsync(sstPath).ConfigureAwait(false);
+        _readerCache[sstPath] = reader;
+
+        var info = new SSTableInfo
         {
-            // Atomically add to SSTable list
-            ImmutableList<SSTableInfo> original, updated;
-            do
-            {
-                original = _sstables;
-                updated = original.Add(info);
-            } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
-        }
+            FilePath = sstPath,
+            Level = 0,
+            FileSize = new FileInfo(sstPath).Length,
+            MinKey = reader.MinKey,
+            MaxKey = reader.MaxKey,
+        };
+
+        // Atomically add to SSTable list
+        ImmutableList<SSTableInfo> original, updated;
+        do
+        {
+            original = _sstables;
+            updated = original.Add(info);
+        } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
 
         // Reset WAL
         await _wal!.DisposeAsync().ConfigureAwait(false);
-        var walPath = Path.Combine(_options.Directory, "wal.log");
-        _wal = WriteAheadLog.Create(walPath);
+        _wal = WriteAheadLog.Create(Path.Combine(_options.Directory, "wal.log"));
 
-        // Trigger compaction if needed
         await TryCompactAsync().ConfigureAwait(false);
     }
 
     private async ValueTask TryCompactAsync()
     {
         if (Interlocked.CompareExchange(ref _compacting, 1, 0) != 0)
-            return; // already compacting
+            return;
 
         try
         {
@@ -264,7 +236,6 @@ public sealed class LsmStore : IAsyncDisposable
             {
                 var plan = _options.CompactionStrategy.Plan(_sstables);
                 if (plan is null) break;
-
                 await ExecuteCompactionAsync(plan).ConfigureAwait(false);
             }
         }
@@ -276,93 +247,164 @@ public sealed class LsmStore : IAsyncDisposable
 
     private async ValueTask ExecuteCompactionAsync(CompactionPlan plan)
     {
-        // Merge all input tables into a new SSTable at the target level
-        var merged = new SortedDictionary<byte[], byte[]?>(KeyComparer.Instance);
-
-        foreach (var tableInfo in plan.InputTables)
-        {
-            await using var reader = await SSTableReader.OpenAsync(tableInfo.FilePath).ConfigureAwait(false);
-            await foreach (var (key, value) in reader.ScanAsync())
-            {
-                merged[key] = value; // last writer wins (higher levels have older data)
-            }
-        }
-
-        // Write merged output
         int fileId = Interlocked.Increment(ref _nextFileId);
         string outputPath = Path.Combine(_options.Directory, $"{fileId:D10}_L{plan.TargetLevel}.sst");
+        int maxLevel = _options.CompactionStrategy.MaxLevels - 1;
 
-        await using (var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize))
+        // Sort inputs: newest (highest file ID) first so they win on duplicate keys
+        var sortedInputs = plan.InputTables.OrderByDescending(t => ParseFileId(t.FilePath)).ToList();
+
+        // Open enumerators for k-way merge
+        var enumerators = new IAsyncEnumerator<(byte[] Key, byte[]? Value)>[sortedInputs.Count];
+        try
         {
-            foreach (var kvp in merged)
+            for (int i = 0; i < sortedInputs.Count; i++)
             {
-                // Drop tombstones at the max level
-                if (kvp.Value is null && plan.TargetLevel == _options.CompactionStrategy.MaxLevels - 1)
+                if (_readerCache.TryGetValue(sortedInputs[i].FilePath, out var reader))
+                    enumerators[i] = reader.ScanAsync().GetAsyncEnumerator();
+                else
+                    enumerators[i] = EmptyEnumerator();
+            }
+
+            // Seed priority queue: (sourceIndex) ordered by (key, sourceIndex)
+            var pq = new PriorityQueue<int, MergeKey>(new MergeKeyComparer());
+            for (int i = 0; i < enumerators.Length; i++)
+            {
+                if (await enumerators[i].MoveNextAsync().ConfigureAwait(false))
+                {
+                    var (key, _) = enumerators[i].Current;
+                    pq.Enqueue(i, new MergeKey(key, i));
+                }
+            }
+
+            await using var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize);
+            byte[]? prevKey = null;
+
+            while (pq.TryDequeue(out int srcIdx, out _))
+            {
+                var (key, value) = enumerators[srcIdx].Current;
+
+                // Advance source
+                if (await enumerators[srcIdx].MoveNextAsync().ConfigureAwait(false))
+                {
+                    var (nk, _) = enumerators[srcIdx].Current;
+                    pq.Enqueue(srcIdx, new MergeKey(nk, srcIdx));
+                }
+
+                // Skip duplicate keys (already emitted from a newer source)
+                if (prevKey is not null && key.AsSpan().SequenceCompareTo(prevKey) == 0)
                     continue;
 
-                await writer.WriteEntryAsync(kvp.Key, kvp.Value).ConfigureAwait(false);
+                prevKey = key;
+
+                // Drop tombstones at max level
+                if (value is null && plan.TargetLevel == maxLevel)
+                    continue;
+
+                await writer.WriteEntryAsync(key, value).ConfigureAwait(false);
             }
+
             await writer.FinishAsync().ConfigureAwait(false);
         }
+        finally
+        {
+            foreach (var e in enumerators)
+            {
+                if (e is not null)
+                    await e.DisposeAsync().ConfigureAwait(false);
+            }
+        }
 
-        var newInfo = await ReadSSTableInfoAsync(outputPath).ConfigureAwait(false);
+        // Open reader for new SSTable
+        var newReader = await SSTableReader.OpenAsync(outputPath).ConfigureAwait(false);
+        _readerCache[outputPath] = newReader;
 
-        // Atomically swap: remove inputs, add output
+        var newInfo = new SSTableInfo
+        {
+            FilePath = outputPath,
+            Level = plan.TargetLevel,
+            FileSize = new FileInfo(outputPath).Length,
+            MinKey = newReader.MinKey,
+            MaxKey = newReader.MaxKey,
+        };
+
+        // Atomically swap in SSTable list
         var inputPaths = new HashSet<string>(plan.InputTables.Select(t => t.FilePath));
-
         ImmutableList<SSTableInfo> original, updated;
         do
         {
             original = _sstables;
             var builder = original.ToBuilder();
             builder.RemoveAll(t => inputPaths.Contains(t.FilePath));
-            if (newInfo is not null)
-                builder.Add(newInfo);
+            builder.Add(newInfo);
             updated = builder.ToImmutable();
         } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
 
-        // Delete old files
+        // Close old readers and delete old files
         foreach (var input in plan.InputTables)
         {
-            try { File.Delete(input.FilePath); } catch { /* best effort */ }
+            if (_readerCache.TryRemove(input.FilePath, out var oldReader))
+                await oldReader.DisposeAsync().ConfigureAwait(false);
+            try { File.Delete(input.FilePath); } catch { }
         }
+    }
+
+    private static async IAsyncEnumerator<(byte[] Key, byte[]? Value)> EmptyEnumerator()
+    {
+        await ValueTask.CompletedTask;
+        yield break;
     }
 
     public async ValueTask DisposeAsync()
     {
         if (_wal is not null)
             await _wal.DisposeAsync().ConfigureAwait(false);
+
+        foreach (var reader in _readerCache.Values)
+            await reader.DisposeAsync().ConfigureAwait(false);
+        _readerCache.Clear();
+    }
+
+    private readonly record struct MergeKey(byte[] Key, int SourceIndex);
+
+    private sealed class MergeKeyComparer : IComparer<MergeKey>
+    {
+        public int Compare(MergeKey x, MergeKey y)
+        {
+            int cmp = x.Key.AsSpan().SequenceCompareTo(y.Key);
+            return cmp != 0 ? cmp : x.SourceIndex.CompareTo(y.SourceIndex);
+        }
     }
 }
 
 /// <summary>
 /// Read-only transaction. Holds a snapshot of the memtable and SSTable list.
-/// Multiple read-only transactions can coexist without blocking.
 /// </summary>
 public sealed class ReadOnlyTransaction : IDisposable
 {
+    private readonly LsmStore _store;
     private readonly ImmutableSortedDictionary<byte[], MemEntry> _snapshot;
     private readonly ImmutableList<SSTableInfo> _sstables;
     private bool _disposed;
 
     internal ReadOnlyTransaction(
+        LsmStore store,
         ImmutableSortedDictionary<byte[], MemEntry> snapshot,
         ImmutableList<SSTableInfo> sstables)
     {
+        _store = store;
         _snapshot = snapshot;
         _sstables = sstables;
     }
 
-    public async ValueTask<byte[]?> GetAsync(byte[] key, LsmStore store)
+    public async ValueTask<byte[]?> GetAsync(byte[] key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Check memtable snapshot first
         if (_snapshot.TryGetValue(key, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
-        // Check SSTables
-        var (value, found) = await store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
+        var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
         return found ? value : null;
     }
 
@@ -384,6 +426,7 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     private ImmutableSortedDictionary<byte[], MemEntry> _current;
     private readonly List<(byte[] Key, byte[]? Value)> _walWrites = new();
     private long _nextSeq;
+    private int _sizeDelta;
     private bool _committed;
     private bool _disposed;
 
@@ -405,6 +448,10 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
+        if (_current.TryGetValue(key, out var existing))
+            _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
+        _sizeDelta += key.Length + value.Length;
+
         _current = _current.SetItem(key, new MemEntry(value, _nextSeq++));
         _walWrites.Add((key, value));
     }
@@ -414,6 +461,10 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
+        if (_current.TryGetValue(key, out var existing))
+            _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
+        _sizeDelta += key.Length;
+
         _current = _current.SetItem(key, new MemEntry(null, _nextSeq++));
         _walWrites.Add((key, null));
     }
@@ -422,19 +473,13 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Check local modified snapshot (includes read-your-own-writes)
         if (_current.TryGetValue(key, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
-        // Check SSTables
         var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
         return found ? value : null;
     }
 
-    /// <summary>
-    /// Attempts to commit the transaction. Returns true if successful,
-    /// false if there was a conflict (memtable changed since transaction start).
-    /// </summary>
     public async ValueTask<bool> CommitAsync()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -443,7 +488,7 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         _committed = true;
         if (_walWrites.Count == 0) return true;
 
-        return await _store.CommitAsync(_baseSnapshot, _current, _walWrites).ConfigureAwait(false);
+        return await _store.CommitAsync(_baseSnapshot, _current, _walWrites, _sizeDelta).ConfigureAwait(false);
     }
 
     public ValueTask DisposeAsync()

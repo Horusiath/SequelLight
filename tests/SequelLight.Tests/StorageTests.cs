@@ -76,8 +76,8 @@ public class WalTests : TempDirTest
 
         await using (var wal = WriteAheadLog.Create(path))
         {
-            await wal.AppendPutAsync(Key("key1"), Val("val1"));
-            await wal.AppendPutAsync(Key("key2"), Val("val2"));
+            wal.AppendPut(Key("key1"), Val("val1"));
+            wal.AppendPut(Key("key2"), Val("val2"));
             await wal.FlushAsync();
         }
 
@@ -100,8 +100,8 @@ public class WalTests : TempDirTest
 
         await using (var wal = WriteAheadLog.Create(path))
         {
-            await wal.AppendPutAsync(Key("key1"), Val("val1"));
-            await wal.AppendDeleteAsync(Key("key1"));
+            wal.AppendPut(Key("key1"), Val("val1"));
+            wal.AppendDelete(Key("key1"));
             await wal.FlushAsync();
         }
 
@@ -139,9 +139,8 @@ public class MemTableTests
         var snap1 = mt.Snapshot();
 
         var newData = snap1.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        Assert.True(mt.TryApply(snap1, newData));
+        Assert.True(mt.TryApply(snap1, newData, 2)); // key(1) + value(1)
 
-        // snap1 should still be empty (immutable)
         Assert.Empty(snap1);
 
         var snap2 = mt.Snapshot();
@@ -154,13 +153,11 @@ public class MemTableTests
         var mt = new MemTable();
         var snap = mt.Snapshot();
 
-        // First write succeeds
         var newData1 = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        Assert.True(mt.TryApply(snap, newData1));
+        Assert.True(mt.TryApply(snap, newData1, 2));
 
-        // Second write with stale snapshot fails (snap is no longer current)
         var newData2 = snap.SetItem(Key("b"), new MemEntry(Val("2"), 2));
-        Assert.False(mt.TryApply(snap, newData2));
+        Assert.False(mt.TryApply(snap, newData2, 2));
     }
 
     [Fact]
@@ -169,7 +166,7 @@ public class MemTableTests
         var mt = new MemTable();
         var snap = mt.Snapshot();
         var newData = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        mt.TryApply(snap, newData);
+        mt.TryApply(snap, newData, 2);
 
         var old = mt.SwapOut();
         Assert.Single(old);
@@ -184,9 +181,8 @@ public class MemTableTests
 
         var snap = mt.Snapshot();
         var newData = snap.SetItem(Key("abc"), new MemEntry(Val("12345"), 1));
-        mt.TryApply(snap, newData);
+        mt.TryApply(snap, newData, 8); // key(3) + value(5)
 
-        // key(3) + value(5) = 8
         Assert.Equal(8, mt.ApproximateSize);
     }
 
@@ -222,7 +218,6 @@ public class SSTableTests : TempDirTest
 
         await using (var writer = SSTableWriter.Create(path))
         {
-            // Write enough entries to span multiple blocks and trigger prefix resets
             for (int i = 0; i < 100; i++)
             {
                 var key = $"key_{i:D4}";
@@ -235,7 +230,6 @@ public class SSTableTests : TempDirTest
 
         await using var reader = await SSTableReader.OpenAsync(path);
 
-        // Point lookups
         foreach (var (k, v) in expected)
         {
             var (value, found) = await reader.GetAsync(Key(k));
@@ -243,7 +237,6 @@ public class SSTableTests : TempDirTest
             Assert.Equal(v, Str(value));
         }
 
-        // Key not present
         var (_, notFound) = await reader.GetAsync(Key("missing"));
         Assert.False(notFound);
     }
@@ -266,7 +259,6 @@ public class SSTableTests : TempDirTest
             entries.Add(Str(key));
 
         Assert.Equal(50, entries.Count);
-        // Verify sorted order
         for (int i = 1; i < entries.Count; i++)
             Assert.True(string.Compare(entries[i - 1], entries[i], StringComparison.Ordinal) < 0);
     }
@@ -279,7 +271,7 @@ public class SSTableTests : TempDirTest
         await using (var writer = SSTableWriter.Create(path))
         {
             await writer.WriteEntryAsync(Key("alive"), Val("yes"));
-            await writer.WriteEntryAsync(Key("dead"), null); // tombstone
+            await writer.WriteEntryAsync(Key("dead"), null);
             await writer.FinishAsync();
         }
 
@@ -299,10 +291,9 @@ public class SSTableTests : TempDirTest
     {
         var path = Path.Combine(TempDir, "test.sst");
 
-        // Use keys with a long shared prefix to exercise prefix compression
         await using (var writer = SSTableWriter.Create(path))
         {
-            for (int i = 0; i < 32; i++) // crosses the 16-entry prefix reset boundary
+            for (int i = 0; i < 32; i++)
                 await writer.WriteEntryAsync(Key($"shared/prefix/path/{i:D4}"), Val($"v{i}"));
             await writer.FinishAsync();
         }
@@ -321,7 +312,6 @@ public class SSTableTests : TempDirTest
     {
         var path = Path.Combine(TempDir, "test.sst");
 
-        // Use small block size to force multiple blocks
         await using (var writer = SSTableWriter.Create(path, targetBlockSize: 128))
         {
             for (int i = 0; i < 50; i++)
@@ -332,13 +322,30 @@ public class SSTableTests : TempDirTest
         await using var reader = await SSTableReader.OpenAsync(path);
         Assert.True(reader.BlockCount > 1, $"Expected multiple blocks, got {reader.BlockCount}");
 
-        // All entries still readable
         for (int i = 0; i < 50; i++)
         {
             var (value, found) = await reader.GetAsync(Key($"key_{i:D4}"));
             Assert.True(found, $"Key key_{i:D4} not found");
             Assert.Equal($"value_{i:D20}", Str(value));
         }
+    }
+
+    [Fact]
+    public async Task MinKey_MaxKey_Are_Correct()
+    {
+        var path = Path.Combine(TempDir, "test.sst");
+
+        await using (var writer = SSTableWriter.Create(path))
+        {
+            await writer.WriteEntryAsync(Key("apple"), Val("1"));
+            await writer.WriteEntryAsync(Key("banana"), Val("2"));
+            await writer.WriteEntryAsync(Key("cherry"), Val("3"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        Assert.Equal("apple", Str(reader.MinKey));
+        Assert.Equal("cherry", Str(reader.MaxKey));
     }
 }
 
@@ -349,7 +356,7 @@ public class CompactionTests
     {
         var strategy = new LevelTieredCompaction(level0Threshold: 4);
         var tables = ImmutableList.Create(
-            MakeTable(0), MakeTable(0), MakeTable(0) // 3 < 4
+            MakeTable(0), MakeTable(0), MakeTable(0)
         );
         Assert.Null(strategy.Plan(tables));
     }
@@ -359,7 +366,7 @@ public class CompactionTests
     {
         var strategy = new LevelTieredCompaction(level0Threshold: 4);
         var tables = ImmutableList.Create(
-            MakeTable(0), MakeTable(0), MakeTable(0), MakeTable(0) // 4 >= 4
+            MakeTable(0), MakeTable(0), MakeTable(0), MakeTable(0)
         );
         var plan = strategy.Plan(tables);
         Assert.NotNull(plan);
@@ -374,13 +381,13 @@ public class CompactionTests
         var tables = ImmutableList.Create(
             MakeTable(0, "a", "m"),
             MakeTable(0, "n", "z"),
-            MakeTable(1, "d", "f") // overlaps with first L0 table
+            MakeTable(1, "d", "f")
         );
 
         var plan = strategy.Plan(tables);
         Assert.NotNull(plan);
         Assert.Equal(1, plan.TargetLevel);
-        Assert.Equal(3, plan.InputTables.Count); // both L0 + overlapping L1
+        Assert.Equal(3, plan.InputTables.Count);
     }
 
     private static SSTableInfo MakeTable(int level, string minKey = "a", string maxKey = "z")
@@ -410,7 +417,7 @@ public class LsmStoreTests : TempDirTest
         }
 
         using var ro = store.BeginReadOnly();
-        var val = await ro.GetAsync(Key("name"), store);
+        var val = await ro.GetAsync(Key("name"));
         Assert.Equal("alice", Str(val));
     }
 
@@ -432,7 +439,7 @@ public class LsmStoreTests : TempDirTest
         }
 
         using var ro = store.BeginReadOnly();
-        var val = await ro.GetAsync(Key("name"), store);
+        var val = await ro.GetAsync(Key("name"));
         Assert.Null(val);
     }
 
@@ -444,7 +451,6 @@ public class LsmStoreTests : TempDirTest
         await using var tx = store.BeginReadWrite();
         tx.Put(Key("k"), Val("v"));
 
-        // Should see own write before commit
         var val = await tx.GetAsync(Key("k"));
         Assert.Equal("v", Str(val));
     }
@@ -460,22 +466,19 @@ public class LsmStoreTests : TempDirTest
             Assert.True(await tx.CommitAsync());
         }
 
-        // Start read-only tx
         using var ro = store.BeginReadOnly();
 
-        // Write more data
         await using (var tx = store.BeginReadWrite())
         {
             tx.Put(Key("k2"), Val("v2"));
             Assert.True(await tx.CommitAsync());
         }
 
-        // Read-only tx should see k1 but not k2 (snapshot isolation)
-        var v1 = await ro.GetAsync(Key("k1"), store);
+        var v1 = await ro.GetAsync(Key("k1"));
         Assert.Equal("v1", Str(v1));
 
-        var v2 = await ro.GetAsync(Key("k2"), store);
-        Assert.Null(v2); // not visible in this snapshot
+        var v2 = await ro.GetAsync(Key("k2"));
+        Assert.Null(v2);
     }
 
     [Fact]
@@ -483,33 +486,25 @@ public class LsmStoreTests : TempDirTest
     {
         await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
 
-        // Start two concurrent read-write transactions
         await using var tx1 = store.BeginReadWrite();
         await using var tx2 = store.BeginReadWrite();
 
         tx1.Put(Key("k"), Val("from_tx1"));
         tx2.Put(Key("k"), Val("from_tx2"));
 
-        // First commit wins
-        var result1 = await tx1.CommitAsync();
-        Assert.True(result1);
-
-        // Second commit fails due to CAS conflict
-        var result2 = await tx2.CommitAsync();
-        Assert.False(result2);
+        Assert.True(await tx1.CommitAsync());
+        Assert.False(await tx2.CommitAsync());
     }
 
     [Fact]
     public async Task MemTable_Flush_To_SSTable()
     {
-        // Use a very small threshold to trigger flush
         await using var store = await LsmStore.OpenAsync(new LsmStoreOptions
         {
             Directory = TempDir,
-            MemTableFlushThreshold = 50, // tiny threshold
+            MemTableFlushThreshold = 50,
         });
 
-        // Write enough data to exceed the threshold
         for (int i = 0; i < 20; i++)
         {
             await using var tx = store.BeginReadWrite();
@@ -517,15 +512,13 @@ public class LsmStoreTests : TempDirTest
             await tx.CommitAsync();
         }
 
-        // SSTable files should have been created
         var sstFiles = Directory.GetFiles(TempDir, "*.sst");
         Assert.NotEmpty(sstFiles);
 
-        // All data still readable
         using var ro = store.BeginReadOnly();
         for (int i = 0; i < 20; i++)
         {
-            var val = await ro.GetAsync(Key($"key_{i:D4}"), store);
+            var val = await ro.GetAsync(Key($"key_{i:D4}"));
             Assert.Equal($"value_{i:D20}", Str(val));
         }
     }
@@ -535,7 +528,6 @@ public class LsmStoreTests : TempDirTest
     {
         var dir = Path.Combine(TempDir, "recovery");
 
-        // Write data and close
         await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = dir }))
         {
             await using var tx = store.BeginReadWrite();
@@ -543,11 +535,10 @@ public class LsmStoreTests : TempDirTest
             await tx.CommitAsync();
         }
 
-        // Reopen and verify data recovered from WAL
         await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = dir }))
         {
             using var ro = store.BeginReadOnly();
-            var val = await ro.GetAsync(Key("persist"), store);
+            var val = await ro.GetAsync(Key("persist"));
             Assert.Equal("durable", Str(val));
         }
     }
@@ -570,7 +561,7 @@ public class LsmStoreTests : TempDirTest
         }
 
         using var ro = store.BeginReadOnly();
-        var val = await ro.GetAsync(Key("k"), store);
+        var val = await ro.GetAsync(Key("k"));
         Assert.Equal("v2", Str(val));
     }
 
@@ -580,7 +571,6 @@ public class LsmStoreTests : TempDirTest
         await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
 
         await using var tx = store.BeginReadWrite();
-        var result = await tx.CommitAsync();
-        Assert.True(result);
+        Assert.True(await tx.CommitAsync());
     }
 }
