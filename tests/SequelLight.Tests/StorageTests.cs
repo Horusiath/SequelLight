@@ -349,6 +349,123 @@ public class SSTableTests : TempDirTest
     }
 }
 
+public class BloomFilterTests
+{
+    [Fact]
+    public void Added_Keys_Are_Found()
+    {
+        var bloom = BloomFilter.Create(100);
+        var keys = new byte[100][];
+        for (int i = 0; i < 100; i++)
+        {
+            keys[i] = Encoding.UTF8.GetBytes($"key/{i:D8}");
+            bloom.Add(keys[i]);
+        }
+
+        for (int i = 0; i < 100; i++)
+            Assert.True(bloom.MayContain(keys[i]), $"Key {i} should be found");
+    }
+
+    [Fact]
+    public void Missing_Keys_Have_Low_FalsePositive_Rate()
+    {
+        int entryCount = 10_000;
+        var bloom = BloomFilter.Create(entryCount);
+        for (int i = 0; i < entryCount; i++)
+            bloom.Add(Encoding.UTF8.GetBytes($"key/{i:D8}"));
+
+        int falsePositives = 0;
+        int testCount = 10_000;
+        for (int i = 0; i < testCount; i++)
+        {
+            if (bloom.MayContain(Encoding.UTF8.GetBytes($"miss/{i:D8}")))
+                falsePositives++;
+        }
+
+        double rate = (double)falsePositives / testCount;
+        // With ~6.4 bits/entry and 4 hashes, expect ~2-5% false positive rate
+        Assert.True(rate < 0.10, $"False positive rate {rate:P2} is too high");
+    }
+
+    [Fact]
+    public void FromBytes_Roundtrip()
+    {
+        int entryCount = 100;
+        var bloom = BloomFilter.Create(entryCount);
+        var keys = new byte[entryCount][];
+        for (int i = 0; i < entryCount; i++)
+        {
+            keys[i] = Encoding.UTF8.GetBytes($"key/{i:D8}");
+            bloom.Add(keys[i]);
+        }
+
+        var restored = BloomFilter.FromBytes(bloom.AsSpan(), entryCount);
+        for (int i = 0; i < entryCount; i++)
+            Assert.True(restored.MayContain(keys[i]), $"Key {i} should be found after roundtrip");
+    }
+
+    [Fact]
+    public void ComputeParameters_Returns_Expected_Values()
+    {
+        // 1000 entries -> 1000/10*8 = 800 bytes = 6400 bits
+        // hashCount = ln(2) * 6400/1000 ≈ 4.4 → 4
+        var (byteCount, hashCount) = BloomFilter.ComputeParameters(1000);
+        Assert.Equal(800, byteCount);
+        Assert.Equal(4, hashCount);
+    }
+}
+
+public class SSTableBloomFilterTests : TempDirTest
+{
+    [Fact]
+    public async Task BloomFilter_Rejects_Missing_Keys()
+    {
+        var path = Path.Combine(TempDir, "bloom.sst");
+
+        await using (var writer = SSTableWriter.Create(path))
+        {
+            for (int i = 0; i < 100; i++)
+                await writer.WriteEntryAsync(Key($"key/{i:D4}"), Val($"val{i}"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        Assert.Equal(100, reader.EntryCount);
+
+        // These keys don't exist — bloom filter should reject most without I/O
+        int notFound = 0;
+        for (int i = 0; i < 100; i++)
+        {
+            var (_, found) = await reader.GetAsync(Key($"miss/{i:D4}"));
+            if (!found) notFound++;
+        }
+
+        Assert.Equal(100, notFound);
+    }
+
+    [Fact]
+    public async Task BloomFilter_Does_Not_Reject_Existing_Keys()
+    {
+        var path = Path.Combine(TempDir, "bloom.sst");
+
+        await using (var writer = SSTableWriter.Create(path))
+        {
+            for (int i = 0; i < 100; i++)
+                await writer.WriteEntryAsync(Key($"key/{i:D4}"), Val($"val{i}"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+
+        for (int i = 0; i < 100; i++)
+        {
+            var (value, found) = await reader.GetAsync(Key($"key/{i:D4}"));
+            Assert.True(found, $"Key key/{i:D4} should be found");
+            Assert.Equal($"val{i}", Str(value));
+        }
+    }
+}
+
 public class CompactionTests
 {
     [Fact]

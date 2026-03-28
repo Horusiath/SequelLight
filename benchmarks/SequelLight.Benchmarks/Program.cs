@@ -1,4 +1,3 @@
 using BenchmarkDotNet.Running;
-using SequelLight.Benchmarks;
 
-BenchmarkRunner.Run<SqlParserBenchmarks>();
+BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);

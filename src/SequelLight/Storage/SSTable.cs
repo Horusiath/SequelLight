@@ -5,11 +5,14 @@ using Microsoft.Win32.SafeHandles;
 namespace SequelLight.Storage;
 
 /// <summary>
-/// SSTable file format:
+/// SSTable file format (v2):
 ///
 ///   [Data Blocks...]
 ///   [Index Block]
-///   [Footer: index_offset(8) | index_count(4) | magic(4)]
+///   [Bloom Filter]
+///   [Footer: index_offset(8) | index_count(4) | entry_count(4) | bloom_offset(8) | bloom_length(4) | magic(4)]
+///
+/// Footer is 32 bytes total.
 ///
 /// Each Data Block (target 4 KiB):
 ///   [Entry...]  (up to block size)
@@ -31,16 +34,19 @@ public sealed class SSTableWriter : IAsyncDisposable
 {
     public const int DefaultBlockSize = 4096;
     public const int PrefixResetInterval = 16;
-    private const uint Magic = 0x53535401; // "SST\x01"
+    private const uint Magic = 0x53535402; // "SST\x02"
+    private const int FooterSize = 32;
 
     private readonly FileStream _stream;
     private readonly int _targetBlockSize;
     private readonly MemoryPool<byte> _pool;
 
     private readonly List<IndexEntry> _index = new();
+    private readonly List<byte[]> _allKeys = new();
     private IMemoryOwner<byte>? _blockBuffer;
     private int _blockOffset;
     private int _entryCount;
+    private int _totalEntryCount;
     private byte[] _prevKey = Array.Empty<byte>();
     private byte[]? _blockFirstKey;
     private long _blockStartPos;
@@ -108,6 +114,8 @@ public sealed class SSTableWriter : IAsyncDisposable
 
         _prevKey = key;
         _entryCount++;
+        _totalEntryCount++;
+        _allKeys.Add(key);
     }
 
     public async ValueTask FinishAsync()
@@ -115,43 +123,61 @@ public sealed class SSTableWriter : IAsyncDisposable
         if (_blockOffset > 0)
             await FlushBlockAsync().ConfigureAwait(false);
 
-        // Compute total index block size
+        // Write index block
         long indexOffset = _stream.Position;
         int indexCount = _index.Count;
         int indexSize = 0;
         foreach (var entry in _index)
             indexSize += 4 + entry.FirstKey.Length + 8 + 4;
 
-        int totalSize = indexSize + 16; // index + footer
-        var buf = ArrayPool<byte>.Shared.Rent(totalSize);
+        var indexBuf = ArrayPool<byte>.Shared.Rent(indexSize);
         try
         {
             int off = 0;
             foreach (var entry in _index)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), entry.FirstKey.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(indexBuf.AsSpan(off), entry.FirstKey.Length);
                 off += 4;
-                entry.FirstKey.CopyTo(buf.AsSpan(off));
+                entry.FirstKey.CopyTo(indexBuf.AsSpan(off));
                 off += entry.FirstKey.Length;
-                BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off), entry.Offset);
+                BinaryPrimitives.WriteInt64LittleEndian(indexBuf.AsSpan(off), entry.Offset);
                 off += 8;
-                BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), entry.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(indexBuf.AsSpan(off), entry.Length);
                 off += 4;
             }
 
-            // Footer
-            BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(off), indexOffset);
-            off += 8;
-            BinaryPrimitives.WriteInt32LittleEndian(buf.AsSpan(off), indexCount);
-            off += 4;
-            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(off), Magic);
-            off += 4;
-
-            await _stream.WriteAsync(buf.AsMemory(0, totalSize)).ConfigureAwait(false);
+            await _stream.WriteAsync(indexBuf.AsMemory(0, indexSize)).ConfigureAwait(false);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            ArrayPool<byte>.Shared.Return(indexBuf);
+        }
+
+        // Build and write bloom filter
+        var bloom = BloomFilter.Create(_totalEntryCount);
+        foreach (var key in _allKeys)
+            bloom.Add(key);
+
+        long bloomOffset = _stream.Position;
+        int bloomLength = bloom.ByteCount;
+        await _stream.WriteAsync(bloom.AsSpan().ToArray().AsMemory(0, bloomLength)).ConfigureAwait(false);
+
+        // Write footer (32 bytes)
+        var footer = ArrayPool<byte>.Shared.Rent(FooterSize);
+        try
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0), indexOffset);
+            BinaryPrimitives.WriteInt32LittleEndian(footer.AsSpan(8), indexCount);
+            BinaryPrimitives.WriteInt32LittleEndian(footer.AsSpan(12), _totalEntryCount);
+            BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(16), bloomOffset);
+            BinaryPrimitives.WriteInt32LittleEndian(footer.AsSpan(24), bloomLength);
+            BinaryPrimitives.WriteUInt32LittleEndian(footer.AsSpan(28), Magic);
+
+            await _stream.WriteAsync(footer.AsMemory(0, FooterSize)).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(footer);
         }
 
         await _stream.FlushAsync().ConfigureAwait(false);
@@ -207,13 +233,16 @@ public sealed class SSTableWriter : IAsyncDisposable
 /// </summary>
 public sealed class SSTableReader : IAsyncDisposable
 {
-    private const uint Magic = 0x53535401;
+    private const uint Magic = 0x53535402;
+    private const int FooterSize = 32;
     private readonly SafeFileHandle _handle;
     private IndexEntry[] _index = Array.Empty<IndexEntry>();
+    private BloomFilter? _bloom;
     private readonly string _filePath;
 
     public byte[] MinKey { get; private set; } = Array.Empty<byte>();
     public byte[] MaxKey { get; private set; } = Array.Empty<byte>();
+    public int EntryCount { get; private set; }
 
     private SSTableReader(string filePath, SafeFileHandle handle)
     {
@@ -237,19 +266,24 @@ public sealed class SSTableReader : IAsyncDisposable
     {
         long fileLength = RandomAccess.GetLength(_handle);
 
-        // Read footer (last 16 bytes)
-        var footerBuf = new byte[16];
-        await RandomAccess.ReadAsync(_handle, footerBuf, fileLength - 16).ConfigureAwait(false);
+        // Read footer (last 32 bytes)
+        var footerBuf = new byte[FooterSize];
+        await RandomAccess.ReadAsync(_handle, footerBuf, fileLength - FooterSize).ConfigureAwait(false);
 
         long indexOffset = BinaryPrimitives.ReadInt64LittleEndian(footerBuf);
         int indexCount = BinaryPrimitives.ReadInt32LittleEndian(footerBuf.AsSpan(8));
-        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(footerBuf.AsSpan(12));
+        int entryCount = BinaryPrimitives.ReadInt32LittleEndian(footerBuf.AsSpan(12));
+        long bloomOffset = BinaryPrimitives.ReadInt64LittleEndian(footerBuf.AsSpan(16));
+        int bloomLength = BinaryPrimitives.ReadInt32LittleEndian(footerBuf.AsSpan(24));
+        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(footerBuf.AsSpan(28));
 
         if (magic != Magic)
             throw new InvalidDataException("Invalid SSTable file: bad magic number");
 
+        EntryCount = entryCount;
+
         // Read entire index block in a single I/O
-        int indexBlockLen = (int)(fileLength - 16 - indexOffset);
+        int indexBlockLen = (int)(bloomOffset - indexOffset);
         var indexBuf = ArrayPool<byte>.Shared.Rent(indexBlockLen);
         try
         {
@@ -273,6 +307,21 @@ public sealed class SSTableReader : IAsyncDisposable
         finally
         {
             ArrayPool<byte>.Shared.Return(indexBuf);
+        }
+
+        // Read bloom filter
+        if (bloomLength > 0)
+        {
+            var bloomBuf = ArrayPool<byte>.Shared.Rent(bloomLength);
+            try
+            {
+                await RandomAccess.ReadAsync(_handle, bloomBuf.AsMemory(0, bloomLength), bloomOffset).ConfigureAwait(false);
+                _bloom = BloomFilter.FromBytes(bloomBuf.AsSpan(0, bloomLength), entryCount);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(bloomBuf);
+            }
         }
 
         // MinKey = first key of first block
@@ -334,6 +383,10 @@ public sealed class SSTableReader : IAsyncDisposable
     /// </summary>
     public async ValueTask<(byte[]? Value, bool Found)> GetAsync(byte[] key)
     {
+        // Bloom filter fast-reject: if the filter says "definitely not here", skip I/O entirely
+        if (_bloom is not null && !_bloom.MayContain(key))
+            return (null, false);
+
         int blockIdx = FindBlock(key);
         if (blockIdx < 0) return (null, false);
 
