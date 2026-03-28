@@ -466,6 +466,116 @@ public class SSTableBloomFilterTests : TempDirTest
     }
 }
 
+public class BlockCacheTests : TempDirTest
+{
+    [Fact]
+    public void Insert_And_TryGet()
+    {
+        using var cache = new BlockCache(1024);
+        var data = new byte[] { 1, 2, 3, 4, 5 };
+
+        cache.Insert("file.sst", 0, data);
+
+        Assert.True(cache.TryGet("file.sst", 0, out var lease));
+        using (lease)
+        {
+            Assert.Equal(data.Length, lease.Span.Length);
+            Assert.True(data.AsSpan().SequenceEqual(lease.Span));
+        }
+    }
+
+    [Fact]
+    public void TryGet_Returns_False_For_Missing()
+    {
+        using var cache = new BlockCache(1024);
+        Assert.False(cache.TryGet("file.sst", 0, out _));
+    }
+
+    [Fact]
+    public void Eviction_Removes_Oldest_Entries()
+    {
+        // Cache fits ~3 blocks of 100 bytes each (maxBytes=300)
+        using var cache = new BlockCache(300);
+        var block = new byte[100];
+
+        cache.Insert("a.sst", 0, block);
+        cache.Insert("b.sst", 0, block);
+        cache.Insert("c.sst", 0, block);
+
+        // Touch 'a' so it's most recent
+        Assert.True(cache.TryGet("a.sst", 0, out var lease));
+        lease.Dispose();
+
+        // Insert 'd' — should trigger eviction of 'b' (oldest untouched)
+        cache.Insert("d.sst", 0, block);
+
+        Assert.True(cache.TryGet("a.sst", 0, out var a)); a.Dispose();
+        Assert.False(cache.TryGet("b.sst", 0, out _)); // evicted
+        Assert.True(cache.TryGet("d.sst", 0, out var d)); d.Dispose();
+    }
+
+    [Fact]
+    public void Invalidate_Removes_All_Blocks_For_File()
+    {
+        using var cache = new BlockCache(4096);
+        var block = new byte[100];
+
+        cache.Insert("file.sst", 0, block);
+        cache.Insert("file.sst", 100, block);
+        cache.Insert("other.sst", 0, block);
+
+        cache.Invalidate("file.sst");
+
+        Assert.False(cache.TryGet("file.sst", 0, out _));
+        Assert.False(cache.TryGet("file.sst", 100, out _));
+        Assert.True(cache.TryGet("other.sst", 0, out var lease));
+        lease.Dispose();
+    }
+
+    [Fact]
+    public void CurrentBytes_Tracks_Size()
+    {
+        using var cache = new BlockCache(4096);
+        Assert.Equal(0, cache.CurrentBytes);
+
+        cache.Insert("f.sst", 0, new byte[200]);
+        Assert.Equal(200, cache.CurrentBytes);
+
+        cache.Insert("f.sst", 200, new byte[300]);
+        Assert.Equal(500, cache.CurrentBytes);
+
+        cache.Invalidate("f.sst");
+        Assert.Equal(0, cache.CurrentBytes);
+    }
+
+    [Fact]
+    public async Task SSTableReader_Uses_Cache_For_PointLookups()
+    {
+        var path = Path.Combine(TempDir, "cached.sst");
+        using var cache = new BlockCache(1024 * 1024);
+
+        await using (var writer = SSTableWriter.Create(path))
+        {
+            for (int i = 0; i < 50; i++)
+                await writer.WriteEntryAsync(Key($"key/{i:D4}"), Val($"val{i}"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path, cache);
+
+        // First lookup — cache miss, populates cache
+        var (v1, f1) = await reader.GetAsync(Key("key/0025"));
+        Assert.True(f1);
+        Assert.Equal("val25", Str(v1));
+        Assert.True(cache.CurrentBytes > 0, "Cache should be populated after first lookup");
+
+        // Second lookup for a key in the same block — should hit cache
+        var (v2, f2) = await reader.GetAsync(Key("key/0025"));
+        Assert.True(f2);
+        Assert.Equal("val25", Str(v2));
+    }
+}
+
 public class CompactionTests
 {
     [Fact]

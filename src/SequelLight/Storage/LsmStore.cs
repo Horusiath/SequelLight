@@ -8,6 +8,7 @@ public sealed class LsmStoreOptions
     public required string Directory { get; init; }
     public int MemTableFlushThreshold { get; init; } = 4 * 1024 * 1024; // 4 MiB
     public int SSTableBlockSize { get; init; } = SSTableWriter.DefaultBlockSize;
+    public long BlockCacheSize { get; init; } = 64 * 1024 * 1024; // 64 MiB
     public ICompactionStrategy CompactionStrategy { get; init; } = new LevelTieredCompaction();
 }
 
@@ -19,6 +20,7 @@ public sealed class LsmStore : IAsyncDisposable
 {
     private readonly LsmStoreOptions _options;
     private readonly MemTable _memTable = new();
+    private readonly BlockCache? _blockCache;
     private WriteAheadLog? _wal;
     private long _sequenceNumber;
 
@@ -30,6 +32,8 @@ public sealed class LsmStore : IAsyncDisposable
     private LsmStore(LsmStoreOptions options)
     {
         _options = options;
+        if (options.BlockCacheSize > 0)
+            _blockCache = new BlockCache(options.BlockCacheSize);
     }
 
     public static async ValueTask<LsmStore> OpenAsync(LsmStoreOptions options)
@@ -51,7 +55,7 @@ public sealed class LsmStore : IAsyncDisposable
         var sstList = ImmutableList.CreateBuilder<SSTableInfo>();
         foreach (var file in sstFiles)
         {
-            var reader = await SSTableReader.OpenAsync(file).ConfigureAwait(false);
+            var reader = await SSTableReader.OpenAsync(file, _blockCache).ConfigureAwait(false);
             _readerCache[file] = reader;
 
             int level = ParseLevel(file);
@@ -198,7 +202,7 @@ public sealed class LsmStore : IAsyncDisposable
         }
 
         // Open reader and cache it
-        var reader = await SSTableReader.OpenAsync(sstPath).ConfigureAwait(false);
+        var reader = await SSTableReader.OpenAsync(sstPath, _blockCache).ConfigureAwait(false);
         _readerCache[sstPath] = reader;
 
         var info = new SSTableInfo
@@ -316,7 +320,7 @@ public sealed class LsmStore : IAsyncDisposable
         }
 
         // Open reader for new SSTable
-        var newReader = await SSTableReader.OpenAsync(outputPath).ConfigureAwait(false);
+        var newReader = await SSTableReader.OpenAsync(outputPath, _blockCache).ConfigureAwait(false);
         _readerCache[outputPath] = newReader;
 
         var newInfo = new SSTableInfo
@@ -340,9 +344,10 @@ public sealed class LsmStore : IAsyncDisposable
             updated = builder.ToImmutable();
         } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
 
-        // Close old readers and delete old files
+        // Close old readers, invalidate cached blocks, and delete old files
         foreach (var input in plan.InputTables)
         {
+            _blockCache?.Invalidate(input.FilePath);
             if (_readerCache.TryRemove(input.FilePath, out var oldReader))
                 await oldReader.DisposeAsync().ConfigureAwait(false);
             try { File.Delete(input.FilePath); } catch { }
@@ -363,6 +368,8 @@ public sealed class LsmStore : IAsyncDisposable
         foreach (var reader in _readerCache.Values)
             await reader.DisposeAsync().ConfigureAwait(false);
         _readerCache.Clear();
+
+        _blockCache?.Dispose();
     }
 
     private readonly record struct MergeKey(byte[] Key, int SourceIndex);

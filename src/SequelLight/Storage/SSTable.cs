@@ -244,20 +244,23 @@ public sealed class SSTableReader : IAsyncDisposable
     public byte[] MaxKey { get; private set; } = Array.Empty<byte>();
     public int EntryCount { get; private set; }
 
-    private SSTableReader(string filePath, SafeFileHandle handle)
+    private readonly BlockCache? _blockCache;
+
+    private SSTableReader(string filePath, SafeFileHandle handle, BlockCache? blockCache)
     {
         _filePath = filePath;
         _handle = handle;
+        _blockCache = blockCache;
     }
 
     public string FilePath => _filePath;
     public int BlockCount => _index.Length;
 
-    public static async ValueTask<SSTableReader> OpenAsync(string filePath)
+    public static async ValueTask<SSTableReader> OpenAsync(string filePath, BlockCache? blockCache = null)
     {
         var handle = File.OpenHandle(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             FileOptions.Asynchronous);
-        var reader = new SSTableReader(filePath, handle);
+        var reader = new SSTableReader(filePath, handle, blockCache);
         await reader.ReadFooterAndIndexAsync().ConfigureAwait(false);
         return reader;
     }
@@ -391,11 +394,25 @@ public sealed class SSTableReader : IAsyncDisposable
         if (blockIdx < 0) return (null, false);
 
         var idx = _index[blockIdx];
+
+        // Try block cache first — zero allocations, no I/O
+        if (_blockCache is not null && _blockCache.TryGet(_filePath, idx.Offset, out var lease))
+        {
+            using (lease)
+                return FindInBlock(lease.Span, key);
+        }
+
+        // Cache miss: read from disk
         var blockBytes = ArrayPool<byte>.Shared.Rent(idx.Length);
         try
         {
             await RandomAccess.ReadAsync(_handle, blockBytes.AsMemory(0, idx.Length), idx.Offset).ConfigureAwait(false);
-            return FindInBlock(blockBytes.AsSpan(0, idx.Length), key);
+            var span = blockBytes.AsSpan(0, idx.Length);
+
+            // Populate cache for future lookups
+            _blockCache?.Insert(_filePath, idx.Offset, span);
+
+            return FindInBlock(span, key);
         }
         finally
         {

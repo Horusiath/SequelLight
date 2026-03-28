@@ -163,6 +163,59 @@ public class LsmStoreBenchmarks
             await tx.CommitAsync();
         }
     }
+
+    [Benchmark(Description = "Repeated reads (SSTable, cached)")]
+    public async Task RepeatedReadsSSTableCached()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = _tempDir,
+            MemTableFlushThreshold = 1, // force flush to SSTable
+        });
+
+        // Load data into SSTables
+        await using (var tx = store.BeginReadWrite())
+        {
+            for (int i = 0; i < _keys.Length; i++)
+                tx.Put(_keys[i], _values[i]);
+            await tx.CommitAsync();
+        }
+
+        // Read all keys 3 times — second and third pass should hit block cache
+        for (int pass = 0; pass < 3; pass++)
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < _keys.Length; i++)
+                await ro.GetAsync(_keys[i]);
+        }
+    }
+
+    [Benchmark(Description = "Repeated reads (SSTable, no cache)")]
+    public async Task RepeatedReadsSSTableNoCache()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = _tempDir,
+            MemTableFlushThreshold = 1, // force flush to SSTable
+            BlockCacheSize = 0, // disable cache
+        });
+
+        // Load data into SSTables
+        await using (var tx = store.BeginReadWrite())
+        {
+            for (int i = 0; i < _keys.Length; i++)
+                tx.Put(_keys[i], _values[i]);
+            await tx.CommitAsync();
+        }
+
+        // Read all keys 3 times — every read hits disk
+        for (int pass = 0; pass < 3; pass++)
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < _keys.Length; i++)
+                await ro.GetAsync(_keys[i]);
+        }
+    }
 }
 
 [Config(typeof(LsmBenchmarkConfig))]
