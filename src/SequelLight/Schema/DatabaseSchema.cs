@@ -101,22 +101,35 @@ public sealed class DatabaseSchema
 
         var body = (ColumnsTableBody)stmt.Body;
 
-        // Collect table-level PK columns for marking on individual ColumnSchema
-        HashSet<string>? tablePkColumnNames = null;
+        // Single pass over table-level constraints
+        string[]? tablePkColumnNames = null;
         PrimaryKeySchema? primaryKey = null;
+        List<UniqueConstraintSchema>? uniqueConstraints = null;
+        List<CheckConstraintSchema>? checkConstraints = null;
+        List<ForeignKeyConstraintSchema>? foreignKeys = null;
 
         foreach (var constraint in body.Constraints)
         {
-            if (constraint is PrimaryKeyTableConstraint pk)
+            switch (constraint)
             {
-                primaryKey = new PrimaryKeySchema(pk.Name, pk.Columns, pk.OnConflict);
-                tablePkColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var col in pk.Columns)
-                {
-                    if (col.Expression is ColumnRefExpr colRef)
-                        tablePkColumnNames.Add(colRef.Column);
-                }
-                break;
+                case PrimaryKeyTableConstraint pk:
+                    primaryKey = new PrimaryKeySchema(pk.Name, pk.Columns, pk.OnConflict);
+                    tablePkColumnNames = new string[pk.Columns.Count];
+                    for (int j = 0; j < pk.Columns.Count; j++)
+                    {
+                        if (pk.Columns[j].Expression is ColumnRefExpr colRef)
+                            tablePkColumnNames[j] = colRef.Column;
+                    }
+                    break;
+                case UniqueTableConstraint u:
+                    (uniqueConstraints ??= new()).Add(new UniqueConstraintSchema(u.Name, u.Columns, u.OnConflict));
+                    break;
+                case CheckTableConstraint c:
+                    (checkConstraints ??= new()).Add(new CheckConstraintSchema(c.Name, c.Expression));
+                    break;
+                case ForeignKeyTableConstraint fk:
+                    (foreignKeys ??= new()).Add(new ForeignKeyConstraintSchema(fk.Name, fk.Columns, fk.ForeignKey));
+                    break;
             }
         }
 
@@ -145,29 +158,17 @@ public sealed class DatabaseSchema
             }
         }
 
-        // Build remaining table-level constraints
-        var uniqueConstraints = new List<UniqueConstraintSchema>();
-        var checkConstraints = new List<CheckConstraintSchema>();
-        var foreignKeys = new List<ForeignKeyConstraintSchema>();
-
-        foreach (var constraint in body.Constraints)
+        // Table options — manual loop avoids LINQ Contains enumerator allocation
+        bool withoutRowId = false;
+        bool isStrict = false;
+        foreach (var option in body.Options)
         {
-            switch (constraint)
+            switch (option)
             {
-                case UniqueTableConstraint u:
-                    uniqueConstraints.Add(new UniqueConstraintSchema(u.Name, u.Columns, u.OnConflict));
-                    break;
-                case CheckTableConstraint c:
-                    checkConstraints.Add(new CheckConstraintSchema(c.Name, c.Expression));
-                    break;
-                case ForeignKeyTableConstraint fk:
-                    foreignKeys.Add(new ForeignKeyConstraintSchema(fk.Name, fk.Columns, fk.ForeignKey));
-                    break;
+                case TableOption.WithoutRowId: withoutRowId = true; break;
+                case TableOption.Strict: isStrict = true; break;
             }
         }
-
-        bool withoutRowId = body.Options.Contains(TableOption.WithoutRowId);
-        bool isStrict = body.Options.Contains(TableOption.Strict);
 
         var oid = AllocateOid();
         _tables[oid] = new TableSchema(
@@ -179,9 +180,9 @@ public sealed class DatabaseSchema
             columns,
             nextColSeq + 1,
             primaryKey,
-            uniqueConstraints,
-            checkConstraints,
-            foreignKeys);
+            (IReadOnlyList<UniqueConstraintSchema>?)uniqueConstraints ?? Array.Empty<UniqueConstraintSchema>(),
+            (IReadOnlyList<CheckConstraintSchema>?)checkConstraints ?? Array.Empty<CheckConstraintSchema>(),
+            (IReadOnlyList<ForeignKeyConstraintSchema>?)foreignKeys ?? Array.Empty<ForeignKeyConstraintSchema>());
         _tableNames[stmt.Table] = oid;
     }
 
@@ -197,13 +198,7 @@ public sealed class DatabaseSchema
             throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
 
         var oid = AllocateOid();
-        _indexes[oid] = new IndexSchema(
-            oid,
-            stmt.Index,
-            tableOid,
-            stmt.Unique,
-            stmt.Columns,
-            stmt.Where);
+        _indexes[oid] = new IndexSchema(oid, stmt.Index, tableOid, stmt.Unique, stmt.Columns, stmt.Where);
         _indexNames[stmt.Index] = oid;
     }
 
@@ -216,12 +211,7 @@ public sealed class DatabaseSchema
         }
 
         var oid = AllocateOid();
-        _views[oid] = new ViewSchema(
-            oid,
-            stmt.View,
-            stmt.Temporary,
-            stmt.Columns,
-            stmt.Query);
+        _views[oid] = new ViewSchema(oid, stmt.View, stmt.Temporary, stmt.Columns, stmt.Query);
         _viewNames[stmt.View] = oid;
     }
 
@@ -238,15 +228,8 @@ public sealed class DatabaseSchema
 
         var oid = AllocateOid();
         _triggers[oid] = new TriggerSchema(
-            oid,
-            stmt.Trigger,
-            stmt.Temporary,
-            tableOid,
-            stmt.Timing,
-            stmt.Event,
-            stmt.ForEachRow,
-            stmt.When,
-            stmt.Body);
+            oid, stmt.Trigger, stmt.Temporary, tableOid,
+            stmt.Timing, stmt.Event, stmt.ForEachRow, stmt.When, stmt.Body);
         _triggerNames[stmt.Trigger] = oid;
     }
 
@@ -320,29 +303,24 @@ public sealed class DatabaseSchema
             {
                 _tableNames.Remove(stmt.Table);
                 _tableNames[rename.NewName] = tableOid;
-                _tables[tableOid] = table with { Name = rename.NewName };
+                table.Name = rename.NewName;
                 // Indexes/triggers reference by Oid — no updates needed
                 break;
             }
             case RenameColumnAction renameCol:
             {
-                var columns = new ColumnSchema[table.Columns.Count];
                 bool found = false;
                 for (int i = 0; i < table.Columns.Count; i++)
                 {
                     if (string.Equals(table.Columns[i].Name, renameCol.OldName, StringComparison.OrdinalIgnoreCase))
                     {
-                        columns[i] = table.Columns[i] with { Name = renameCol.NewName };
+                        table.Columns[i].Name = renameCol.NewName;
                         found = true;
-                    }
-                    else
-                    {
-                        columns[i] = table.Columns[i];
+                        break;
                     }
                 }
                 if (!found)
                     throw new InvalidOperationException($"Column '{renameCol.OldName}' does not exist in table '{stmt.Table}'.");
-                _tables[tableOid] = table with { Columns = columns };
                 break;
             }
             case AddColumnAction addCol:
@@ -352,23 +330,31 @@ public sealed class DatabaseSchema
                 for (int i = 0; i < table.Columns.Count; i++)
                     columns[i] = table.Columns[i];
                 columns[table.Columns.Count] = newColumn;
-                _tables[tableOid] = table with { Columns = columns, NextColumnSeqNo = table.NextColumnSeqNo + 1 };
+                table.Columns = columns;
+                table.NextColumnSeqNo++;
                 break;
             }
             case DropColumnAction dropCol:
             {
-                var columns = new List<ColumnSchema>(table.Columns.Count - 1);
-                bool found = false;
-                foreach (var col in table.Columns)
+                int dropIndex = -1;
+                for (int i = 0; i < table.Columns.Count; i++)
                 {
-                    if (string.Equals(col.Name, dropCol.ColumnName, StringComparison.OrdinalIgnoreCase))
-                        found = true;
-                    else
-                        columns.Add(col);
+                    if (string.Equals(table.Columns[i].Name, dropCol.ColumnName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        dropIndex = i;
+                        break;
+                    }
                 }
-                if (!found)
+                if (dropIndex < 0)
                     throw new InvalidOperationException($"Column '{dropCol.ColumnName}' does not exist in table '{stmt.Table}'.");
-                _tables[tableOid] = table with { Columns = columns };
+
+                var columns = new ColumnSchema[table.Columns.Count - 1];
+                for (int i = 0, j = 0; i < table.Columns.Count; i++)
+                {
+                    if (i != dropIndex)
+                        columns[j++] = table.Columns[i];
+                }
+                table.Columns = columns;
                 break;
             }
             default:
@@ -376,34 +362,33 @@ public sealed class DatabaseSchema
         }
     }
 
-    private static ColumnSchema BuildColumn(int seqNo, ColumnDef colDef, HashSet<string>? tablePkColumns)
+    private static ColumnSchema BuildColumn(int seqNo, ColumnDef colDef, string[]? tablePkColumns)
     {
-        bool isNotNull = false;
-        bool isPrimaryKey = tablePkColumns?.Contains(colDef.Name) ?? false;
+        var flags = ColumnFlags.None;
         SortOrder? pkOrder = null;
-        bool isAutoincrement = false;
-        bool isUnique = false;
         string? collation = null;
         SqlExpr? defaultValue = null;
         SqlExpr? checkExpression = null;
         ForeignKeyClause? foreignKey = null;
         SqlExpr? generatedExpression = null;
-        bool isStored = false;
+
+        if (tablePkColumns != null && ContainsColumn(tablePkColumns, colDef.Name))
+            flags |= ColumnFlags.PrimaryKey;
 
         foreach (var constraint in colDef.Constraints)
         {
             switch (constraint)
             {
                 case PrimaryKeyColumnConstraint pk:
-                    isPrimaryKey = true;
+                    flags |= ColumnFlags.PrimaryKey;
                     pkOrder = pk.Order;
-                    isAutoincrement = pk.Autoincrement;
+                    if (pk.Autoincrement) flags |= ColumnFlags.Autoincrement;
                     break;
                 case NotNullColumnConstraint:
-                    isNotNull = true;
+                    flags |= ColumnFlags.NotNull;
                     break;
                 case UniqueColumnConstraint:
-                    isUnique = true;
+                    flags |= ColumnFlags.Unique;
                     break;
                 case CollateColumnConstraint c:
                     collation = c.Collation;
@@ -419,7 +404,7 @@ public sealed class DatabaseSchema
                     break;
                 case GeneratedColumnConstraint g:
                     generatedExpression = g.Expression;
-                    isStored = g.Stored;
+                    if (g.Stored) flags |= ColumnFlags.Stored;
                     break;
             }
         }
@@ -428,16 +413,25 @@ public sealed class DatabaseSchema
             seqNo,
             colDef.Name,
             colDef.Type?.Name,
-            isNotNull,
-            isPrimaryKey,
+            flags,
             pkOrder,
-            isAutoincrement,
-            isUnique,
             collation,
             defaultValue,
             checkExpression,
             foreignKey,
-            generatedExpression,
-            isStored);
+            generatedExpression);
+    }
+
+    /// <summary>
+    /// Linear scan — faster than HashSet for the typical 1-3 PK columns.
+    /// </summary>
+    private static bool ContainsColumn(string[] columns, string name)
+    {
+        foreach (var col in columns)
+        {
+            if (col != null && string.Equals(col, name, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 }
