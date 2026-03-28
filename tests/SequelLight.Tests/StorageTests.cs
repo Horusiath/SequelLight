@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using SequelLight.Storage;
 
@@ -137,11 +138,8 @@ public class MemTableTests
         var mt = new MemTable();
         var snap1 = mt.Snapshot();
 
-        var mutations = new List<(byte[], MemEntry)>
-        {
-            (Key("a"), new MemEntry(Val("1"), 1))
-        };
-        Assert.True(mt.TryApply(snap1, mutations));
+        var newData = snap1.SetItem(Key("a"), new MemEntry(Val("1"), 1));
+        Assert.True(mt.TryApply(snap1, newData));
 
         // snap1 should still be empty (immutable)
         Assert.Empty(snap1);
@@ -157,10 +155,12 @@ public class MemTableTests
         var snap = mt.Snapshot();
 
         // First write succeeds
-        Assert.True(mt.TryApply(snap, [(Key("a"), new MemEntry(Val("1"), 1))]));
+        var newData1 = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
+        Assert.True(mt.TryApply(snap, newData1));
 
-        // Second write with stale snapshot fails
-        Assert.False(mt.TryApply(snap, [(Key("b"), new MemEntry(Val("2"), 2))]));
+        // Second write with stale snapshot fails (snap is no longer current)
+        var newData2 = snap.SetItem(Key("b"), new MemEntry(Val("2"), 2));
+        Assert.False(mt.TryApply(snap, newData2));
     }
 
     [Fact]
@@ -168,7 +168,8 @@ public class MemTableTests
     {
         var mt = new MemTable();
         var snap = mt.Snapshot();
-        mt.TryApply(snap, [(Key("a"), new MemEntry(Val("1"), 1))]);
+        var newData = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
+        mt.TryApply(snap, newData);
 
         var old = mt.SwapOut();
         Assert.Single(old);
@@ -182,7 +183,8 @@ public class MemTableTests
         Assert.Equal(0, mt.ApproximateSize);
 
         var snap = mt.Snapshot();
-        mt.TryApply(snap, [(Key("abc"), new MemEntry(Val("12345"), 1))]);
+        var newData = snap.SetItem(Key("abc"), new MemEntry(Val("12345"), 1));
+        mt.TryApply(snap, newData);
 
         // key(3) + value(5) = 8
         Assert.Equal(8, mt.ApproximateSize);
@@ -346,10 +348,9 @@ public class CompactionTests
     public void Plan_Returns_Null_When_Below_Threshold()
     {
         var strategy = new LevelTieredCompaction(level0Threshold: 4);
-        var tables = new List<SSTableInfo>
-        {
-            MakeTable(0), MakeTable(0), MakeTable(0), // 3 < 4
-        };
+        var tables = ImmutableList.Create(
+            MakeTable(0), MakeTable(0), MakeTable(0) // 3 < 4
+        );
         Assert.Null(strategy.Plan(tables));
     }
 
@@ -357,10 +358,9 @@ public class CompactionTests
     public void Plan_Returns_Compaction_At_Threshold()
     {
         var strategy = new LevelTieredCompaction(level0Threshold: 4);
-        var tables = new List<SSTableInfo>
-        {
-            MakeTable(0), MakeTable(0), MakeTable(0), MakeTable(0), // 4 >= 4
-        };
+        var tables = ImmutableList.Create(
+            MakeTable(0), MakeTable(0), MakeTable(0), MakeTable(0) // 4 >= 4
+        );
         var plan = strategy.Plan(tables);
         Assert.NotNull(plan);
         Assert.Equal(1, plan.TargetLevel);
@@ -371,12 +371,11 @@ public class CompactionTests
     public void Plan_Includes_Overlapping_NextLevel_Tables()
     {
         var strategy = new LevelTieredCompaction(level0Threshold: 2);
-        var tables = new List<SSTableInfo>
-        {
+        var tables = ImmutableList.Create(
             MakeTable(0, "a", "m"),
             MakeTable(0, "n", "z"),
-            MakeTable(1, "d", "f"), // overlaps with first L0 table
-        };
+            MakeTable(1, "d", "f") // overlaps with first L0 table
+        );
 
         var plan = strategy.Plan(tables);
         Assert.NotNull(plan);

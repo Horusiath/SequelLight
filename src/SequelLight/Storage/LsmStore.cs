@@ -87,7 +87,7 @@ public sealed class LsmStore : IAsyncDisposable
         if (File.Exists(walPath))
         {
             var snapshot = _memTable.Snapshot();
-            var mutations = new List<(byte[], MemEntry)>();
+            var recovered = snapshot;
             long maxSeq = 0;
 
             await WriteAheadLog.ReplayAsync(walPath, (type, key, value) =>
@@ -96,13 +96,13 @@ public sealed class LsmStore : IAsyncDisposable
                 var entry = type == WalEntryType.Put
                     ? new MemEntry(value, maxSeq)
                     : new MemEntry(null, maxSeq);
-                mutations.Add((key, entry));
+                recovered = recovered.SetItem(key, entry);
                 return ValueTask.CompletedTask;
             }).ConfigureAwait(false);
 
-            if (mutations.Count > 0)
+            if (maxSeq > 0)
             {
-                _memTable.TryApply(snapshot, mutations);
+                _memTable.TryApply(snapshot, recovered);
                 _sequenceNumber = maxSeq;
             }
         }
@@ -168,13 +168,13 @@ public sealed class LsmStore : IAsyncDisposable
 
     internal async ValueTask<bool> CommitAsync(
         ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
-        IReadOnlyList<(byte[] Key, byte[]? Value)> writes,
-        long baseSequence)
+        ImmutableSortedDictionary<byte[], MemEntry> newSnapshot,
+        List<(byte[] Key, byte[]? Value)> walWrites)
     {
-        if (writes.Count == 0) return true;
+        if (walWrites.Count == 0) return true;
 
         // Write to WAL first for durability
-        foreach (var (key, value) in writes)
+        foreach (var (key, value) in walWrites)
         {
             if (value is not null)
                 await _wal!.AppendPutAsync(key, value).ConfigureAwait(false);
@@ -183,17 +183,8 @@ public sealed class LsmStore : IAsyncDisposable
         }
         await _wal!.FlushAsync().ConfigureAwait(false);
 
-        // Build mutations with sequence numbers
-        var mutations = new List<(byte[], MemEntry)>(writes.Count);
-        for (int i = 0; i < writes.Count; i++)
-        {
-            var seq = Interlocked.Increment(ref _sequenceNumber);
-            var (key, value) = writes[i];
-            mutations.Add((key, new MemEntry(value, seq)));
-        }
-
         // CAS apply
-        if (!_memTable.TryApply(expectedSnapshot, mutations))
+        if (!_memTable.TryApply(expectedSnapshot, newSnapshot))
             return false;
 
         // Check if flush is needed
@@ -382,18 +373,17 @@ public sealed class ReadOnlyTransaction : IDisposable
 }
 
 /// <summary>
-/// Read-write transaction. Accumulates writes locally and applies them
-/// atomically on commit via CAS.
+/// Read-write transaction. Mutations are applied to a local copy of the memtable snapshot.
+/// On commit, the entire modified snapshot is CAS-swapped into the memtable.
 /// </summary>
 public sealed class ReadWriteTransaction : IAsyncDisposable
 {
     private readonly LsmStore _store;
     private readonly ImmutableSortedDictionary<byte[], MemEntry> _baseSnapshot;
     private readonly ImmutableList<SSTableInfo> _sstables;
-    private readonly long _baseSequence;
-    private readonly List<(byte[] Key, byte[]? Value)> _writes = new();
-    // Local buffer for reads-your-own-writes
-    private readonly SortedDictionary<byte[], byte[]?> _localWrites = new(KeyComparer.Instance);
+    private ImmutableSortedDictionary<byte[], MemEntry> _current;
+    private readonly List<(byte[] Key, byte[]? Value)> _walWrites = new();
+    private long _nextSeq;
     private bool _committed;
     private bool _disposed;
 
@@ -405,8 +395,9 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     {
         _store = store;
         _baseSnapshot = snapshot;
+        _current = snapshot;
         _sstables = sstables;
-        _baseSequence = baseSequence;
+        _nextSeq = baseSequence + 1;
     }
 
     public void Put(byte[] key, byte[] value)
@@ -414,8 +405,8 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        _writes.Add((key, value));
-        _localWrites[key] = value;
+        _current = _current.SetItem(key, new MemEntry(value, _nextSeq++));
+        _walWrites.Add((key, value));
     }
 
     public void Delete(byte[] key)
@@ -423,20 +414,16 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        _writes.Add((key, null));
-        _localWrites[key] = null;
+        _current = _current.SetItem(key, new MemEntry(null, _nextSeq++));
+        _walWrites.Add((key, null));
     }
 
     public async ValueTask<byte[]?> GetAsync(byte[] key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Check local writes first (read-your-own-writes)
-        if (_localWrites.TryGetValue(key, out var localValue))
-            return localValue;
-
-        // Check base memtable snapshot
-        if (_baseSnapshot.TryGetValue(key, out var entry))
+        // Check local modified snapshot (includes read-your-own-writes)
+        if (_current.TryGetValue(key, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
         // Check SSTables
@@ -454,9 +441,9 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
         _committed = true;
-        if (_writes.Count == 0) return true;
+        if (_walWrites.Count == 0) return true;
 
-        return await _store.CommitAsync(_baseSnapshot, _writes, _baseSequence).ConfigureAwait(false);
+        return await _store.CommitAsync(_baseSnapshot, _current, _walWrites).ConfigureAwait(false);
     }
 
     public ValueTask DisposeAsync()

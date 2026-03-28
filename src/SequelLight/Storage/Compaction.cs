@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace SequelLight.Storage;
 
 /// <summary>
@@ -17,7 +19,7 @@ public sealed class SSTableInfo
 /// </summary>
 public sealed class CompactionPlan
 {
-    public required IReadOnlyList<SSTableInfo> InputTables { get; init; }
+    public required List<SSTableInfo> InputTables { get; init; }
     public required int TargetLevel { get; init; }
 }
 
@@ -30,7 +32,7 @@ public interface ICompactionStrategy
     /// Given the current set of SSTables across all levels, determines whether compaction is needed
     /// and returns a plan. Returns null if no compaction is required.
     /// </summary>
-    CompactionPlan? Plan(IReadOnlyList<SSTableInfo> tables);
+    CompactionPlan? Plan(ImmutableList<SSTableInfo> tables);
 
     /// <summary>
     /// Maximum number of levels in this strategy.
@@ -58,7 +60,7 @@ public sealed class LevelTieredCompaction : ICompactionStrategy
         MaxLevels = maxLevels;
     }
 
-    public CompactionPlan? Plan(IReadOnlyList<SSTableInfo> tables)
+    public CompactionPlan? Plan(ImmutableList<SSTableInfo> tables)
     {
         // Group tables by level
         var byLevel = new List<SSTableInfo>[MaxLevels];

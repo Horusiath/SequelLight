@@ -40,33 +40,17 @@ public sealed class MemTable
     /// </summary>
     public bool TryApply(
         ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
-        IReadOnlyList<(byte[] Key, MemEntry Entry)> mutations)
+        ImmutableSortedDictionary<byte[], MemEntry> newData)
     {
-        var builder = expectedSnapshot.ToBuilder();
-        int sizeChange = 0;
-
-        foreach (var (key, entry) in mutations)
-        {
-            if (builder.TryGetValue(key, out var existing))
-            {
-                // Subtract old value size
-                sizeChange -= key.Length + (existing.Value?.Length ?? 0);
-            }
-
-            builder[key] = entry;
-            sizeChange += key.Length + (entry.Value?.Length ?? 0);
-        }
-
-        var newData = builder.ToImmutable();
         var original = Interlocked.CompareExchange(ref _data, newData, expectedSnapshot);
+        if (!ReferenceEquals(original, expectedSnapshot))
+            return false;
 
-        if (ReferenceEquals(original, expectedSnapshot))
-        {
-            Interlocked.Add(ref _approximateSize, sizeChange);
-            return true;
-        }
-
-        return false;
+        int size = 0;
+        foreach (var kvp in newData)
+            size += kvp.Key.Length + (kvp.Value.Value?.Length ?? 0);
+        Interlocked.Exchange(ref _approximateSize, size);
+        return true;
     }
 
     /// <summary>

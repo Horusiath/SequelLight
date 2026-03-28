@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.IO.Pipelines;
 
 namespace SequelLight.Storage;
@@ -81,7 +82,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
         value.CopyTo(span[offset..]);
         offset += value.Length;
 
-        uint crc = Crc32(span[crcStart..offset]);
+        uint crc = Crc32C(span[crcStart..offset]);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
         offset += 4;
 
@@ -108,7 +109,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
         key.CopyTo(span[offset..]);
         offset += key.Length;
 
-        uint crc = Crc32(span[crcStart..offset]);
+        uint crc = Crc32C(span[crcStart..offset]);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
         offset += 4;
 
@@ -182,7 +183,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
             int bodyLen = entryLen - 4; // body is everything except trailing CRC
             uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(span[bodyLen..]);
-            uint computedCrc = Crc32(span[..bodyLen]);
+            uint computedCrc = Crc32C(span[..bodyLen]);
             if (storedCrc != computedCrc)
             {
                 // Corrupt entry — stop replay
@@ -212,20 +213,8 @@ public sealed class WriteAheadLog : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Simple CRC32 (IEEE) for checksum validation.
-    /// </summary>
-    private static uint Crc32(ReadOnlySpan<byte> data)
-    {
-        uint crc = 0xFFFFFFFF;
-        foreach (byte b in data)
-        {
-            crc ^= b;
-            for (int i = 0; i < 8; i++)
-                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
-        }
-        return crc ^ 0xFFFFFFFF;
-    }
+    private static uint Crc32C(ReadOnlySpan<byte> data) =>
+        System.IO.Hashing.Crc32.HashToUInt32(data);
 
     public async ValueTask DisposeAsync()
     {
