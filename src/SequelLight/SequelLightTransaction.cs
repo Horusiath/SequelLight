@@ -10,7 +10,7 @@ namespace SequelLight;
 public sealed class SequelLightTransaction : DbTransaction
 {
     private readonly SequelLightConnection _connection;
-    private ReadWriteTransaction? _inner;
+    private ReadOnlyTransaction? _inner;
     private bool _disposed;
 
     internal SequelLightTransaction(SequelLightConnection connection, IsolationLevel isolationLevel)
@@ -20,7 +20,7 @@ public sealed class SequelLightTransaction : DbTransaction
         _inner = connection.Db!.BeginReadWrite();
     }
 
-    internal ReadWriteTransaction? Inner => _inner;
+    internal ReadOnlyTransaction? Inner => _inner;
 
     public override IsolationLevel IsolationLevel { get; }
 
@@ -34,11 +34,11 @@ public sealed class SequelLightTransaction : DbTransaction
     public override async Task CommitAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_inner is null)
+        if (_inner is not ReadWriteTransaction rw)
             throw new InvalidOperationException("Transaction has already been completed.");
 
-        await _inner.CommitAsync().ConfigureAwait(false);
-        await _inner.DisposeAsync().ConfigureAwait(false);
+        await rw.CommitAsync().ConfigureAwait(false);
+        await rw.DisposeAsync().ConfigureAwait(false);
         _inner = null;
     }
 

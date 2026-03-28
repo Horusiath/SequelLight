@@ -97,7 +97,7 @@ public sealed class SequelLightCommand : DbCommand
         return new SequelLightParameter();
     }
 
-    private (Database Db, Storage.ReadWriteTransaction? Tx) EnsureValid()
+    private (Database Db, Storage.ReadOnlyTransaction? Tx) EnsureValid()
     {
         if (Connection is null || Connection.State != ConnectionState.Open || Connection.Db is null)
             throw new InvalidOperationException("Connection is not open.");

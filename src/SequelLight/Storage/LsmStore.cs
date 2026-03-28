@@ -408,31 +408,31 @@ public sealed class LsmStore : IAsyncDisposable
 /// Read-only transaction. Holds a reference to the skip list and SSTable list at
 /// the time the transaction began.
 /// </summary>
-public sealed class ReadOnlyTransaction : IDisposable
+public class ReadOnlyTransaction : IDisposable, IAsyncDisposable
 {
-    private readonly LsmStore _store;
-    private readonly ConcurrentSkipList _snapshot;
-    private readonly ImmutableList<SSTableInfo> _sstables;
-    private bool _disposed;
+    private protected readonly LsmStore Store;
+    private protected readonly ConcurrentSkipList Snapshot;
+    private protected readonly ImmutableList<SSTableInfo> SSTables;
+    private protected bool Disposed;
 
     internal ReadOnlyTransaction(
         LsmStore store,
         ConcurrentSkipList snapshot,
         ImmutableList<SSTableInfo> sstables)
     {
-        _store = store;
-        _snapshot = snapshot;
-        _sstables = sstables;
+        Store = store;
+        Snapshot = snapshot;
+        SSTables = sstables;
     }
 
-    public async ValueTask<byte[]?> GetAsync(byte[] key)
+    public virtual async ValueTask<byte[]?> GetAsync(byte[] key)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
 
-        if (_snapshot.TryGetValue(key, out var entry))
+        if (Snapshot.TryGetValue(key, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
-        var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
+        var (value, found) = await Store.GetFromSSTAsync(key, SSTables).ConfigureAwait(false);
         return found ? value : null;
     }
 
@@ -441,14 +441,14 @@ public sealed class ReadOnlyTransaction : IDisposable
     /// to this transaction. Entries are deduplicated by key with newest source winning.
     /// Tombstones are surfaced (IsTombstone = true).
     /// </summary>
-    public Cursor CreateCursor()
+    public virtual Cursor CreateCursor()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
 
-        var children = new List<Cursor> { new SkipListCursor(_snapshot) };
-        for (int i = _sstables.Count - 1; i >= 0; i--)
+        var children = new List<Cursor> { new SkipListCursor(Snapshot) };
+        for (int i = SSTables.Count - 1; i >= 0; i--)
         {
-            var reader = _sstables[i].Reader;
+            var reader = SSTables[i].Reader;
             if (reader is not null)
                 children.Add(reader.CreateCursor());
         }
@@ -457,7 +457,13 @@ public sealed class ReadOnlyTransaction : IDisposable
 
     public void Dispose()
     {
-        _disposed = true;
+        Disposed = true;
+    }
+
+    public virtual ValueTask DisposeAsync()
+    {
+        Disposed = true;
+        return ValueTask.CompletedTask;
     }
 }
 
@@ -465,11 +471,8 @@ public sealed class ReadOnlyTransaction : IDisposable
 /// Read-write transaction. Mutations are buffered locally and applied to the skip list
 /// atomically on commit. Sequence numbers provide ordering.
 /// </summary>
-public sealed class ReadWriteTransaction : IAsyncDisposable
+public sealed class ReadWriteTransaction : ReadOnlyTransaction
 {
-    private readonly LsmStore _store;
-    private readonly ConcurrentSkipList _readSnapshot;
-    private readonly ImmutableList<SSTableInfo> _sstables;
     private readonly List<(byte[] Key, MemEntry Entry)> _mutations = new();
     private readonly List<(byte[] Key, byte[]? Value)> _walWrites = new();
     // Local buffer for read-your-own-writes
@@ -477,29 +480,26 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     private long _nextSeq;
     private int _sizeDelta;
     private bool _committed;
-    private bool _disposed;
 
     internal ReadWriteTransaction(
         LsmStore store,
         ConcurrentSkipList readSnapshot,
         ImmutableList<SSTableInfo> sstables,
         long baseSequence)
+        : base(store, readSnapshot, sstables)
     {
-        _store = store;
-        _readSnapshot = readSnapshot;
-        _sstables = sstables;
         _nextSeq = baseSequence + 1;
     }
 
     public void Put(byte[] key, byte[] value)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
         // Track size delta against both local writes and the shared skip list
         if (_localWrites.TryGetValue(key, out var localExisting))
             _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
-        else if (_readSnapshot.TryGetValue(key, out var existing))
+        else if (Snapshot.TryGetValue(key, out var existing))
             _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
         _sizeDelta += key.Length + value.Length;
 
@@ -511,12 +511,12 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
 
     public void Delete(byte[] key)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
         if (_localWrites.TryGetValue(key, out var localExisting))
             _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
-        else if (_readSnapshot.TryGetValue(key, out var existing))
+        else if (Snapshot.TryGetValue(key, out var existing))
             _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
         _sizeDelta += key.Length;
 
@@ -526,20 +526,15 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         _walWrites.Add((key, null));
     }
 
-    public async ValueTask<byte[]?> GetAsync(byte[] key)
+    public override async ValueTask<byte[]?> GetAsync(byte[] key)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
 
         // Check local writes first (read-your-own-writes)
         if (_localWrites.TryGetValue(key, out var local))
             return local.IsTombstone ? null : local.Value;
 
-        // Then check the skip list snapshot
-        if (_readSnapshot.TryGetValue(key, out var entry))
-            return entry.IsTombstone ? null : entry.Value;
-
-        var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
-        return found ? value : null;
+        return await base.GetAsync(key).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -547,17 +542,17 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     /// the memtable snapshot, and all SSTables visible to this transaction.
     /// The cursor is a snapshot of local writes at creation time.
     /// </summary>
-    public Cursor CreateCursor()
+    public override Cursor CreateCursor()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
 
         var children = new List<Cursor>();
         if (_localWrites.Count > 0)
             children.Add(new ArrayCursor(_localWrites));
-        children.Add(new SkipListCursor(_readSnapshot));
-        for (int i = _sstables.Count - 1; i >= 0; i--)
+        children.Add(new SkipListCursor(Snapshot));
+        for (int i = SSTables.Count - 1; i >= 0; i--)
         {
-            var reader = _sstables[i].Reader;
+            var reader = SSTables[i].Reader;
             if (reader is not null)
                 children.Add(reader.CreateCursor());
         }
@@ -566,19 +561,19 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
 
     public async ValueTask<bool> CommitAsync()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
         _committed = true;
         if (_walWrites.Count == 0) return true;
 
-        await _store.CommitAsync(_mutations, _walWrites, _sizeDelta).ConfigureAwait(false);
+        await Store.CommitAsync(_mutations, _walWrites, _sizeDelta).ConfigureAwait(false);
         return true;
     }
 
-    public ValueTask DisposeAsync()
+    public override ValueTask DisposeAsync()
     {
-        _disposed = true;
+        Disposed = true;
         return ValueTask.CompletedTask;
     }
 }
