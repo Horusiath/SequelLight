@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using SequelLight.Parsing.Ast;
 
 namespace SequelLight.Parsing;
@@ -6,7 +7,8 @@ public sealed partial class SqlParser
 {
     private readonly SqlLexer _lexer;
     private Token _current;
-    private Token? _buffered; // single-token lookahead buffer
+    private Token _bufferedToken;
+    private bool _hasBuffered;
 
     private SqlParser(string source)
     {
@@ -48,10 +50,10 @@ public sealed partial class SqlParser
     private Token Advance()
     {
         var prev = _current;
-        if (_buffered.HasValue)
+        if (_hasBuffered)
         {
-            _current = _buffered.Value;
-            _buffered = null;
+            _current = _bufferedToken;
+            _hasBuffered = false;
         }
         else
         {
@@ -62,9 +64,12 @@ public sealed partial class SqlParser
 
     private TokenKind PeekNextKind()
     {
-        if (!_buffered.HasValue)
-            _buffered = _lexer.NextToken();
-        return _buffered.Value.Kind;
+        if (!_hasBuffered)
+        {
+            _bufferedToken = _lexer.NextToken();
+            _hasBuffered = true;
+        }
+        return _bufferedToken.Kind;
     }
 
     private bool Check(TokenKind kind) => _current.Kind == kind;
@@ -86,10 +91,53 @@ public sealed partial class SqlParser
     private SqlParseException Error(string message) =>
         new($"{message} at position {_current.Span.Start}", _current.Span.Start);
 
+    // ---- Bitmask set for fast TokenKind membership testing ----
+
+    private readonly struct TokenKindSet
+    {
+        private readonly ulong _b0, _b1, _b2;
+
+        private TokenKindSet(ulong b0, ulong b1, ulong b2)
+        {
+            _b0 = b0;
+            _b1 = b1;
+            _b2 = b2;
+        }
+
+        public static TokenKindSet Create(ReadOnlySpan<TokenKind> kinds)
+        {
+            ulong b0 = 0, b1 = 0, b2 = 0;
+            foreach (var kind in kinds)
+            {
+                int i = (int)kind;
+                ulong mask = 1UL << (i & 63);
+                switch (i >> 6)
+                {
+                    case 0: b0 |= mask; break;
+                    case 1: b1 |= mask; break;
+                    default: b2 |= mask; break;
+                }
+            }
+            return new TokenKindSet(b0, b1, b2);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool Contains(TokenKind kind)
+        {
+            int i = (int)kind;
+            ulong mask = 1UL << (i & 63);
+            return ((i >> 6) switch
+            {
+                0 => _b0,
+                1 => _b1,
+                _ => _b2,
+            } & mask) != 0;
+        }
+    }
+
     // ---- Name / identifier helpers ----
 
-    private static readonly HashSet<TokenKind> FallbackKeywords = new()
-    {
+    private static readonly TokenKindSet FallbackKeywords = TokenKindSet.Create([
         // fallback_excluding_conflicts
         TokenKind.Abort, TokenKind.Action, TokenKind.After, TokenKind.Always, TokenKind.Analyze,
         TokenKind.Asc, TokenKind.Attach, TokenKind.Before, TokenKind.Begin, TokenKind.By,
@@ -116,13 +164,12 @@ public sealed partial class SqlParser
         TokenKind.Left, TokenKind.Natural, TokenKind.Outer, TokenKind.Right,
         // RAISE
         TokenKind.Raise,
-    };
+    ]);
 
-    private static readonly HashSet<TokenKind> JoinKeywords = new()
-    {
+    private static readonly TokenKindSet JoinKeywords = TokenKindSet.Create([
         TokenKind.Cross, TokenKind.Full, TokenKind.Indexed, TokenKind.Inner,
         TokenKind.Left, TokenKind.Natural, TokenKind.Outer, TokenKind.Right,
-    };
+    ]);
 
     private bool IsAnyName() =>
         _current.Kind == TokenKind.Identifier ||
@@ -139,9 +186,9 @@ public sealed partial class SqlParser
         if (!IsAnyName())
             throw Error("Expected identifier");
         var tok = Advance();
-        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text)
-            : tok.Kind == TokenKind.StringLiteral ? SqlLexer.UnquoteString(tok.Text)
-            : tok.Text;
+        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text.Span)
+            : tok.Kind == TokenKind.StringLiteral ? SqlLexer.UnquoteString(tok.Text.Span)
+            : tok.Text.ToString();
     }
 
     private string ParseNameExcludingString()
@@ -149,7 +196,7 @@ public sealed partial class SqlParser
         if (_current.Kind != TokenKind.Identifier && !FallbackKeywords.Contains(_current.Kind))
             throw Error("Expected identifier");
         var tok = Advance();
-        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text) : tok.Text;
+        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text.Span) : tok.Text.ToString();
     }
 
     private string ParseNameExcludingJoins()
@@ -157,9 +204,9 @@ public sealed partial class SqlParser
         if (!IsAnyNameExcludingJoins())
             throw Error("Expected identifier");
         var tok = Advance();
-        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text)
-            : tok.Kind == TokenKind.StringLiteral ? SqlLexer.UnquoteString(tok.Text)
-            : tok.Text;
+        return tok.Kind == TokenKind.Identifier ? SqlLexer.UnquoteIdentifier(tok.Text.Span)
+            : tok.Kind == TokenKind.StringLiteral ? SqlLexer.UnquoteString(tok.Text.Span)
+            : tok.Text.ToString();
     }
 
     // ---- Expression parsing (precedence climbing) ----
@@ -212,12 +259,6 @@ public sealed partial class SqlParser
             Advance();
             left = new BinaryExpr(left, op, ParseBitwise());
         }
-        // For the higher-level operators (binary, and, or), wrap and re-enter the normal parse chain
-        // Actually, it's simpler to wrap left into the or-level by calling the remaining parse
-        // Since left is already at comparison level, we just need to handle binary/and/or on top.
-        // But ParseBinary expects to call ParseComparison internally...
-        // Simplest approach: just return left and let the caller's context handle the rest.
-        // This is fine because ParseResultColumn only needs basic expression continuation.
         return left;
     }
 
@@ -355,10 +396,6 @@ public sealed partial class SqlParser
                 continue;
             }
 
-            // If we consumed NOT but nothing matched, we need to undo.
-            // Actually, we only consume NOT if IsNotFollowedByBinaryOp() was true.
-            // But if we got here with not=true, something went wrong.
-            // In practice this shouldn't happen due to IsNotFollowedByBinaryOp().
             if (not)
                 throw Error("Unexpected NOT");
 
@@ -396,11 +433,12 @@ public sealed partial class SqlParser
         }
 
         // Expression list: IN (expr, expr, ...)
-        var exprs = new List<SqlExpr> { ParseExpr() };
+        var exprs = new ValueListBuilder<SqlExpr>();
+        exprs.Add(ParseExpr());
         while (Match(TokenKind.Comma))
             exprs.Add(ParseExpr());
         Expect(TokenKind.CloseParen);
-        return new InExprList(exprs);
+        return new InExprList(exprs.ToArray());
     }
 
     private SqlExpr ParseComparison()
@@ -522,45 +560,46 @@ public sealed partial class SqlParser
             case TokenKind.NumericLiteral:
             {
                 var tok = Advance();
-                var kind = tok.Text.Contains('.') || tok.Text.Contains('e') || tok.Text.Contains('E')
+                var span = tok.Text.Span;
+                var kind = span.Contains('.') || span.Contains('e') || span.Contains('E')
                     ? LiteralKind.Real : LiteralKind.Integer;
-                return new LiteralExpr(kind, tok.Text);
+                return new LiteralExpr(kind, tok.Text.ToString());
             }
             case TokenKind.StringLiteral:
             {
                 var tok = Advance();
-                return new LiteralExpr(LiteralKind.String, SqlLexer.UnquoteString(tok.Text));
+                return new LiteralExpr(LiteralKind.String, SqlLexer.UnquoteString(tok.Text.Span));
             }
             case TokenKind.BlobLiteral:
             {
                 var tok = Advance();
-                return new LiteralExpr(LiteralKind.Blob, tok.Text);
+                return new LiteralExpr(LiteralKind.Blob, tok.Text.ToString());
             }
             case TokenKind.Null:
                 Advance();
-                return new LiteralExpr(LiteralKind.Null, "NULL");
+                return LiteralExpr.NullLiteral;
             case TokenKind.True:
                 Advance();
-                return new LiteralExpr(LiteralKind.True, "TRUE");
+                return LiteralExpr.TrueLiteral;
             case TokenKind.False:
                 Advance();
-                return new LiteralExpr(LiteralKind.False, "FALSE");
+                return LiteralExpr.FalseLiteral;
             case TokenKind.CurrentTime:
                 Advance();
-                return new LiteralExpr(LiteralKind.CurrentTime, "CURRENT_TIME");
+                return LiteralExpr.CurrentTimeLiteral;
             case TokenKind.CurrentDate:
                 Advance();
-                return new LiteralExpr(LiteralKind.CurrentDate, "CURRENT_DATE");
+                return LiteralExpr.CurrentDateLiteral;
             case TokenKind.CurrentTimestamp:
                 Advance();
-                return new LiteralExpr(LiteralKind.CurrentTimestamp, "CURRENT_TIMESTAMP");
+                return LiteralExpr.CurrentTimestampLiteral;
         }
 
         // Bind parameter
         if (Check(TokenKind.BindParameter))
         {
             var tok = Advance();
-            return new BindParameterExpr(tok.Text);
+            return new BindParameterExpr(tok.Text.ToString());
         }
 
         // RAISE function
@@ -586,30 +625,8 @@ public sealed partial class SqlParser
         }
         if (Check(TokenKind.Not))
         {
-            // Check for NOT EXISTS
-            // We need lookahead here. Save position.
-            // Since our lexer is forward-only, let's handle this carefully.
             // NOT at this level could be NOT EXISTS. Otherwise it's handled by ParseNot.
-            // But ParseBase is called from ParseUnary which is below ParseNot.
-            // So if we see NOT here, it must be NOT EXISTS.
-            // Actually no, NOT is handled in ParseNot above. It shouldn't reach here.
-            // Unless it's NOT EXISTS specifically in expr_base context.
-            // Hmm, the grammar says expr_base can have (NOT_? EXISTS_)? OPEN_PAR select_stmt CLOSE_PAR
-            // But NOT is consumed by the NOT precedence level. So at the base level,
-            // we should only see EXISTS, not NOT EXISTS.
-            // Actually, looking more carefully at the grammar, NOT EXISTS is in expr_base,
-            // not expr_not. So we need to handle it here.
-            // But ParseNot would consume the NOT first...
-            // The solution: in ParseNot, we need to check if NOT is followed by EXISTS,
-            // and if so, NOT pass it through to the lower level.
-            // For now, let's not handle NOT EXISTS here since ParseNot handles it.
-            // Actually, this IS a problem. Let me think...
-            // ParseNot: if we see NOT, we call ParseNot recursively and wrap in UnaryExpr(Not, ...).
-            // So `NOT EXISTS (SELECT 1)` would parse as UnaryExpr(Not, SubqueryExpr(Exists))
-            // which is semantically the same as SubqueryExpr(NotExists).
-            // That's fine! The UnaryExpr(Not, SubqueryExpr(Exists)) IS NOT EXISTS.
-            // So we don't need special handling here.
-            // Fall through to identifier handling below.
+            // See comments in original code about the grammar.
         }
 
         // Parenthesized expression, subquery, or expression list
@@ -629,11 +646,12 @@ public sealed partial class SqlParser
             var first = ParseExpr();
             if (Check(TokenKind.Comma))
             {
-                var exprs = new List<SqlExpr> { first };
+                var exprs = new ValueListBuilder<SqlExpr>();
+                exprs.Add(first);
                 while (Match(TokenKind.Comma))
                     exprs.Add(ParseExpr());
                 Expect(TokenKind.CloseParen);
-                return new ExprListExpr(exprs);
+                return new ExprListExpr(exprs.ToArray());
             }
             Expect(TokenKind.CloseParen);
             return first; // single parenthesized expression
@@ -665,14 +683,6 @@ public sealed partial class SqlParser
         {
             var second = ParseName();
 
-            // Check for function call on second part: schema.func(...)
-            if (Check(TokenKind.OpenParen))
-            {
-                // This could be schema.func(...) - but functions don't have schema prefixes
-                // in the expression grammar. Only in IN targets.
-                // In expressions, a.b( is not valid. a.b.c is schema.table.column.
-            }
-
             if (Match(TokenKind.Dot))
             {
                 var third = ParseName();
@@ -688,7 +698,7 @@ public sealed partial class SqlParser
     {
         Expect(TokenKind.OpenParen);
 
-        var args = new List<SqlExpr>();
+        var args = new ValueListBuilder<SqlExpr>();
         var distinct = false;
         var isStar = false;
         IReadOnlyList<OrderingTerm>? orderBy = null;
@@ -744,7 +754,7 @@ public sealed partial class SqlParser
             over = ParseOverClause();
         }
 
-        return new FunctionCallExpr(name, args, distinct, isStar, orderBy, percentileOrderBy, filterWhere, over);
+        return new FunctionCallExpr(name, args.ToArray(), distinct, isStar, orderBy, percentileOrderBy, filterWhere, over);
     }
 
     private OverClause ParseOverClause()
@@ -763,12 +773,10 @@ public sealed partial class SqlParser
         Expect(TokenKind.OpenParen);
 
         string? baseName = null;
-        // base_window_name is an identifier that is not a keyword that starts a clause
         if (IsAnyName() && _current.Kind != TokenKind.Partition && _current.Kind != TokenKind.Order
             && _current.Kind != TokenKind.Range && _current.Kind != TokenKind.Rows
             && _current.Kind != TokenKind.Groups)
         {
-            // Speculatively try to parse base window name
             if (_current.Kind == TokenKind.Identifier || FallbackKeywords.Contains(_current.Kind))
             {
                 baseName = ParseName();
@@ -779,10 +787,11 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Partition))
         {
             Expect(TokenKind.By);
-            var exprs = new List<SqlExpr> { ParseExpr() };
+            var exprs = new ValueListBuilder<SqlExpr>();
+            exprs.Add(ParseExpr());
             while (Match(TokenKind.Comma))
                 exprs.Add(ParseExpr());
-            partitionBy = exprs;
+            partitionBy = exprs.ToArray();
         }
 
         IReadOnlyList<OrderingTerm>? orderBy = null;
@@ -856,14 +865,14 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Current))
         {
             Expect(TokenKind.Row);
-            return new CurrentRowBound();
+            return CurrentRowBound.Instance;
         }
 
         if (Check(TokenKind.Unbounded))
         {
             Advance();
             Expect(TokenKind.Preceding);
-            return new UnboundedPrecedingBound();
+            return UnboundedPrecedingBound.Instance;
         }
 
         var expr = ParseExpr();
@@ -876,16 +885,16 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Current))
         {
             Expect(TokenKind.Row);
-            return new CurrentRowBound();
+            return CurrentRowBound.Instance;
         }
 
         if (Check(TokenKind.Unbounded))
         {
             Advance();
             if (Match(TokenKind.Preceding))
-                return new UnboundedPrecedingBound();
+                return UnboundedPrecedingBound.Instance;
             Expect(TokenKind.Following);
-            return new UnboundedFollowingBound();
+            return UnboundedFollowingBound.Instance;
         }
 
         var expr = ParseExpr();
@@ -917,7 +926,7 @@ public sealed partial class SqlParser
         Expect(TokenKind.Comma);
         var msg = Expect(TokenKind.StringLiteral);
         Expect(TokenKind.CloseParen);
-        return new RaiseExpr(kind, SqlLexer.UnquoteString(msg.Text));
+        return new RaiseExpr(kind, SqlLexer.UnquoteString(msg.Text.Span));
     }
 
     private SqlExpr ParseCast()
@@ -939,7 +948,7 @@ public sealed partial class SqlParser
         if (!Check(TokenKind.When))
             operand = ParseExpr();
 
-        var whens = new List<WhenClause>();
+        var whens = new ValueListBuilder<WhenClause>();
         while (Match(TokenKind.When))
         {
             var cond = ParseExpr();
@@ -953,34 +962,45 @@ public sealed partial class SqlParser
             elseExpr = ParseExpr();
 
         Expect(TokenKind.End);
-        return new CaseExpr(operand, whens, elseExpr);
+        return new CaseExpr(operand, whens.ToArray(), elseExpr);
     }
 
     // ---- Shared clause parsers used by both expressions and statements ----
 
     internal TypeName ParseTypeName()
     {
-        // One or more names, optionally followed by (N) or (N,M)
-        var names = new List<string>();
-        while (IsAnyName() && _current.Kind != TokenKind.OpenParen)
-        {
-            names.Add(ParseName());
-            if (!IsAnyName() || _current.Kind == TokenKind.OpenParen)
-                break;
-        }
-
-        if (names.Count == 0)
+        // Fast path: most type names are a single word (INTEGER, TEXT, BLOB, etc.)
+        if (!IsAnyName() || _current.Kind == TokenKind.OpenParen)
             throw Error("Expected type name");
 
-        var typeName = string.Join(" ", names);
-        List<string>? args = null;
+        var firstName = ParseName();
+        string typeName;
 
+        if (!IsAnyName() || _current.Kind == TokenKind.OpenParen)
+        {
+            typeName = firstName;
+        }
+        else
+        {
+            // Multi-word type name (e.g. VARYING CHARACTER, DOUBLE PRECISION)
+            var builder = new ValueListBuilder<string>();
+            builder.Add(firstName);
+            do
+            {
+                builder.Add(ParseName());
+            } while (IsAnyName() && _current.Kind != TokenKind.OpenParen);
+            var names = builder.ToArray();
+            typeName = string.Join(" ", names);
+        }
+
+        IReadOnlyList<string>? args = null;
         if (Match(TokenKind.OpenParen))
         {
-            args = new List<string>();
-            args.Add(ParseSignedNumber());
+            var first = ParseSignedNumber();
             if (Match(TokenKind.Comma))
-                args.Add(ParseSignedNumber());
+                args = new[] { first, ParseSignedNumber() };
+            else
+                args = new[] { first };
             Expect(TokenKind.CloseParen);
         }
 
@@ -989,24 +1009,25 @@ public sealed partial class SqlParser
 
     private string ParseSignedNumber()
     {
-        var sign = "";
         if (_current.Kind is TokenKind.Plus or TokenKind.Minus)
         {
-            sign = _current.Kind == TokenKind.Minus ? "-" : "+";
+            var negative = _current.Kind == TokenKind.Minus;
             Advance();
+            var num = Expect(TokenKind.NumericLiteral);
+            return string.Concat(negative ? "-".AsSpan() : "+".AsSpan(), num.Text.Span);
         }
-        var num = Expect(TokenKind.NumericLiteral);
-        return sign + num.Text;
+        return Expect(TokenKind.NumericLiteral).Text.ToString();
     }
 
     internal IReadOnlyList<OrderingTerm> ParseOrderByClause()
     {
         Expect(TokenKind.Order);
         Expect(TokenKind.By);
-        var terms = new List<OrderingTerm> { ParseOrderingTerm() };
+        var terms = new ValueListBuilder<OrderingTerm>();
+        terms.Add(ParseOrderingTerm());
         while (Match(TokenKind.Comma))
             terms.Add(ParseOrderingTerm());
-        return terms;
+        return terms.ToArray();
     }
 
     private OrderingTerm ParseOrderingTerm()

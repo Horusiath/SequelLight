@@ -17,7 +17,15 @@ public enum LiteralKind
     CurrentTimestamp,
 }
 
-public sealed record LiteralExpr(LiteralKind Kind, string Value) : SqlExpr;
+public sealed record LiteralExpr(LiteralKind Kind, string Value) : SqlExpr
+{
+    internal static readonly LiteralExpr NullLiteral = new(LiteralKind.Null, "NULL");
+    internal static readonly LiteralExpr TrueLiteral = new(LiteralKind.True, "TRUE");
+    internal static readonly LiteralExpr FalseLiteral = new(LiteralKind.False, "FALSE");
+    internal static readonly LiteralExpr CurrentTimeLiteral = new(LiteralKind.CurrentTime, "CURRENT_TIME");
+    internal static readonly LiteralExpr CurrentDateLiteral = new(LiteralKind.CurrentDate, "CURRENT_DATE");
+    internal static readonly LiteralExpr CurrentTimestampLiteral = new(LiteralKind.CurrentTimestamp, "CURRENT_TIMESTAMP");
+}
 
 public sealed record BindParameterExpr(string Name) : SqlExpr;
 

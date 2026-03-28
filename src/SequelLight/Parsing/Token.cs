@@ -5,7 +5,7 @@ public readonly record struct TextSpan(int Start, int Length)
     public int End => Start + Length;
 }
 
-public readonly record struct Token(TokenKind Kind, string Text, TextSpan Span)
+public readonly record struct Token(TokenKind Kind, ReadOnlyMemory<char> Text, TextSpan Span)
 {
     public override string ToString() => Kind == TokenKind.Eof ? "EOF" : $"{Kind}({Text})";
 }

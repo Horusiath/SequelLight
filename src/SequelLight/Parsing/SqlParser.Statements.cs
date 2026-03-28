@@ -49,7 +49,7 @@ public sealed partial class SqlParser
     {
         var with = Check(TokenKind.With) ? ParseWithClause() : null;
         var first = ParseSelectBody();
-        var compounds = new List<CompoundSelectClause>();
+        var compounds = new ValueListBuilder<CompoundSelectClause>();
 
         while (_current.Kind is TokenKind.Union or TokenKind.Intersect or TokenKind.Except)
         {
@@ -72,7 +72,7 @@ public sealed partial class SqlParser
                 offset = ParseExpr();
         }
 
-        return new SelectStmt(with, first, compounds, orderBy, limit, offset);
+        return new SelectStmt(with, first, compounds.ToArray(), orderBy, limit, offset);
     }
 
     private SelectBody ParseSelectBody()
@@ -91,9 +91,11 @@ public sealed partial class SqlParser
         else
             Match(TokenKind.All); // consume ALL if present, default behavior
 
-        var columns = new List<ResultColumn> { ParseResultColumn() };
+        var columnsBuilder = new ValueListBuilder<ResultColumn>();
+        columnsBuilder.Add(ParseResultColumn());
         while (Match(TokenKind.Comma))
-            columns.Add(ParseResultColumn());
+            columnsBuilder.Add(ParseResultColumn());
+        var columns = columnsBuilder.ToArray();
 
         JoinClause? from = null;
         if (Match(TokenKind.From))
@@ -108,10 +110,11 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Group))
         {
             Expect(TokenKind.By);
-            var exprs = new List<SqlExpr> { ParseExpr() };
+            var exprs = new ValueListBuilder<SqlExpr>();
+            exprs.Add(ParseExpr());
             while (Match(TokenKind.Comma))
                 exprs.Add(ParseExpr());
-            groupBy = exprs;
+            groupBy = exprs.ToArray();
             if (Match(TokenKind.Having))
                 having = ParseExpr();
         }
@@ -119,7 +122,7 @@ public sealed partial class SqlParser
         IReadOnlyList<NamedWindowDef>? windows = null;
         if (Match(TokenKind.Window))
         {
-            var defs = new List<NamedWindowDef>();
+            var defs = new ValueListBuilder<NamedWindowDef>();
             do
             {
                 var name = ParseName();
@@ -127,7 +130,7 @@ public sealed partial class SqlParser
                 var def = ParseWindowDef();
                 defs.Add(new NamedWindowDef(name, def));
             } while (Match(TokenKind.Comma));
-            windows = defs;
+            windows = defs.ToArray();
         }
 
         return new SelectCore(distinct, columns, from, where, groupBy, having, windows);
@@ -136,17 +139,18 @@ public sealed partial class SqlParser
     private ValuesBody ParseValuesBody()
     {
         Expect(TokenKind.Values);
-        var rows = new List<IReadOnlyList<SqlExpr>>();
+        var rows = new ValueListBuilder<IReadOnlyList<SqlExpr>>();
         do
         {
             Expect(TokenKind.OpenParen);
-            var vals = new List<SqlExpr> { ParseExpr() };
+            var vals = new ValueListBuilder<SqlExpr>();
+            vals.Add(ParseExpr());
             while (Match(TokenKind.Comma))
                 vals.Add(ParseExpr());
             Expect(TokenKind.CloseParen);
-            rows.Add(vals);
+            rows.Add(vals.ToArray());
         } while (Match(TokenKind.Comma));
-        return new ValuesBody(rows);
+        return new ValuesBody(rows.ToArray());
     }
 
     private ResultColumn ParseResultColumn()
@@ -154,11 +158,11 @@ public sealed partial class SqlParser
         if (Check(TokenKind.Star))
         {
             Advance();
-            return new StarResultColumn();
+            return StarResultColumn.Instance;
         }
 
         // Check for table.* using lookahead: name DOT STAR
-        if (IsAnyName() && PeekNextKind() == TokenKind.Dot)
+        if (IsAnyNameExcludingJoins() && PeekNextKind() == TokenKind.Dot)
         {
             var name = ParseName();
             if (Match(TokenKind.Dot) && Check(TokenKind.Star))
@@ -229,7 +233,7 @@ public sealed partial class SqlParser
     private JoinClause ParseJoinClause()
     {
         var left = ParseTableOrSubquery();
-        var joins = new List<JoinItem>();
+        var joins = new ValueListBuilder<JoinItem>();
 
         while (IsJoinOperatorStart())
         {
@@ -244,18 +248,19 @@ public sealed partial class SqlParser
                 else if (Match(TokenKind.Using))
                 {
                     Expect(TokenKind.OpenParen);
-                    var cols = new List<string> { ParseName() };
+                    var cols = new ValueListBuilder<string>();
+                    cols.Add(ParseName());
                     while (Match(TokenKind.Comma))
                         cols.Add(ParseName());
                     Expect(TokenKind.CloseParen);
-                    constraint = new UsingJoinConstraint(cols);
+                    constraint = new UsingJoinConstraint(cols.ToArray());
                 }
             }
 
             joins.Add(new JoinItem(op, right, constraint));
         }
 
-        return new JoinClause(left, joins);
+        return new JoinClause(left, joins.ToArray());
     }
 
     private bool IsJoinOperatorStart() =>
@@ -336,7 +341,8 @@ public sealed partial class SqlParser
         if (Check(TokenKind.OpenParen))
         {
             Advance();
-            var args = new List<SqlExpr> { ParseExpr() };
+            var args = new ValueListBuilder<SqlExpr>();
+            args.Add(ParseExpr());
             while (Match(TokenKind.Comma))
                 args.Add(ParseExpr());
             Expect(TokenKind.CloseParen);
@@ -345,7 +351,7 @@ public sealed partial class SqlParser
                 fAlias = ParseName();
             else if (IsAnyNameExcludingJoins())
                 fAlias = ParseNameExcludingJoins();
-            return new TableFunctionRef(schema, name, args, fAlias);
+            return new TableFunctionRef(schema, name, args.ToArray(), fAlias);
         }
 
         // Regular table ref
@@ -369,7 +375,7 @@ public sealed partial class SqlParser
         {
             Advance(); // NOT
             Advance(); // INDEXED
-            hint = new NotIndexedHint();
+            hint = NotIndexedHint.Instance;
         }
 
         return new TableRef(schema, name, alias, hint);
@@ -381,10 +387,11 @@ public sealed partial class SqlParser
     {
         Expect(TokenKind.With);
         var recursive = Match(TokenKind.Recursive);
-        var ctes = new List<CommonTableExpression> { ParseCte() };
+        var ctes = new ValueListBuilder<CommonTableExpression>();
+        ctes.Add(ParseCte());
         while (Match(TokenKind.Comma))
             ctes.Add(ParseCte());
-        return new WithClause(recursive, ctes);
+        return new WithClause(recursive, ctes.ToArray());
     }
 
     private CommonTableExpression ParseCte()
@@ -393,11 +400,12 @@ public sealed partial class SqlParser
         IReadOnlyList<string>? cols = null;
         if (Match(TokenKind.OpenParen))
         {
-            var list = new List<string> { ParseName() };
+            var list = new ValueListBuilder<string>();
+            list.Add(ParseName());
             while (Match(TokenKind.Comma))
                 list.Add(ParseName());
             Expect(TokenKind.CloseParen);
-            cols = list;
+            cols = list.ToArray();
         }
         Expect(TokenKind.As);
         bool? materialized = null;
@@ -462,31 +470,18 @@ public sealed partial class SqlParser
         IReadOnlyList<string>? columns = null;
         if (Check(TokenKind.OpenParen) && !Check(TokenKind.Select) && !Check(TokenKind.With))
         {
-            // Could be column list or VALUES. Need to distinguish.
-            // Column list: ( name, name, ... )
-            // We peek: if after ( we see a name followed by , or ), it's columns.
-            // Otherwise it's part of the source.
-            // Actually, INSERT INTO t (col1, col2) SELECT/VALUES ...
-            // The ( here is always the column list if followed by names, because
-            // the source SELECT/VALUES comes after.
             Advance(); // (
             if (!Check(TokenKind.Select) && !Check(TokenKind.With) && !Check(TokenKind.Values))
             {
-                var cols = new List<string> { ParseName() };
+                var cols = new ValueListBuilder<string>();
+                cols.Add(ParseName());
                 while (Match(TokenKind.Comma))
                     cols.Add(ParseName());
                 Expect(TokenKind.CloseParen);
-                columns = cols;
+                columns = cols.ToArray();
             }
             else
             {
-                // Oops, it was a subquery starting with (SELECT...
-                // We already consumed the (. We need to handle this.
-                // Actually, this case shouldn't happen because the grammar says
-                // the column list comes before the source.
-                // If we see ( followed by SELECT, we went too far.
-                // Let me back up by re-parsing as the source.
-                // For now, throw an error.
                 throw Error("Unexpected SELECT inside column list");
             }
         }
@@ -497,7 +492,7 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Default))
         {
             Expect(TokenKind.Values);
-            source = new DefaultValuesSource();
+            source = DefaultValuesSource.Instance;
         }
         else
         {
@@ -507,10 +502,10 @@ public sealed partial class SqlParser
             // Upsert clauses
             if (Check(TokenKind.On))
             {
-                var list = new List<UpsertClause>();
+                var list = new ValueListBuilder<UpsertClause>();
                 while (Check(TokenKind.On))
                     list.Add(ParseUpsertClause());
-                upserts = list;
+                upserts = list.ToArray();
             }
         }
 
@@ -529,11 +524,12 @@ public sealed partial class SqlParser
 
         if (Match(TokenKind.OpenParen))
         {
-            var cols = new List<IndexedColumn> { ParseIndexedColumn() };
+            var cols = new ValueListBuilder<IndexedColumn>();
+            cols.Add(ParseIndexedColumn());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseIndexedColumn());
             Expect(TokenKind.CloseParen);
-            conflictCols = cols;
+            conflictCols = cols.ToArray();
             if (Match(TokenKind.Where))
                 conflictWhere = ParseExpr();
         }
@@ -543,19 +539,20 @@ public sealed partial class SqlParser
         UpsertAction action;
         if (Match(TokenKind.Nothing))
         {
-            action = new DoNothingAction();
+            action = DoNothingAction.Instance;
         }
         else
         {
             Expect(TokenKind.Update);
             Expect(TokenKind.Set);
-            var setters = new List<UpdateSetter> { ParseUpdateSetter() };
+            var setters = new ValueListBuilder<UpdateSetter>();
+            setters.Add(ParseUpdateSetter());
             while (Match(TokenKind.Comma))
                 setters.Add(ParseUpdateSetter());
             SqlExpr? where = null;
             if (Match(TokenKind.Where))
                 where = ParseExpr();
-            action = new DoUpdateAction(setters, where);
+            action = new DoUpdateAction(setters.ToArray(), where);
         }
 
         return new UpsertClause(conflictCols, conflictWhere, action);
@@ -563,7 +560,7 @@ public sealed partial class SqlParser
 
     private UpdateSetter ParseUpdateSetter()
     {
-        var columns = new List<string>();
+        var columns = new ValueListBuilder<string>();
         if (Match(TokenKind.OpenParen))
         {
             columns.Add(ParseName());
@@ -577,22 +574,23 @@ public sealed partial class SqlParser
         }
         Expect(TokenKind.Assign);
         var value = ParseExpr();
-        return new UpdateSetter(columns, value);
+        return new UpdateSetter(columns.ToArray(), value);
     }
 
     private IReadOnlyList<ReturningColumn> ParseReturningClause()
     {
         Expect(TokenKind.Returning);
-        var cols = new List<ReturningColumn> { ParseReturningColumn() };
+        var cols = new ValueListBuilder<ReturningColumn>();
+        cols.Add(ParseReturningColumn());
         while (Match(TokenKind.Comma))
             cols.Add(ParseReturningColumn());
-        return cols;
+        return cols.ToArray();
     }
 
     private ReturningColumn ParseReturningColumn()
     {
         if (Match(TokenKind.Star))
-            return new StarReturning();
+            return StarReturning.Instance;
         var expr = ParseExpr();
         string? alias = null;
         if (Match(TokenKind.As))
@@ -632,9 +630,11 @@ public sealed partial class SqlParser
 
         var table = ParseQualifiedTableName();
         Expect(TokenKind.Set);
-        var setters = new List<UpdateSetter> { ParseUpdateSetter() };
+        var setters = new ValueListBuilder<UpdateSetter>();
+        setters.Add(ParseUpdateSetter());
         while (Match(TokenKind.Comma))
             setters.Add(ParseUpdateSetter());
+        var settersArray = setters.ToArray();
 
         JoinClause? from = null;
         if (Match(TokenKind.From))
@@ -660,7 +660,7 @@ public sealed partial class SqlParser
                 offset = ParseExpr();
         }
 
-        return new UpdateStmt(with, orAction, table, setters, from, where, returning, orderBy, limit, offset);
+        return new UpdateStmt(with, orAction, table, settersArray, from, where, returning, orderBy, limit, offset);
     }
 
     // ---- DELETE ----
@@ -720,7 +720,7 @@ public sealed partial class SqlParser
             // NOT INDEXED — need lookahead
             Advance(); // NOT
             if (Match(TokenKind.Indexed))
-                hint = new NotIndexedHint();
+                hint = NotIndexedHint.Instance;
             else
                 throw Error("Expected INDEXED after NOT");
         }
@@ -797,8 +797,9 @@ public sealed partial class SqlParser
         else
         {
             Expect(TokenKind.OpenParen);
-            var columns = new List<ColumnDef> { ParseColumnDef() };
-            var constraints = new List<TableConstraint>();
+            var columns = new ValueListBuilder<ColumnDef>();
+            columns.Add(ParseColumnDef());
+            var constraints = new ValueListBuilder<TableConstraint>();
 
             while (Match(TokenKind.Comma))
             {
@@ -810,7 +811,7 @@ public sealed partial class SqlParser
             }
             Expect(TokenKind.CloseParen);
 
-            var options = new List<TableOption>();
+            var options = new ValueListBuilder<TableOption>();
             if (Check(TokenKind.Without) || Check(TokenKind.Strict))
             {
                 options.Add(ParseTableOption());
@@ -818,7 +819,7 @@ public sealed partial class SqlParser
                     options.Add(ParseTableOption());
             }
 
-            body = new ColumnsTableBody(columns, constraints, options);
+            body = new ColumnsTableBody(columns.ToArray(), constraints.ToArray(), options.ToArray());
         }
 
         return new CreateTableStmt(temp, ifNotExists, schema, name, body);
@@ -848,11 +849,11 @@ public sealed partial class SqlParser
         if (IsAnyName() && !IsColumnConstraintStart())
             type = ParseTypeName();
 
-        var constraints = new List<ColumnConstraint>();
+        var constraints = new ValueListBuilder<ColumnConstraint>();
         while (IsColumnConstraintStart() || Check(TokenKind.Constraint))
             constraints.Add(ParseColumnConstraint());
 
-        return new ColumnDef(name, type, constraints);
+        return new ColumnDef(name, type, constraints.ToArray());
     }
 
     private bool IsColumnConstraintStart() =>
@@ -972,21 +973,23 @@ public sealed partial class SqlParser
         {
             Expect(TokenKind.Key);
             Expect(TokenKind.OpenParen);
-            var cols = new List<IndexedColumn> { ParseIndexedColumn() };
+            var cols = new ValueListBuilder<IndexedColumn>();
+            cols.Add(ParseIndexedColumn());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseIndexedColumn());
             Expect(TokenKind.CloseParen);
-            return new PrimaryKeyTableConstraint(constraintName, cols, ParseOptionalConflictClause());
+            return new PrimaryKeyTableConstraint(constraintName, cols.ToArray(), ParseOptionalConflictClause());
         }
 
         if (Match(TokenKind.Unique))
         {
             Expect(TokenKind.OpenParen);
-            var cols = new List<IndexedColumn> { ParseIndexedColumn() };
+            var cols = new ValueListBuilder<IndexedColumn>();
+            cols.Add(ParseIndexedColumn());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseIndexedColumn());
             Expect(TokenKind.CloseParen);
-            return new UniqueTableConstraint(constraintName, cols, ParseOptionalConflictClause());
+            return new UniqueTableConstraint(constraintName, cols.ToArray(), ParseOptionalConflictClause());
         }
 
         if (Match(TokenKind.Check))
@@ -1001,11 +1004,12 @@ public sealed partial class SqlParser
         {
             Expect(TokenKind.Key);
             Expect(TokenKind.OpenParen);
-            var cols = new List<string> { ParseName() };
+            var cols = new ValueListBuilder<string>();
+            cols.Add(ParseName());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseName());
             Expect(TokenKind.CloseParen);
-            return new ForeignKeyTableConstraint(constraintName, cols, ParseForeignKeyClause());
+            return new ForeignKeyTableConstraint(constraintName, cols.ToArray(), ParseForeignKeyClause());
         }
 
         throw Error("Expected table constraint");
@@ -1019,11 +1023,12 @@ public sealed partial class SqlParser
         IReadOnlyList<string>? columns = null;
         if (Match(TokenKind.OpenParen))
         {
-            var cols = new List<string> { ParseName() };
+            var cols = new ValueListBuilder<string>();
+            cols.Add(ParseName());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseName());
             Expect(TokenKind.CloseParen);
-            columns = cols;
+            columns = cols.ToArray();
         }
 
         ForeignKeyAction? onDelete = null, onUpdate = null;
@@ -1101,7 +1106,8 @@ public sealed partial class SqlParser
         Expect(TokenKind.On);
         var table = ParseName();
         Expect(TokenKind.OpenParen);
-        var cols = new List<IndexedColumn> { ParseIndexedColumn() };
+        var cols = new ValueListBuilder<IndexedColumn>();
+        cols.Add(ParseIndexedColumn());
         while (Match(TokenKind.Comma))
             cols.Add(ParseIndexedColumn());
         Expect(TokenKind.CloseParen);
@@ -1110,7 +1116,7 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Where))
             where = ParseExpr();
 
-        return new CreateIndexStmt(unique, ifNotExists, schema, name, table, cols, where);
+        return new CreateIndexStmt(unique, ifNotExists, schema, name, table, cols.ToArray(), where);
     }
 
     private CreateViewStmt ParseCreateView(bool temp)
@@ -1129,11 +1135,12 @@ public sealed partial class SqlParser
         IReadOnlyList<string>? columns = null;
         if (Match(TokenKind.OpenParen))
         {
-            var cols = new List<string> { ParseName() };
+            var cols = new ValueListBuilder<string>();
+            cols.Add(ParseName());
             while (Match(TokenKind.Comma))
                 cols.Add(ParseName());
             Expect(TokenKind.CloseParen);
-            columns = cols;
+            columns = cols.ToArray();
         }
 
         Expect(TokenKind.As);
@@ -1167,11 +1174,11 @@ public sealed partial class SqlParser
         TriggerEvent evt;
         if (Match(TokenKind.Delete))
         {
-            evt = new DeleteTriggerEvent();
+            evt = DeleteTriggerEvent.Instance;
         }
         else if (Match(TokenKind.Insert))
         {
-            evt = new InsertTriggerEvent();
+            evt = InsertTriggerEvent.Instance;
         }
         else
         {
@@ -1179,10 +1186,11 @@ public sealed partial class SqlParser
             IReadOnlyList<string>? cols = null;
             if (Match(TokenKind.Of))
             {
-                var list = new List<string> { ParseName() };
+                var list = new ValueListBuilder<string>();
+                list.Add(ParseName());
                 while (Match(TokenKind.Comma))
                     list.Add(ParseName());
-                cols = list;
+                cols = list.ToArray();
             }
             evt = new UpdateTriggerEvent(cols);
         }
@@ -1203,7 +1211,7 @@ public sealed partial class SqlParser
             when = ParseExpr();
 
         Expect(TokenKind.Begin);
-        var body = new List<SqlStmt>();
+        var body = new ValueListBuilder<SqlStmt>();
         do
         {
             body.Add(ParseStatement());
@@ -1211,7 +1219,7 @@ public sealed partial class SqlParser
         } while (!Check(TokenKind.End));
         Expect(TokenKind.End);
 
-        return new CreateTriggerStmt(temp, ifNotExists, schema, name, timing, evt, table, forEachRow, when, body);
+        return new CreateTriggerStmt(temp, ifNotExists, schema, name, timing, evt, table, forEachRow, when, body.ToArray());
     }
 
     private CreateVirtualTableStmt ParseCreateVirtualTable(bool _)
@@ -1233,7 +1241,7 @@ public sealed partial class SqlParser
         IReadOnlyList<string>? args = null;
         if (Match(TokenKind.OpenParen))
         {
-            var list = new List<string>();
+            var list = new ValueListBuilder<string>();
             if (!Check(TokenKind.CloseParen))
             {
                 list.Add(ParseModuleArgument());
@@ -1241,7 +1249,7 @@ public sealed partial class SqlParser
                     list.Add(ParseModuleArgument());
             }
             Expect(TokenKind.CloseParen);
-            args = list;
+            args = list.ToArray();
         }
 
         return new CreateVirtualTableStmt(ifNotExists, schema, name, module, args);
@@ -1252,7 +1260,7 @@ public sealed partial class SqlParser
         // Module arguments are free-form text with balanced parentheses
         var start = _current.Span.Start;
         var depth = 0;
-        var parts = new List<string>();
+        var parts = new ValueListBuilder<string>();
 
         while (!Check(TokenKind.Eof))
         {
@@ -1262,11 +1270,11 @@ public sealed partial class SqlParser
                 depth++;
             else if (_current.Kind == TokenKind.CloseParen)
                 depth--;
-            parts.Add(_current.Text);
+            parts.Add(_current.Text.ToString());
             Advance();
         }
 
-        return string.Join(" ", parts);
+        return string.Join(" ", parts.ToArray());
     }
 
     // ---- DROP ----
@@ -1369,7 +1377,7 @@ public sealed partial class SqlParser
         if (!Match(TokenKind.Commit))
             Expect(TokenKind.End);
         Match(TokenKind.Transaction); // optional
-        return new CommitStmt();
+        return CommitStmt.Instance;
     }
 
     private RollbackStmt ParseRollbackStmt()
@@ -1481,7 +1489,7 @@ public sealed partial class SqlParser
         if (_current.Kind == TokenKind.StringLiteral)
         {
             var tok = Advance();
-            return new LiteralExpr(LiteralKind.String, SqlLexer.UnquoteString(tok.Text));
+            return new LiteralExpr(LiteralKind.String, SqlLexer.UnquoteString(tok.Text.Span));
         }
         if (_current.Kind == TokenKind.NumericLiteral || _current.Kind is TokenKind.Plus or TokenKind.Minus)
         {

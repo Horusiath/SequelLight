@@ -1,3 +1,5 @@
+using System.Collections.Frozen;
+
 namespace SequelLight.Parsing;
 
 public sealed class SqlLexer
@@ -5,8 +7,8 @@ public sealed class SqlLexer
     private readonly string _source;
     private int _pos;
 
-    private static readonly Dictionary<string, TokenKind> Keywords =
-        new(StringComparer.OrdinalIgnoreCase)
+    private static readonly FrozenDictionary<string, TokenKind> Keywords =
+        new Dictionary<string, TokenKind>(StringComparer.OrdinalIgnoreCase)
         {
             ["ABORT"] = TokenKind.Abort,
             ["ACTION"] = TokenKind.Action,
@@ -161,7 +163,7 @@ public sealed class SqlLexer
             ["WITH"] = TokenKind.With,
             ["WITHIN"] = TokenKind.Within,
             ["WITHOUT"] = TokenKind.Without,
-        };
+        }.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 
     public SqlLexer(string source)
     {
@@ -174,7 +176,7 @@ public sealed class SqlLexer
         SkipWhitespaceAndComments();
 
         if (_pos >= _source.Length)
-            return new Token(TokenKind.Eof, "", new TextSpan(_pos, 0));
+            return new Token(TokenKind.Eof, default, new TextSpan(_pos, 0));
 
         var start = _pos;
         var ch = _source[_pos];
@@ -286,8 +288,8 @@ public sealed class SqlLexer
         if ((ch == 'x' || ch == 'X') && _pos + 1 < _source.Length && _source[_pos + 1] == '\'')
         {
             _pos++; // skip 'x'
-            var strToken = ScanStringLiteral(_pos);
-            return new Token(TokenKind.BlobLiteral, _source[start.._pos], new TextSpan(start, _pos - start));
+            ScanStringLiteral(_pos);
+            return new Token(TokenKind.BlobLiteral, _source.AsMemory(start, _pos - start), new TextSpan(start, _pos - start));
         }
 
         // Quoted identifiers
@@ -424,7 +426,7 @@ public sealed class SqlLexer
         {
             // Quoted identifier after prefix
             ScanQuotedIdentifier('"', '"', _pos);
-            return new Token(TokenKind.BindParameter, _source[start.._pos], new TextSpan(start, _pos - start));
+            return new Token(TokenKind.BindParameter, _source.AsMemory(start, _pos - start), new TextSpan(start, _pos - start));
         }
         while (_pos < _source.Length && IsIdentChar(_source[_pos]))
             _pos++;
@@ -480,17 +482,21 @@ public sealed class SqlLexer
         while (_pos < _source.Length && IsIdentChar(_source[_pos]))
             _pos++;
 
-        var text = _source[start.._pos];
+        var len = _pos - start;
+        var span = _source.AsSpan(start, len);
+        var mem = _source.AsMemory(start, len);
+        var textSpan = new TextSpan(start, len);
 
-        if (Keywords.TryGetValue(text, out var kind))
-            return new Token(kind, text, new TextSpan(start, _pos - start));
+        var lookup = Keywords.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(span, out var kind))
+            return new Token(kind, mem, textSpan);
 
-        return new Token(TokenKind.Identifier, text, new TextSpan(start, _pos - start));
+        return new Token(TokenKind.Identifier, mem, textSpan);
     }
 
     private Token MakeToken(TokenKind kind, int start)
     {
-        return new Token(kind, _source[start.._pos], new TextSpan(start, _pos - start));
+        return new Token(kind, _source.AsMemory(start, _pos - start), new TextSpan(start, _pos - start));
     }
 
     private static bool IsDigit(char ch) => ch is >= '0' and <= '9';
@@ -506,24 +512,35 @@ public sealed class SqlLexer
 
     // --- Static utility methods for unquoting ---
 
-    public static string UnquoteIdentifier(string raw)
+    public static string UnquoteIdentifier(string raw) => UnquoteIdentifier(raw.AsSpan());
+
+    internal static string UnquoteIdentifier(ReadOnlySpan<char> raw)
     {
-        if (raw.Length < 2) return raw;
+        if (raw.Length < 2) return raw.ToString();
 
         if (raw[0] == '"' && raw[^1] == '"')
-            return raw[1..^1].Replace("\"\"", "\"");
+        {
+            var inner = raw[1..^1];
+            return inner.Contains('"') ? inner.ToString().Replace("\"\"", "\"") : inner.ToString();
+        }
         if (raw[0] == '`' && raw[^1] == '`')
-            return raw[1..^1].Replace("``", "`");
+        {
+            var inner = raw[1..^1];
+            return inner.Contains('`') ? inner.ToString().Replace("``", "`") : inner.ToString();
+        }
         if (raw[0] == '[' && raw[^1] == ']')
-            return raw[1..^1];
+            return raw[1..^1].ToString();
 
-        return raw;
+        return raw.ToString();
     }
 
-    public static string UnquoteString(string raw)
+    public static string UnquoteString(string raw) => UnquoteString(raw.AsSpan());
+
+    internal static string UnquoteString(ReadOnlySpan<char> raw)
     {
         if (raw.Length < 2 || raw[0] != '\'' || raw[^1] != '\'')
-            return raw;
-        return raw[1..^1].Replace("''", "'");
+            return raw.ToString();
+        var inner = raw[1..^1];
+        return inner.Contains('\'') ? inner.ToString().Replace("''", "'") : inner.ToString();
     }
 }

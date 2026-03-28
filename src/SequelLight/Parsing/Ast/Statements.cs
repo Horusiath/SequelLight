@@ -103,7 +103,7 @@ public sealed record AlterTableStmt(string? Schema, string Table, AlterTableActi
 
 public sealed record BeginStmt(TransactionKind? Kind) : SqlStmt;
 
-public sealed record CommitStmt : SqlStmt;
+public sealed record CommitStmt : SqlStmt { public static readonly CommitStmt Instance = new(); }
 
 public sealed record RollbackStmt(string? SavepointName) : SqlStmt;
 

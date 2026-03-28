@@ -24,7 +24,7 @@ public class LexerTests
         var tokens = Tokenize("SELECT 1");
         Assert.Equal(TokenKind.Select, tokens[0].Kind);
         Assert.Equal(TokenKind.NumericLiteral, tokens[1].Kind);
-        Assert.Equal("1", tokens[1].Text);
+        Assert.Equal("1", tokens[1].Text.ToString());
         Assert.Equal(TokenKind.Eof, tokens[2].Kind);
     }
 
@@ -33,7 +33,7 @@ public class LexerTests
     {
         var tokens = Tokenize("'hello''world'");
         Assert.Equal(TokenKind.StringLiteral, tokens[0].Kind);
-        Assert.Equal("'hello''world'", tokens[0].Text);
+        Assert.Equal("'hello''world'", tokens[0].Text.ToString());
     }
 
     [Fact]
@@ -41,7 +41,7 @@ public class LexerTests
     {
         var tokens = Tokenize("\"my column\"");
         Assert.Equal(TokenKind.Identifier, tokens[0].Kind);
-        Assert.Equal("my column", SqlLexer.UnquoteIdentifier(tokens[0].Text));
+        Assert.Equal("my column", SqlLexer.UnquoteIdentifier(tokens[0].Text.ToString()));
     }
 
     [Fact]
@@ -74,15 +74,15 @@ public class LexerTests
     {
         var tokens = Tokenize("? ?1 :name @var $param");
         Assert.Equal(TokenKind.BindParameter, tokens[0].Kind);
-        Assert.Equal("?", tokens[0].Text);
+        Assert.Equal("?", tokens[0].Text.ToString());
         Assert.Equal(TokenKind.BindParameter, tokens[1].Kind);
-        Assert.Equal("?1", tokens[1].Text);
+        Assert.Equal("?1", tokens[1].Text.ToString());
         Assert.Equal(TokenKind.BindParameter, tokens[2].Kind);
-        Assert.Equal(":name", tokens[2].Text);
+        Assert.Equal(":name", tokens[2].Text.ToString());
         Assert.Equal(TokenKind.BindParameter, tokens[3].Kind);
-        Assert.Equal("@var", tokens[3].Text);
+        Assert.Equal("@var", tokens[3].Text.ToString());
         Assert.Equal(TokenKind.BindParameter, tokens[4].Kind);
-        Assert.Equal("$param", tokens[4].Text);
+        Assert.Equal("$param", tokens[4].Text.ToString());
     }
 
     [Fact]
@@ -90,10 +90,10 @@ public class LexerTests
     {
         var tokens = Tokenize("42 3.14 1e10 0xFF");
         Assert.All(tokens.Take(4), t => Assert.Equal(TokenKind.NumericLiteral, t.Kind));
-        Assert.Equal("42", tokens[0].Text);
-        Assert.Equal("3.14", tokens[1].Text);
-        Assert.Equal("1e10", tokens[2].Text);
-        Assert.Equal("0xFF", tokens[3].Text);
+        Assert.Equal("42", tokens[0].Text.ToString());
+        Assert.Equal("3.14", tokens[1].Text.ToString());
+        Assert.Equal("1e10", tokens[2].Text.ToString());
+        Assert.Equal("0xFF", tokens[3].Text.ToString());
     }
 }
 

@@ -108,12 +108,12 @@ public sealed record ParenJoinRef(JoinClause Join) : TableOrSubquery;
 
 public abstract record IndexHint;
 public sealed record IndexedByHint(string IndexName) : IndexHint;
-public sealed record NotIndexedHint : IndexHint;
+public sealed record NotIndexedHint : IndexHint { public static readonly NotIndexedHint Instance = new(); }
 
 // ---- Result columns ----
 
 public abstract record ResultColumn;
-public sealed record StarResultColumn : ResultColumn;
+public sealed record StarResultColumn : ResultColumn { public static readonly StarResultColumn Instance = new(); }
 public sealed record TableStarResultColumn(string Table) : ResultColumn;
 public sealed record ExprResultColumn(SqlExpr Expression, string? Alias) : ResultColumn;
 
@@ -159,9 +159,9 @@ public sealed record FrameSpec(FrameType Type, FrameBound Start, FrameBound? End
 public enum FrameType { Range, Rows, Groups }
 
 public abstract record FrameBound;
-public sealed record CurrentRowBound : FrameBound;
-public sealed record UnboundedPrecedingBound : FrameBound;
-public sealed record UnboundedFollowingBound : FrameBound;
+public sealed record CurrentRowBound : FrameBound { public static readonly CurrentRowBound Instance = new(); }
+public sealed record UnboundedPrecedingBound : FrameBound { public static readonly UnboundedPrecedingBound Instance = new(); }
+public sealed record UnboundedFollowingBound : FrameBound { public static readonly UnboundedFollowingBound Instance = new(); }
 public sealed record ExprPrecedingBound(SqlExpr Value) : FrameBound;
 public sealed record ExprFollowingBound(SqlExpr Value) : FrameBound;
 
@@ -179,7 +179,7 @@ public sealed record UpsertClause(
     UpsertAction Action);
 
 public abstract record UpsertAction;
-public sealed record DoNothingAction : UpsertAction;
+public sealed record DoNothingAction : UpsertAction { public static readonly DoNothingAction Instance = new(); }
 public sealed record DoUpdateAction(IReadOnlyList<UpdateSetter> Setters, SqlExpr? Where) : UpsertAction;
 
 public sealed record UpdateSetter(IReadOnlyList<string> Columns, SqlExpr Value);
@@ -187,7 +187,7 @@ public sealed record UpdateSetter(IReadOnlyList<string> Columns, SqlExpr Value);
 // ---- Returning clause ----
 
 public abstract record ReturningColumn;
-public sealed record StarReturning : ReturningColumn;
+public sealed record StarReturning : ReturningColumn { public static readonly StarReturning Instance = new(); }
 public sealed record ExprReturning(SqlExpr Expression, string? Alias) : ReturningColumn;
 
 // ---- Table options ----
@@ -211,8 +211,8 @@ public sealed record DropColumnAction(string ColumnName) : AlterTableAction;
 public enum TriggerTiming { Before, After, InsteadOf }
 
 public abstract record TriggerEvent;
-public sealed record DeleteTriggerEvent : TriggerEvent;
-public sealed record InsertTriggerEvent : TriggerEvent;
+public sealed record DeleteTriggerEvent : TriggerEvent { public static readonly DeleteTriggerEvent Instance = new(); }
+public sealed record InsertTriggerEvent : TriggerEvent { public static readonly InsertTriggerEvent Instance = new(); }
 public sealed record UpdateTriggerEvent(IReadOnlyList<string>? Columns) : TriggerEvent;
 
 // ---- Insert ----
@@ -230,4 +230,4 @@ public enum InsertVerb
 
 public abstract record InsertSource;
 public sealed record SelectInsertSource(SelectStmt Query) : InsertSource;
-public sealed record DefaultValuesSource : InsertSource;
+public sealed record DefaultValuesSource : InsertSource { public static readonly DefaultValuesSource Instance = new(); }
