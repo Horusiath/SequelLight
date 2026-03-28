@@ -58,9 +58,8 @@ public sealed class SequelLightCommand : DbCommand
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
-        EnsureValid();
-        // TODO: parse and execute command
-        throw new NotImplementedException();
+        var (db, tx) = EnsureValid();
+        return await db.ExecuteNonQueryAsync(_commandText, tx).ConfigureAwait(false);
     }
 
     public override object? ExecuteScalar()
@@ -70,9 +69,8 @@ public sealed class SequelLightCommand : DbCommand
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
-        EnsureValid();
-        // TODO: parse and execute command, return first column of first row
-        throw new NotImplementedException();
+        var (db, tx) = EnsureValid();
+        return await db.ExecuteScalarAsync(_commandText, tx).ConfigureAwait(false);
     }
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
@@ -83,15 +81,15 @@ public sealed class SequelLightCommand : DbCommand
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
         CommandBehavior behavior, CancellationToken cancellationToken)
     {
-        EnsureValid();
-        // TODO: parse and execute query, return data reader
-        throw new NotImplementedException();
+        var (db, tx) = EnsureValid();
+        return await db.ExecuteReaderAsync(_commandText, tx).ConfigureAwait(false);
     }
 
     public override void Prepare()
     {
         EnsureValid();
-        // TODO: pre-parse and validate command text
+        // Eagerly parse to surface syntax errors early
+        Parsing.SqlParser.Parse(_commandText);
     }
 
     protected override DbParameter CreateDbParameter()
@@ -99,11 +97,13 @@ public sealed class SequelLightCommand : DbCommand
         return new SequelLightParameter();
     }
 
-    private void EnsureValid()
+    private (Database Db, Storage.ReadWriteTransaction? Tx) EnsureValid()
     {
-        if (Connection is null || Connection.State != ConnectionState.Open)
+        if (Connection is null || Connection.State != ConnectionState.Open || Connection.Db is null)
             throw new InvalidOperationException("Connection is not open.");
         if (string.IsNullOrEmpty(_commandText))
             throw new InvalidOperationException("CommandText has not been set.");
+
+        return (Connection.Db, Transaction?.Inner);
     }
 }

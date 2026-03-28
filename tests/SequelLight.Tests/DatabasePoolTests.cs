@@ -218,4 +218,81 @@ public class SequelLightConnectionTests : TempDirTest
         await conn.DisposeAsync();
         Assert.Equal(System.Data.ConnectionState.Closed, conn.State);
     }
+
+    [Fact]
+    public async Task ExecuteNonQueryAsync_Parses_SQL_Via_Database()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "INSERT INTO t (id) VALUES (1)";
+
+        // Execution is not yet implemented, but SQL is parsed — should throw NotImplementedException, not SqlParseException
+        await Assert.ThrowsAsync<NotImplementedException>(() => cmd.ExecuteNonQueryAsync());
+
+        await conn.CloseAsync();
+    }
+
+    [Fact]
+    public async Task ExecuteScalarAsync_Parses_SQL_Via_Database()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1";
+
+        await Assert.ThrowsAsync<NotImplementedException>(() => cmd.ExecuteScalarAsync());
+
+        await conn.CloseAsync();
+    }
+
+    [Fact]
+    public async Task ExecuteReaderAsync_Parses_SQL_Via_Database()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t";
+
+        await Assert.ThrowsAsync<NotImplementedException>(() => cmd.ExecuteReaderAsync());
+
+        await conn.CloseAsync();
+    }
+
+    [Fact]
+    public async Task Command_With_Invalid_SQL_Throws_ParseException()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "NOT VALID SQL !!!";
+
+        // Parser should reject this before execution is attempted
+        await Assert.ThrowsAsync<Parsing.SqlParseException>(() => cmd.ExecuteNonQueryAsync());
+
+        await conn.CloseAsync();
+    }
+
+    [Fact]
+    public async Task Prepare_Validates_SQL_Syntax()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+
+        // Valid SQL should not throw
+        cmd.CommandText = "SELECT 1";
+        cmd.Prepare();
+
+        // Invalid SQL should throw parse error
+        cmd.CommandText = "SELEC ??? broken";
+        Assert.Throws<Parsing.SqlParseException>(() => cmd.Prepare());
+
+        await conn.CloseAsync();
+    }
 }

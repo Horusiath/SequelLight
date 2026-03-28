@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using SequelLight.Parsing;
+using SequelLight.Parsing.Ast;
 using SequelLight.Storage;
 
 namespace SequelLight;
@@ -22,6 +24,27 @@ public sealed class Database : IAsyncDisposable
 
     public ReadOnlyTransaction BeginReadOnly() => _store.BeginReadOnly();
     public ReadWriteTransaction BeginReadWrite() => _store.BeginReadWrite();
+
+    internal async ValueTask<int> ExecuteNonQueryAsync(string sql, ReadWriteTransaction? transaction)
+    {
+        var stmt = SqlParser.Parse(sql);
+        // TODO: execute statement against store/transaction
+        throw new NotImplementedException();
+    }
+
+    internal async ValueTask<object?> ExecuteScalarAsync(string sql, ReadWriteTransaction? transaction)
+    {
+        var stmt = SqlParser.Parse(sql);
+        // TODO: execute statement, return first column of first row
+        throw new NotImplementedException();
+    }
+
+    internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql, ReadWriteTransaction? transaction)
+    {
+        var stmt = SqlParser.Parse(sql);
+        // TODO: execute query, populate reader from cursor
+        throw new NotImplementedException();
+    }
 
     public async ValueTask DisposeAsync()
     {
