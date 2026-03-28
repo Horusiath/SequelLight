@@ -397,6 +397,50 @@ public class SSTableTests : TempDirTest
     }
 
     [Fact]
+    public async Task Scanner_Matches_ScanAsync()
+    {
+        var path = Path.Combine(TempDir, "scanner.sst");
+
+        await using (var writer = SSTableWriter.Create(path, targetBlockSize: 128))
+        {
+            for (int i = 0; i < 50; i++)
+                await writer.WriteEntryAsync(Key($"k{i:D3}"), Val($"v{i}"));
+            // Include some tombstones
+            await writer.WriteEntryAsync(Key("k100"), null);
+            await writer.WriteEntryAsync(Key("k101"), null);
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+
+        // Collect results from ScanAsync
+        var scanEntries = new List<(string Key, string? Value)>();
+        await foreach (var (key, value) in reader.ScanAsync())
+            scanEntries.Add((Str(key), value is null ? null : Str(value)));
+
+        // Collect results from SSTableScanner
+        var scannerEntries = new List<(string Key, string? Value)>();
+        await using (var scanner = reader.CreateScanner())
+        {
+            while (await scanner.MoveNextAsync())
+            {
+                var key = Str(scanner.CurrentKey);
+                string? value = scanner.IsTombstone
+                    ? null
+                    : Encoding.UTF8.GetString(scanner.CurrentValueMemory.Span);
+                scannerEntries.Add((key, value));
+            }
+        }
+
+        Assert.Equal(scanEntries.Count, scannerEntries.Count);
+        for (int i = 0; i < scanEntries.Count; i++)
+        {
+            Assert.Equal(scanEntries[i].Key, scannerEntries[i].Key);
+            Assert.Equal(scanEntries[i].Value, scannerEntries[i].Value);
+        }
+    }
+
+    [Fact]
     public async Task MinKey_MaxKey_Are_Correct()
     {
         var path = Path.Combine(TempDir, "test.sst");

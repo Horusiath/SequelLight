@@ -267,28 +267,24 @@ public sealed class LsmStore : IAsyncDisposable
         // Sort inputs: newest (highest file ID) first so they win on duplicate keys
         var sortedInputs = plan.InputTables.OrderByDescending(t => ParseFileId(t.FilePath)).ToList();
 
-        // Open enumerators for k-way merge
-        var enumerators = new IAsyncEnumerator<(byte[] Key, byte[]? Value)>[sortedInputs.Count];
+        // Use SSTableScanner for efficient iteration: keys are allocated per entry (needed by
+        // PQ and writer), but value buffers are pooled and reused across entries.
+        var scanners = new SSTableScanner?[sortedInputs.Count];
         try
         {
             for (int i = 0; i < sortedInputs.Count; i++)
             {
                 var inputReader = sortedInputs[i].Reader;
                 if (inputReader is not null)
-                    enumerators[i] = inputReader.ScanAsync().GetAsyncEnumerator();
-                else
-                    enumerators[i] = EmptyEnumerator();
+                    scanners[i] = inputReader.CreateScanner();
             }
 
             // Seed priority queue: (sourceIndex) ordered by (key, sourceIndex)
             var pq = new PriorityQueue<int, MergeKey>(new MergeKeyComparer());
-            for (int i = 0; i < enumerators.Length; i++)
+            for (int i = 0; i < scanners.Length; i++)
             {
-                if (await enumerators[i].MoveNextAsync().ConfigureAwait(false))
-                {
-                    var (key, _) = enumerators[i].Current;
-                    pq.Enqueue(i, new MergeKey(key, i));
-                }
+                if (scanners[i] is not null && await scanners[i]!.MoveNextAsync().ConfigureAwait(false))
+                    pq.Enqueue(i, new MergeKey(scanners[i]!.CurrentKey, i));
             }
 
             await using var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize);
@@ -296,36 +292,43 @@ public sealed class LsmStore : IAsyncDisposable
 
             while (pq.TryDequeue(out int srcIdx, out _))
             {
-                var (key, value) = enumerators[srcIdx].Current;
+                var scanner = scanners[srcIdx]!;
+                var key = scanner.CurrentKey;
+                bool isTombstone = scanner.IsTombstone;
 
-                // Advance source
-                if (await enumerators[srcIdx].MoveNextAsync().ConfigureAwait(false))
+                // Check for duplicate keys BEFORE writing — skip entries already emitted
+                // from a newer source.
+                bool isDuplicate = prevKey is not null &&
+                    key.AsSpan().SequenceCompareTo(prevKey) == 0;
+
+                if (!isDuplicate)
                 {
-                    var (nk, _) = enumerators[srcIdx].Current;
-                    pq.Enqueue(srcIdx, new MergeKey(nk, srcIdx));
+                    prevKey = key;
+
+                    // Write entry while scanner's value buffer is still valid (before advance).
+                    // Drop tombstones at max level.
+                    if (!(isTombstone && plan.TargetLevel == maxLevel))
+                    {
+                        if (isTombstone)
+                            await writer.WriteEntryAsync(key, null).ConfigureAwait(false);
+                        else
+                            await writer.WriteEntryAsync(key, scanner.CurrentValueMemory, isTombstone).ConfigureAwait(false);
+                    }
                 }
 
-                // Skip duplicate keys (already emitted from a newer source)
-                if (prevKey is not null && key.AsSpan().SequenceCompareTo(prevKey) == 0)
-                    continue;
-
-                prevKey = key;
-
-                // Drop tombstones at max level
-                if (value is null && plan.TargetLevel == maxLevel)
-                    continue;
-
-                await writer.WriteEntryAsync(key, value).ConfigureAwait(false);
+                // Advance source AFTER the value has been consumed by the writer
+                if (await scanner.MoveNextAsync().ConfigureAwait(false))
+                    pq.Enqueue(srcIdx, new MergeKey(scanner.CurrentKey, srcIdx));
             }
 
             await writer.FinishAsync().ConfigureAwait(false);
         }
         finally
         {
-            foreach (var e in enumerators)
+            foreach (var s in scanners)
             {
-                if (e is not null)
-                    await e.DisposeAsync().ConfigureAwait(false);
+                if (s is not null)
+                    await s.DisposeAsync().ConfigureAwait(false);
             }
         }
 
@@ -366,12 +369,6 @@ public sealed class LsmStore : IAsyncDisposable
                 _retiredReaders.Add(input.Reader);
             try { File.Delete(input.FilePath); } catch { }
         }
-    }
-
-    private static async IAsyncEnumerator<(byte[] Key, byte[]? Value)> EmptyEnumerator()
-    {
-        await ValueTask.CompletedTask;
-        yield break;
     }
 
     public async ValueTask DisposeAsync()

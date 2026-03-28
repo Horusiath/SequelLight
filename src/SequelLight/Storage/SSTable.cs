@@ -118,6 +118,62 @@ public sealed class SSTableWriter : IAsyncDisposable
         _allKeys.Add(key);
     }
 
+    /// <summary>
+    /// Writes an entry using a borrowed value buffer. The value data is copied into the
+    /// block buffer immediately — the caller's buffer can be reused after this returns.
+    /// Used by compaction to avoid allocating a byte[] per value.
+    /// </summary>
+    internal async ValueTask WriteEntryAsync(byte[] key, ReadOnlyMemory<byte> value, bool isTombstone)
+    {
+        if (_blockFirstKey is null)
+            _blockFirstKey = key;
+
+        int shared = 0;
+        if (_entryCount % PrefixResetInterval != 0)
+            shared = KeyComparer.CommonPrefixLength(key, _prevKey);
+
+        int valueLen = isTombstone ? 0 : value.Length;
+        int suffixLen = key.Length - shared;
+        int entrySize = 2 + 2 + suffixLen + 4 + (isTombstone ? 0 : valueLen);
+
+        if (_blockOffset > 0 && _blockOffset + entrySize > _targetBlockSize)
+        {
+            await FlushBlockAsync().ConfigureAwait(false);
+            _blockFirstKey = key;
+            shared = 0;
+            suffixLen = key.Length;
+            entrySize = 2 + 2 + suffixLen + 4 + (isTombstone ? 0 : valueLen);
+        }
+
+        EnsureBlockCapacity(entrySize);
+        var span = _blockBuffer!.Memory.Span;
+
+        BinaryPrimitives.WriteUInt16LittleEndian(span[_blockOffset..], (ushort)shared);
+        _blockOffset += 2;
+        BinaryPrimitives.WriteUInt16LittleEndian(span[_blockOffset..], (ushort)suffixLen);
+        _blockOffset += 2;
+        key.AsSpan(shared).CopyTo(span[_blockOffset..]);
+        _blockOffset += suffixLen;
+
+        if (isTombstone)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(span[_blockOffset..], -1);
+            _blockOffset += 4;
+        }
+        else
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(span[_blockOffset..], valueLen);
+            _blockOffset += 4;
+            value.Span.CopyTo(span[_blockOffset..]);
+            _blockOffset += valueLen;
+        }
+
+        _prevKey = key;
+        _entryCount++;
+        _totalEntryCount++;
+        _allKeys.Add(key);
+    }
+
     public async ValueTask FinishAsync()
     {
         if (_blockOffset > 0)
@@ -510,6 +566,14 @@ public sealed class SSTableReader : IAsyncDisposable
     }
 
     /// <summary>
+    /// Creates a scanner for efficient sequential iteration with reusable value buffers.
+    /// Keys are allocated per entry (needed by callers), but the value buffer is pooled
+    /// and reused across entries — valid only until the next MoveNextAsync call.
+    /// Designed for compaction where value allocations dominate GC pressure.
+    /// </summary>
+    public SSTableScanner CreateScanner() => new SSTableScanner(_handle, _index);
+
+    /// <summary>
     /// Scans all entries in sorted order. Decodes lazily per entry from each block.
     /// </summary>
     public async IAsyncEnumerable<(byte[] Key, byte[]? Value)> ScanAsync()
@@ -597,5 +661,128 @@ public sealed class SSTableReader : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
-    private readonly record struct IndexEntry(byte[] FirstKey, long Offset, int Length);
+    internal readonly record struct IndexEntry(byte[] FirstKey, long Offset, int Length);
+}
+
+/// <summary>
+/// Streaming block decoder for SSTable sequential iteration.
+/// Allocates a fresh byte[] per key (needed by PQ and writer), but reuses a pooled
+/// value buffer across entries. Value data is only valid until the next MoveNextAsync call.
+/// </summary>
+public sealed class SSTableScanner : IAsyncDisposable
+{
+    private readonly SafeFileHandle _handle;
+    private readonly SSTableReader.IndexEntry[] _index;
+    private int _blockIdx;
+    private byte[]? _blockBuf;
+    private int _blockLen;
+    private int _offset;
+    private byte[] _prevKey = Array.Empty<byte>();
+
+    // Reusable value buffer
+    private byte[] _valueBuf;
+
+    /// <summary>Freshly allocated key for the current entry.</summary>
+    public byte[] CurrentKey { get; private set; } = Array.Empty<byte>();
+
+    /// <summary>Length of valid value data in the value buffer. -1 for tombstones.</summary>
+    public int CurrentValueLength { get; private set; }
+
+    public bool IsTombstone => CurrentValueLength == -1;
+
+    /// <summary>
+    /// Value data for the current entry. Only valid until the next MoveNextAsync call.
+    /// </summary>
+    public ReadOnlyMemory<byte> CurrentValueMemory =>
+        IsTombstone ? default : _valueBuf.AsMemory(0, CurrentValueLength);
+
+    internal SSTableScanner(SafeFileHandle handle, SSTableReader.IndexEntry[] index)
+    {
+        _handle = handle;
+        _index = index;
+        _blockIdx = -1; // will be incremented on first MoveNextAsync
+        _offset = 0;
+        _blockLen = 0;
+        _valueBuf = ArrayPool<byte>.Shared.Rent(4096);
+    }
+
+    public async ValueTask<bool> MoveNextAsync()
+    {
+        while (true)
+        {
+            // Try to decode next entry from current block
+            if (_blockBuf is not null && _offset + 4 <= _blockLen)
+            {
+                var block = _blockBuf.AsSpan(0, _blockLen);
+
+                ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[_offset..]);
+                _offset += 2;
+                ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[_offset..]);
+                _offset += 2;
+
+                int keyLen = shared + suffixLen;
+                if (_offset + suffixLen + 4 > _blockLen) return false;
+
+                var key = new byte[keyLen];
+                if (shared > 0) _prevKey.AsSpan(0, shared).CopyTo(key);
+                block.Slice(_offset, suffixLen).CopyTo(key.AsSpan(shared));
+                _offset += suffixLen;
+
+                int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[_offset..]);
+                _offset += 4;
+
+                CurrentKey = key;
+                _prevKey = key;
+
+                if (valueLen == -1)
+                {
+                    CurrentValueLength = -1;
+                }
+                else
+                {
+                    // Ensure value buffer is large enough
+                    if (valueLen > _valueBuf.Length)
+                    {
+                        ArrayPool<byte>.Shared.Return(_valueBuf);
+                        _valueBuf = ArrayPool<byte>.Shared.Rent(valueLen);
+                    }
+                    block.Slice(_offset, valueLen).CopyTo(_valueBuf);
+                    _offset += valueLen;
+                    CurrentValueLength = valueLen;
+                }
+
+                return true;
+            }
+
+            // Load next block
+            _blockIdx++;
+            if (_blockIdx >= _index.Length) return false;
+
+            var idx = _index[_blockIdx];
+            if (_blockBuf is null || _blockBuf.Length < idx.Length)
+            {
+                if (_blockBuf is not null)
+                    ArrayPool<byte>.Shared.Return(_blockBuf);
+                _blockBuf = ArrayPool<byte>.Shared.Rent(idx.Length);
+            }
+
+            await RandomAccess.ReadAsync(_handle, _blockBuf.AsMemory(0, idx.Length), idx.Offset)
+                .ConfigureAwait(false);
+            _blockLen = idx.Length;
+            _offset = 0;
+            _prevKey = Array.Empty<byte>();
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_blockBuf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(_blockBuf);
+            _blockBuf = null;
+        }
+        ArrayPool<byte>.Shared.Return(_valueBuf);
+        _valueBuf = null!;
+        return ValueTask.CompletedTask;
+    }
 }
