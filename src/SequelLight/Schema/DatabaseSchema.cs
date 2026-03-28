@@ -122,10 +122,11 @@ public sealed class DatabaseSchema
 
         // Build columns, resolving column-level constraints
         var columns = new ColumnSchema[body.Columns.Count];
+        int nextColSeq = 0;
         for (int i = 0; i < body.Columns.Count; i++)
         {
             var colDef = body.Columns[i];
-            columns[i] = BuildColumn(colDef, tablePkColumnNames);
+            columns[i] = BuildColumn(++nextColSeq, colDef, tablePkColumnNames);
 
             // If column has a column-level PK and no table-level PK exists, derive one
             if (columns[i].IsPrimaryKey && primaryKey == null)
@@ -176,6 +177,7 @@ public sealed class DatabaseSchema
             withoutRowId,
             isStrict,
             columns,
+            nextColSeq + 1,
             primaryKey,
             uniqueConstraints,
             checkConstraints,
@@ -345,12 +347,12 @@ public sealed class DatabaseSchema
             }
             case AddColumnAction addCol:
             {
-                var newColumn = BuildColumn(addCol.Column, tablePkColumns: null);
+                var newColumn = BuildColumn(table.NextColumnSeqNo, addCol.Column, tablePkColumns: null);
                 var columns = new ColumnSchema[table.Columns.Count + 1];
                 for (int i = 0; i < table.Columns.Count; i++)
                     columns[i] = table.Columns[i];
                 columns[table.Columns.Count] = newColumn;
-                _tables[tableOid] = table with { Columns = columns };
+                _tables[tableOid] = table with { Columns = columns, NextColumnSeqNo = table.NextColumnSeqNo + 1 };
                 break;
             }
             case DropColumnAction dropCol:
@@ -374,7 +376,7 @@ public sealed class DatabaseSchema
         }
     }
 
-    private static ColumnSchema BuildColumn(ColumnDef colDef, HashSet<string>? tablePkColumns)
+    private static ColumnSchema BuildColumn(int seqNo, ColumnDef colDef, HashSet<string>? tablePkColumns)
     {
         bool isNotNull = false;
         bool isPrimaryKey = tablePkColumns?.Contains(colDef.Name) ?? false;
@@ -423,6 +425,7 @@ public sealed class DatabaseSchema
         }
 
         return new ColumnSchema(
+            seqNo,
             colDef.Name,
             colDef.Type?.Name,
             isNotNull,

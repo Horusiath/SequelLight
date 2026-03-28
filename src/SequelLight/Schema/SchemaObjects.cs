@@ -27,8 +27,11 @@ public readonly struct Oid : IEquatable<Oid>, IComparable<Oid>
 /// <summary>
 /// Flattened representation of a column within a table.
 /// Column-level constraints are resolved into direct properties.
+/// <see cref="SeqNo"/> is a stable, monotonically increasing identifier within the parent table
+/// that is never reused, even after the column is dropped.
 /// </summary>
 public sealed record ColumnSchema(
+    int SeqNo,
     string Name,
     string? TypeName,
     bool IsNotNull,
@@ -76,6 +79,8 @@ public sealed record ForeignKeyConstraintSchema(
 
 /// <summary>
 /// In-memory representation of a table's schema, derived from CREATE TABLE DDL.
+/// <see cref="NextColumnSeqNo"/> tracks the next sequence number to assign to a new column,
+/// ensuring dropped column sequence numbers are never reused.
 /// </summary>
 public sealed record TableSchema(
     Oid Oid,
@@ -84,6 +89,7 @@ public sealed record TableSchema(
     bool WithoutRowId,
     bool IsStrict,
     IReadOnlyList<ColumnSchema> Columns,
+    int NextColumnSeqNo,
     PrimaryKeySchema? PrimaryKey,
     IReadOnlyList<UniqueConstraintSchema> UniqueConstraints,
     IReadOnlyList<CheckConstraintSchema> CheckConstraints,

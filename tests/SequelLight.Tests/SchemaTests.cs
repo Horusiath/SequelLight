@@ -888,4 +888,126 @@ public class SchemaTests
         var indexByOid = schema.GetIndex(indexByName.Oid)!;
         Assert.Same(indexByName, indexByOid);
     }
+
+    // ==== Column SeqNo tests ====
+
+    [Fact]
+    public void ColumnSeqNo_AssignedStartingAtOne()
+    {
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT, c REAL)");
+
+        var cols = schema.GetTable("t")!.Columns;
+        Assert.Equal(1, cols[0].SeqNo);
+        Assert.Equal(2, cols[1].SeqNo);
+        Assert.Equal(3, cols[2].SeqNo);
+    }
+
+    [Fact]
+    public void ColumnSeqNo_StableAfterRenameColumn()
+    {
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+        var seqBefore = schema.GetTable("t")!.Columns[0].SeqNo;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME COLUMN a TO z"));
+
+        var col = schema.GetTable("t")!.Columns[0];
+        Assert.Equal("z", col.Name);
+        Assert.Equal(seqBefore, col.SeqNo);
+    }
+
+    [Fact]
+    public void ColumnSeqNo_AddedColumnGetsNextSeq()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "ALTER TABLE t ADD COLUMN c REAL");
+
+        var cols = schema.GetTable("t")!.Columns;
+        Assert.Equal(1, cols[0].SeqNo); // a
+        Assert.Equal(2, cols[1].SeqNo); // b
+        Assert.Equal(3, cols[2].SeqNo); // c
+    }
+
+    [Fact]
+    public void ColumnSeqNo_NotReusedAfterDrop()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (a INTEGER, b TEXT, c REAL)",
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t ADD COLUMN d INTEGER");
+
+        var cols = schema.GetTable("t")!.Columns;
+        Assert.Equal(1, cols[0].SeqNo); // a — original
+        Assert.Equal(3, cols[1].SeqNo); // c — original
+        Assert.Equal(4, cols[2].SeqNo); // d — new, skips 2 (was b)
+    }
+
+    [Fact]
+    public void ColumnSeqNo_MultipleDropAndAdd()
+    {
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT, c REAL)");
+
+        // Drop all original columns except 'a', then add two new ones
+        schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN b"));
+        schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN c"));
+        schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN x INTEGER"));
+        schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
+
+        var cols = schema.GetTable("t")!.Columns;
+        Assert.Equal(3, cols.Count);
+        Assert.Equal(1, cols[0].SeqNo); // a — original
+        Assert.Equal(4, cols[1].SeqNo); // x — skips 2,3
+        Assert.Equal(5, cols[2].SeqNo); // y
+    }
+
+    [Fact]
+    public void ColumnSeqNo_NextColumnSeqNoTracked()
+    {
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+
+        var table = schema.GetTable("t")!;
+        Assert.Equal(3, table.NextColumnSeqNo); // next after 1,2
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN c REAL"));
+        table = schema.GetTable("t")!;
+        Assert.Equal(4, table.NextColumnSeqNo);
+
+        // Dropping doesn't decrease the counter
+        schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN b"));
+        table = schema.GetTable("t")!;
+        Assert.Equal(4, table.NextColumnSeqNo);
+    }
+
+    [Fact]
+    public void ColumnSeqNo_IndependentPerTable()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t1 (a INTEGER, b TEXT)",
+            "CREATE TABLE t2 (x REAL, y INTEGER, z TEXT)");
+
+        var cols1 = schema.GetTable("t1")!.Columns;
+        var cols2 = schema.GetTable("t2")!.Columns;
+
+        // Each table starts its own sequence at 1
+        Assert.Equal(1, cols1[0].SeqNo);
+        Assert.Equal(2, cols1[1].SeqNo);
+
+        Assert.Equal(1, cols2[0].SeqNo);
+        Assert.Equal(2, cols2[1].SeqNo);
+        Assert.Equal(3, cols2[2].SeqNo);
+    }
+
+    [Fact]
+    public void ColumnSeqNo_PreservedAcrossTableRename()
+    {
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+        var seqA = schema.GetTable("t")!.Columns[0].SeqNo;
+        var seqB = schema.GetTable("t")!.Columns[1].SeqNo;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
+
+        var cols = schema.GetTable("t2")!.Columns;
+        Assert.Equal(seqA, cols[0].SeqNo);
+        Assert.Equal(seqB, cols[1].SeqNo);
+    }
 }
