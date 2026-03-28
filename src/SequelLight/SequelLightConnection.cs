@@ -13,15 +13,11 @@ public sealed class SequelLightConnection : DbConnection
     private string _directory = string.Empty;
     private Database? _database;
     private ConnectionState _state = ConnectionState.Closed;
-    private readonly DatabasePool _pool;
 
     public SequelLightConnection() : this(string.Empty) { }
 
-    public SequelLightConnection(string connectionString) : this(connectionString, DatabasePool.Shared) { }
-
-    public SequelLightConnection(string connectionString, DatabasePool pool)
+    public SequelLightConnection(string connectionString)
     {
-        _pool = pool;
         ConnectionString = connectionString;
     }
 
@@ -56,7 +52,7 @@ public sealed class SequelLightConnection : DbConnection
         _state = ConnectionState.Connecting;
         try
         {
-            _database = await _pool.AcquireAsync(_directory).ConfigureAwait(false);
+            _database = await DatabasePool.Shared.AcquireAsync(_directory).ConfigureAwait(false);
             _state = ConnectionState.Open;
         }
         catch
@@ -77,7 +73,7 @@ public sealed class SequelLightConnection : DbConnection
 
         if (_database is not null)
         {
-            await _pool.ReleaseAsync(_database).ConfigureAwait(false);
+            await DatabasePool.Shared.ReleaseAsync(_database).ConfigureAwait(false);
             _database = null;
         }
 

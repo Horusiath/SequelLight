@@ -30,28 +30,30 @@ public sealed class Database : IAsyncDisposable
 }
 
 /// <summary>
-/// Thread-safe pool of <see cref="Database"/> instances keyed by directory path.
+/// Singleton pool of <see cref="Database"/> instances keyed by directory path.
 /// Uses lock-free reference counting and <see cref="TaskCompletionSource{T}"/>
 /// for one-shot async initialization.
 /// </summary>
-public sealed class DatabasePool : IAsyncDisposable
+public sealed class DatabasePool
 {
     public static DatabasePool Shared { get; } = new();
 
     private readonly ConcurrentDictionary<string, DatabaseSlot> _databases = new(StringComparer.OrdinalIgnoreCase);
 
+    private DatabasePool() { }
+
     /// <summary>
     /// Acquires a reference to the database at the given directory.
-    /// If no database is open for that path, one is created and opened.
+    /// If no database is open for that path, one is created and opened in a thread-safe manner.
     /// The caller must call <see cref="ReleaseAsync"/> when done.
     /// </summary>
-    public async ValueTask<Database> AcquireAsync(string directory, LsmStoreOptions? options = null)
+    internal async ValueTask<Database> AcquireAsync(string directory)
     {
         var fullPath = Path.GetFullPath(directory);
 
         while (true)
         {
-            var slot = _databases.GetOrAdd(fullPath, static (path, opts) => new DatabaseSlot(path, opts), options);
+            var slot = _databases.GetOrAdd(fullPath, static path => new DatabaseSlot(path));
             var acquired = slot.Acquire();
 
             if (acquired <= 0)
@@ -79,7 +81,7 @@ public sealed class DatabasePool : IAsyncDisposable
     /// Releases a reference to the database. When the last reference is released,
     /// the database is closed and removed from the pool.
     /// </summary>
-    public async ValueTask ReleaseAsync(Database database)
+    internal async ValueTask ReleaseAsync(Database database)
     {
         if (!_databases.TryGetValue(database.Directory, out var slot))
             return;
@@ -97,29 +99,16 @@ public sealed class DatabasePool : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
-    {
-        foreach (var kvp in _databases)
-        {
-            _databases.TryRemove(kvp);
-            kvp.Value.MarkDisposed();
-            var db = await kvp.Value.GetDatabaseAsync().ConfigureAwait(false);
-            await db.DisposeAsync().ConfigureAwait(false);
-        }
-    }
-
     private sealed class DatabaseSlot
     {
         private readonly string _directory;
-        private readonly LsmStoreOptions? _options;
         private readonly TaskCompletionSource<Database> _initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _refCount;
         private int _initializing;
 
-        public DatabaseSlot(string directory, LsmStoreOptions? options)
+        public DatabaseSlot(string directory)
         {
             _directory = directory;
-            _options = options;
         }
 
         /// <summary>
@@ -144,17 +133,7 @@ public sealed class DatabasePool : IAsyncDisposable
             {
                 try
                 {
-                    var opts = _options ?? new LsmStoreOptions { Directory = _directory };
-                    if (opts.Directory != _directory)
-                        opts = new LsmStoreOptions
-                        {
-                            Directory = _directory,
-                            MemTableFlushThreshold = opts.MemTableFlushThreshold,
-                            SSTableBlockSize = opts.SSTableBlockSize,
-                            BlockCacheSize = opts.BlockCacheSize,
-                            CompactionStrategy = opts.CompactionStrategy,
-                        };
-                    var store = await LsmStore.OpenAsync(opts).ConfigureAwait(false);
+                    var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = _directory }).ConfigureAwait(false);
                     _initialized.TrySetResult(new Database(store, _directory));
                 }
                 catch (Exception ex)

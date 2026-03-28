@@ -7,26 +7,28 @@ public class DatabasePoolTests : TempDirTest
     [Fact]
     public async Task AcquireAsync_Creates_Database_For_New_Directory()
     {
-        await using var pool = new DatabasePool();
-        var db = await pool.AcquireAsync(TempDir);
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
 
-        Assert.NotNull(db);
-        Assert.Equal(Path.GetFullPath(TempDir), db.Directory);
+        Assert.NotNull(conn.Db);
+        Assert.Equal(Path.GetFullPath(TempDir), conn.Db!.Directory);
 
-        await pool.ReleaseAsync(db);
+        await conn.CloseAsync();
     }
 
     [Fact]
     public async Task AcquireAsync_Returns_Same_Instance_For_Same_Directory()
     {
-        await using var pool = new DatabasePool();
-        var db1 = await pool.AcquireAsync(TempDir);
-        var db2 = await pool.AcquireAsync(TempDir);
+        var conn1 = new SequelLightConnection($"Data Source={TempDir}");
+        var conn2 = new SequelLightConnection($"Data Source={TempDir}");
 
-        Assert.Same(db1, db2);
+        await conn1.OpenAsync();
+        await conn2.OpenAsync();
 
-        await pool.ReleaseAsync(db1);
-        await pool.ReleaseAsync(db2);
+        Assert.Same(conn1.Db, conn2.Db);
+
+        await conn1.CloseAsync();
+        await conn2.CloseAsync();
     }
 
     [Fact]
@@ -35,66 +37,82 @@ public class DatabasePoolTests : TempDirTest
         var dir1 = Path.Combine(TempDir, "db1");
         var dir2 = Path.Combine(TempDir, "db2");
 
-        await using var pool = new DatabasePool();
-        var db1 = await pool.AcquireAsync(dir1);
-        var db2 = await pool.AcquireAsync(dir2);
+        var conn1 = new SequelLightConnection($"Data Source={dir1}");
+        var conn2 = new SequelLightConnection($"Data Source={dir2}");
 
-        Assert.NotSame(db1, db2);
-        Assert.NotEqual(db1.Directory, db2.Directory);
+        await conn1.OpenAsync();
+        await conn2.OpenAsync();
 
-        await pool.ReleaseAsync(db1);
-        await pool.ReleaseAsync(db2);
+        Assert.NotSame(conn1.Db, conn2.Db);
+        Assert.NotEqual(conn1.Db!.Directory, conn2.Db!.Directory);
+
+        await conn1.CloseAsync();
+        await conn2.CloseAsync();
     }
 
     [Fact]
     public async Task ReleaseAsync_Last_Reference_Disposes_Database()
     {
-        await using var pool = new DatabasePool();
-        var db = await pool.AcquireAsync(TempDir);
-        await pool.ReleaseAsync(db);
+        var conn1 = new SequelLightConnection($"Data Source={TempDir}");
+        await conn1.OpenAsync();
+        var db1 = conn1.Db;
+        await conn1.CloseAsync();
 
-        // After release, acquiring again should create a new instance
-        var db2 = await pool.AcquireAsync(TempDir);
-        Assert.NotSame(db, db2);
+        // After all connections close, acquiring again should create a new instance
+        var conn2 = new SequelLightConnection($"Data Source={TempDir}");
+        await conn2.OpenAsync();
+        Assert.NotSame(db1, conn2.Db);
 
-        await pool.ReleaseAsync(db2);
+        await conn2.CloseAsync();
     }
 
     [Fact]
     public async Task ReleaseAsync_With_Multiple_References_Keeps_Database_Alive()
     {
-        await using var pool = new DatabasePool();
-        var db1 = await pool.AcquireAsync(TempDir);
-        var db2 = await pool.AcquireAsync(TempDir);
+        var conn1 = new SequelLightConnection($"Data Source={TempDir}");
+        var conn2 = new SequelLightConnection($"Data Source={TempDir}");
+
+        await conn1.OpenAsync();
+        await conn2.OpenAsync();
+        var db = conn1.Db;
 
         // Release one — database should still be alive
-        await pool.ReleaseAsync(db1);
+        await conn1.CloseAsync();
 
-        // Acquiring again should return the same instance (still referenced by db2)
-        var db3 = await pool.AcquireAsync(TempDir);
-        Assert.Same(db2, db3);
+        // Opening a new connection should return the same database (still referenced by conn2)
+        var conn3 = new SequelLightConnection($"Data Source={TempDir}");
+        await conn3.OpenAsync();
+        Assert.Same(db, conn3.Db);
 
-        await pool.ReleaseAsync(db2);
-        await pool.ReleaseAsync(db3);
+        await conn2.CloseAsync();
+        await conn3.CloseAsync();
     }
 
     [Fact]
-    public async Task Concurrent_Acquires_Return_Same_Instance()
+    public async Task Concurrent_Connections_Share_Same_Database()
     {
-        await using var pool = new DatabasePool();
+        var tasks = new Task<Database?>[10];
+        var connections = new SequelLightConnection[10];
 
-        var tasks = new Task<Database>[10];
         for (int i = 0; i < tasks.Length; i++)
-            tasks[i] = pool.AcquireAsync(TempDir).AsTask();
+        {
+            var conn = new SequelLightConnection($"Data Source={TempDir}");
+            connections[i] = conn;
+            tasks[i] = Task.Run(async () =>
+            {
+                await conn.OpenAsync();
+                return conn.Db;
+            });
+        }
 
         var results = await Task.WhenAll(tasks);
 
-        // All should be the same instance
+        // All should reference the same database instance
         for (int i = 1; i < results.Length; i++)
             Assert.Same(results[0], results[i]);
 
-        foreach (var db in results)
-            await pool.ReleaseAsync(db);
+        foreach (var conn in connections)
+            await conn.CloseAsync();
     }
 }
 
@@ -131,8 +149,7 @@ public class SequelLightConnectionTests : TempDirTest
     [Fact]
     public async Task OpenAsync_And_CloseAsync()
     {
-        await using var pool = new DatabasePool();
-        var conn = new SequelLightConnection($"Data Source={TempDir}", pool);
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
 
         await conn.OpenAsync();
         Assert.Equal(System.Data.ConnectionState.Open, conn.State);
@@ -146,10 +163,8 @@ public class SequelLightConnectionTests : TempDirTest
     [Fact]
     public async Task Multiple_Connections_Share_Same_Database()
     {
-        await using var pool = new DatabasePool();
-
-        var conn1 = new SequelLightConnection($"Data Source={TempDir}", pool);
-        var conn2 = new SequelLightConnection($"Data Source={TempDir}", pool);
+        var conn1 = new SequelLightConnection($"Data Source={TempDir}");
+        var conn2 = new SequelLightConnection($"Data Source={TempDir}");
 
         await conn1.OpenAsync();
         await conn2.OpenAsync();
@@ -163,8 +178,7 @@ public class SequelLightConnectionTests : TempDirTest
     [Fact]
     public async Task CreateCommand_Returns_Command_With_Connection()
     {
-        await using var pool = new DatabasePool();
-        var conn = new SequelLightConnection($"Data Source={TempDir}", pool);
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
         await conn.OpenAsync();
 
         var cmd = conn.CreateCommand();
@@ -177,8 +191,7 @@ public class SequelLightConnectionTests : TempDirTest
     [Fact]
     public async Task BeginTransaction_Creates_Transaction()
     {
-        await using var pool = new DatabasePool();
-        var conn = new SequelLightConnection($"Data Source={TempDir}", pool);
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
         await conn.OpenAsync();
 
         await using var tx = conn.BeginTransaction();
@@ -189,7 +202,7 @@ public class SequelLightConnectionTests : TempDirTest
     }
 
     [Fact]
-    public async Task BeginTransaction_On_Closed_Connection_Throws()
+    public void BeginTransaction_On_Closed_Connection_Throws()
     {
         var conn = new SequelLightConnection($"Data Source={TempDir}");
         Assert.Throws<InvalidOperationException>(() => conn.BeginTransaction());
@@ -198,8 +211,7 @@ public class SequelLightConnectionTests : TempDirTest
     [Fact]
     public async Task DisposeAsync_Closes_Connection()
     {
-        await using var pool = new DatabasePool();
-        var conn = new SequelLightConnection($"Data Source={TempDir}", pool);
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
         await conn.OpenAsync();
         Assert.Equal(System.Data.ConnectionState.Open, conn.State);
 
