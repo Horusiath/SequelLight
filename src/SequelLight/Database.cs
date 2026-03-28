@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
+using SequelLight.Schema;
 using SequelLight.Storage;
 
 namespace SequelLight;
@@ -17,9 +18,11 @@ public sealed class Database : IAsyncDisposable
     {
         _store = store;
         Directory = directory;
+        Schema = new DatabaseSchema();
     }
 
     public string Directory { get; }
+    public DatabaseSchema Schema { get; }
     internal LsmStore Store => _store;
 
     public ReadOnlyTransaction BeginReadOnly() => _store.BeginReadOnly();
