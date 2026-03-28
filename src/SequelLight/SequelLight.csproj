@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="SequelLight.Tests" />
+    <InternalsVisibleTo Include="SequelLight.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>
