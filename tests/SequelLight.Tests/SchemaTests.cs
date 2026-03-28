@@ -268,7 +268,7 @@ public class SchemaTests
         var index = schema.GetIndex("idx");
         Assert.NotNull(index);
         Assert.Equal("idx", index.Name);
-        Assert.Equal("t", index.TableName);
+        Assert.Equal(schema.GetTableOid("t"), index.TableOid);
         Assert.False(index.IsUnique);
         Assert.Single(index.Columns);
         Assert.Null(index.Where);
@@ -403,7 +403,7 @@ public class SchemaTests
         var trigger = schema.GetTrigger("trg");
         Assert.NotNull(trigger);
         Assert.Equal("trg", trigger.Name);
-        Assert.Equal("t", trigger.TableName);
+        Assert.Equal(schema.GetTableOid("t"), trigger.TableOid);
         Assert.Equal(TriggerTiming.After, trigger.Timing);
         Assert.IsType<InsertTriggerEvent>(trigger.Event);
         Assert.False(trigger.ForEachRow);
@@ -536,8 +536,9 @@ public class SchemaTests
         Assert.NotNull(table);
         Assert.Equal("t2", table.Name);
 
-        // Index should reference new table name
-        Assert.Equal("t2", schema.GetIndex("idx")!.TableName);
+        // Index still references the same table by Oid
+        var index = schema.GetIndex("idx")!;
+        Assert.Equal(table.Oid, index.TableOid);
     }
 
     [Fact]
@@ -677,5 +678,214 @@ public class SchemaTests
 
         Assert.Throws<InvalidOperationException>(() =>
             schema.Apply(SqlParser.Parse("SELECT 1")));
+    }
+
+    // ==== Oid tests ====
+
+    [Fact]
+    public void Oid_AssignedOnCreate()
+    {
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+
+        var table = schema.GetTable("t")!;
+        Assert.NotEqual(Oid.None, table.Oid);
+    }
+
+    [Fact]
+    public void Oid_MonotonicallyIncreasing()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE a (x INTEGER)",
+            "CREATE TABLE b (x INTEGER)",
+            "CREATE INDEX idx ON b (x)",
+            "CREATE VIEW v AS SELECT 1");
+
+        var oidA = schema.GetTable("a")!.Oid;
+        var oidB = schema.GetTable("b")!.Oid;
+        var oidIdx = schema.GetIndex("idx")!.Oid;
+        var oidV = schema.GetView("v")!.Oid;
+
+        Assert.True(oidA.Value < oidB.Value);
+        Assert.True(oidB.Value < oidIdx.Value);
+        Assert.True(oidIdx.Value < oidV.Value);
+    }
+
+    [Fact]
+    public void Oid_UniqueAcrossObjectTypes()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var oids = new HashSet<Oid>
+        {
+            schema.GetTable("t")!.Oid,
+            schema.GetIndex("idx")!.Oid,
+            schema.GetView("v")!.Oid,
+            schema.GetTrigger("trg")!.Oid,
+        };
+        Assert.Equal(4, oids.Count);
+    }
+
+    [Fact]
+    public void Oid_LookupByOid()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var tableOid = schema.GetTableOid("t");
+        var indexOid = schema.GetIndexOid("idx");
+        var viewOid = schema.GetViewOid("v");
+        var triggerOid = schema.GetTriggerOid("trg");
+
+        Assert.Equal("t", schema.GetTable(tableOid)!.Name);
+        Assert.Equal("idx", schema.GetIndex(indexOid)!.Name);
+        Assert.Equal("v", schema.GetView(viewOid)!.Name);
+        Assert.Equal("trg", schema.GetTrigger(triggerOid)!.Name);
+    }
+
+    [Fact]
+    public void Oid_LookupMissing_ReturnsNone()
+    {
+        var schema = new DatabaseSchema();
+
+        Assert.Equal(Oid.None, schema.GetTableOid("nonexistent"));
+        Assert.Null(schema.GetTable(Oid.None));
+    }
+
+    [Fact]
+    public void Oid_StableAfterRenameTable()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var oidBefore = schema.GetTable("t")!.Oid;
+        var indexOidBefore = schema.GetIndex("idx")!.Oid;
+        var triggerOidBefore = schema.GetTrigger("trg")!.Oid;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
+
+        // Table Oid unchanged, reachable by new name
+        Assert.Equal(Oid.None, schema.GetTableOid("t"));
+        var table = schema.GetTable("t2")!;
+        Assert.Equal(oidBefore, table.Oid);
+        Assert.Equal(oidBefore, schema.GetTableOid("t2"));
+
+        // Also reachable by Oid directly
+        Assert.Equal("t2", schema.GetTable(oidBefore)!.Name);
+
+        // Index and trigger Oids unchanged, still reference same table Oid
+        var index = schema.GetIndex("idx")!;
+        Assert.Equal(indexOidBefore, index.Oid);
+        Assert.Equal(oidBefore, index.TableOid);
+
+        var trigger = schema.GetTrigger("trg")!;
+        Assert.Equal(triggerOidBefore, trigger.Oid);
+        Assert.Equal(oidBefore, trigger.TableOid);
+    }
+
+    [Fact]
+    public void Oid_StableAfterRenameColumn()
+    {
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var oidBefore = schema.GetTable("t")!.Oid;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME COLUMN x TO y"));
+
+        Assert.Equal(oidBefore, schema.GetTable("t")!.Oid);
+    }
+
+    [Fact]
+    public void Oid_StableAfterAddColumn()
+    {
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var oidBefore = schema.GetTable("t")!.Oid;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
+
+        Assert.Equal(oidBefore, schema.GetTable("t")!.Oid);
+    }
+
+    [Fact]
+    public void Oid_StableAfterDropColumn()
+    {
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER, y TEXT)");
+        var oidBefore = schema.GetTable("t")!.Oid;
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN y"));
+
+        Assert.Equal(oidBefore, schema.GetTable("t")!.Oid);
+    }
+
+    [Fact]
+    public void Oid_NotReusedAfterDrop()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "DROP TABLE t",
+            "CREATE TABLE t (y TEXT)");
+
+        // New table gets a different (higher) Oid
+        var table = schema.GetTable("t")!;
+        Assert.True(table.Oid.Value > 1u);
+    }
+
+    [Fact]
+    public void Oid_IndexAndTrigger_ReferenceTableByOid()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var tableOid = schema.GetTable("t")!.Oid;
+        Assert.Equal(tableOid, schema.GetIndex("idx")!.TableOid);
+        Assert.Equal(tableOid, schema.GetTrigger("trg")!.TableOid);
+    }
+
+    [Fact]
+    public void Oid_DropTableCascade_ClearsOidMappings()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var tableOid = schema.GetTableOid("t");
+        var indexOid = schema.GetIndexOid("idx");
+        var triggerOid = schema.GetTriggerOid("trg");
+
+        schema.Apply(SqlParser.Parse("DROP TABLE t"));
+
+        // All Oid lookups return nothing
+        Assert.Null(schema.GetTable(tableOid));
+        Assert.Null(schema.GetIndex(indexOid));
+        Assert.Null(schema.GetTrigger(triggerOid));
+        Assert.Equal(Oid.None, schema.GetTableOid("t"));
+        Assert.Equal(Oid.None, schema.GetIndexOid("idx"));
+        Assert.Equal(Oid.None, schema.GetTriggerOid("trg"));
+    }
+
+    [Fact]
+    public void Oid_MatchesBetweenNameAndOidLookup()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)");
+
+        var tableByName = schema.GetTable("t")!;
+        var tableByOid = schema.GetTable(tableByName.Oid)!;
+        Assert.Same(tableByName, tableByOid);
+
+        var indexByName = schema.GetIndex("idx")!;
+        var indexByOid = schema.GetIndex(indexByName.Oid)!;
+        Assert.Same(indexByName, indexByOid);
     }
 }
