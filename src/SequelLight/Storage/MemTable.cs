@@ -1,22 +1,19 @@
-using System.Collections.Immutable;
-
 namespace SequelLight.Storage;
 
 /// <summary>
-/// In-memory sorted table backed by ImmutableSortedDictionary.
-/// Supports lock-free CAS-based concurrent access:
-///   - Read-only transactions hold a snapshot of the dictionary.
-///   - Read-write transactions build a local copy and CAS-swap on commit.
+/// In-memory sorted table backed by a lock-free skip list.
+///
+/// Concurrency model:
+///   - The active memtable is a ConcurrentSkipList that supports lock-free concurrent reads and writes.
+///   - Read-only transactions get a reference to the current skip list (reads are safe concurrently).
+///   - Read-write transactions buffer mutations locally and apply them to the skip list on commit.
+///   - On flush, the active skip list is atomically swapped for a fresh one; the frozen list is
+///     drained into an SSTable.
 /// </summary>
 public sealed class MemTable
 {
-    private volatile ImmutableSortedDictionary<byte[], MemEntry> _data;
+    private volatile ConcurrentSkipList _data = new();
     private int _approximateSize;
-
-    public MemTable()
-    {
-        _data = ImmutableSortedDictionary.Create<byte[], MemEntry>(KeyComparer.Instance);
-    }
 
     public int Count => _data.Count;
 
@@ -26,37 +23,32 @@ public sealed class MemTable
     public int ApproximateSize => Volatile.Read(ref _approximateSize);
 
     /// <summary>
-    /// Takes a snapshot for read-only access. The returned dictionary is immutable
-    /// and safe to hold across concurrent writes.
+    /// Returns the current skip list for read-only access.
+    /// The returned skip list is safe to read concurrently with writes.
     /// </summary>
-    public ImmutableSortedDictionary<byte[], MemEntry> Snapshot() => _data;
+    public ConcurrentSkipList Current => _data;
 
     /// <summary>
-    /// Tries to atomically replace the memtable via CAS.
-    /// <paramref name="sizeDelta"/> is the net change in approximate size caused by the mutations.
-    /// Returns false if the memtable was concurrently modified.
+    /// Applies buffered mutations to the active skip list.
+    /// Unlike the old ImmutableSortedDictionary approach, there's no CAS-swap needed —
+    /// the skip list handles concurrent inserts internally.
     /// </summary>
-    public bool TryApply(
-        ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
-        ImmutableSortedDictionary<byte[], MemEntry> newData,
-        int sizeDelta)
+    public void Apply(List<(byte[] Key, MemEntry Entry)> mutations, int sizeDelta)
     {
-        var original = Interlocked.CompareExchange(ref _data, newData, expectedSnapshot);
-        if (!ReferenceEquals(original, expectedSnapshot))
-            return false;
+        foreach (var (key, entry) in mutations)
+            _data.Put(key, entry);
 
         Interlocked.Add(ref _approximateSize, sizeDelta);
-        return true;
     }
 
     /// <summary>
-    /// Atomically replaces the memtable with an empty dictionary and returns the old data.
+    /// Atomically replaces the memtable with an empty skip list and returns the old one.
     /// Used during flush to SSTable.
     /// </summary>
-    public ImmutableSortedDictionary<byte[], MemEntry> SwapOut()
+    public ConcurrentSkipList SwapOut()
     {
-        var empty = ImmutableSortedDictionary.Create<byte[], MemEntry>(KeyComparer.Instance);
-        var old = Interlocked.Exchange(ref _data, empty);
+        var fresh = new ConcurrentSkipList();
+        var old = Interlocked.Exchange(ref _data, fresh);
         Interlocked.Exchange(ref _approximateSize, 0);
         return old;
     }

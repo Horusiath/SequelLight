@@ -351,32 +351,51 @@ public sealed class SSTableReader : IAsyncDisposable
     private static byte[] DecodeLastKey(ReadOnlySpan<byte> block)
     {
         int offset = 0;
-        byte[] prevKey = Array.Empty<byte>();
-        byte[] lastKey = Array.Empty<byte>();
+        const int StackLimit = 256;
+        Span<byte> keyBuf = stackalloc byte[StackLimit];
+        byte[]? rentedBuf = null;
+        int lastKeyLen = 0;
 
-        while (offset + 4 <= block.Length)
+        try
         {
-            ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
-            ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
+            while (offset + 4 <= block.Length)
+            {
+                ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                offset += 2;
+                ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                offset += 2;
 
-            if (offset + suffixLen + 4 > block.Length) break;
+                int keyLen = shared + suffixLen;
+                if (offset + suffixLen + 4 > block.Length) break;
 
-            var key = new byte[shared + suffixLen];
-            if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
-            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
-            offset += suffixLen;
+                if (keyLen > keyBuf.Length)
+                {
+                    var newRented = ArrayPool<byte>.Shared.Rent(keyLen);
+                    if (shared > 0)
+                        keyBuf[..shared].CopyTo(newRented);
+                    if (rentedBuf is not null)
+                        ArrayPool<byte>.Shared.Return(rentedBuf);
+                    rentedBuf = newRented;
+                    keyBuf = rentedBuf;
+                }
 
-            int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
-            offset += 4;
-            if (valueLen > 0) offset += valueLen;
+                block.Slice(offset, suffixLen).CopyTo(keyBuf[shared..]);
+                offset += suffixLen;
 
-            lastKey = key;
-            prevKey = key;
+                int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
+                offset += 4;
+                if (valueLen > 0) offset += valueLen;
+
+                lastKeyLen = keyLen;
+            }
+
+            return keyBuf[..lastKeyLen].ToArray();
         }
-
-        return lastKey;
+        finally
+        {
+            if (rentedBuf is not null)
+                ArrayPool<byte>.Shared.Return(rentedBuf);
+        }
     }
 
     /// <summary>
@@ -422,45 +441,72 @@ public sealed class SSTableReader : IAsyncDisposable
 
     /// <summary>
     /// Decodes entries one at a time from a block, comparing against the target key.
-    /// Returns immediately on match or overshoot — avoids allocating values for non-matching entries.
+    /// Returns immediately on match or overshoot. Reconstructs keys into a reusable
+    /// buffer (stackalloc for small keys, ArrayPool for large) to avoid per-entry allocations.
     /// </summary>
     private static (byte[]? Value, bool Found) FindInBlock(ReadOnlySpan<byte> block, byte[] targetKey)
     {
         int offset = 0;
-        byte[] prevKey = Array.Empty<byte>();
+        // Reusable key buffer: stackalloc for typical keys, rent for oversized
+        const int StackLimit = 256;
+        Span<byte> keyBuf = stackalloc byte[StackLimit];
+        byte[]? rentedBuf = null;
+        int prevKeyLen = 0;
 
-        while (offset + 4 <= block.Length)
+        try
         {
-            ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
-            ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
-            offset += 2;
-
-            int keyLen = shared + suffixLen;
-            if (offset + suffixLen + 4 > block.Length) break;
-
-            var key = new byte[keyLen];
-            if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
-            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
-            offset += suffixLen;
-
-            int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
-            offset += 4;
-
-            int cmp = key.AsSpan().SequenceCompareTo(targetKey);
-            if (cmp == 0)
+            while (offset + 4 <= block.Length)
             {
-                byte[]? value = valueLen == -1 ? null : block.Slice(offset, valueLen).ToArray();
-                return (value, true);
+                ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                offset += 2;
+                ushort suffixLen = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
+                offset += 2;
+
+                int keyLen = shared + suffixLen;
+                if (offset + suffixLen + 4 > block.Length) break;
+
+                // Ensure buffer is large enough
+                if (keyLen > keyBuf.Length)
+                {
+                    var newRented = ArrayPool<byte>.Shared.Rent(keyLen);
+                    // Copy previous key prefix into new buffer (needed for shared prefix reconstruction)
+                    if (shared > 0)
+                        keyBuf[..shared].CopyTo(newRented);
+                    if (rentedBuf is not null)
+                        ArrayPool<byte>.Shared.Return(rentedBuf);
+                    rentedBuf = newRented;
+                    keyBuf = rentedBuf;
+                }
+                else if (shared > 0 && shared <= prevKeyLen)
+                {
+                    // Shared prefix is already in keyBuf from the previous iteration — no copy needed
+                }
+
+                block.Slice(offset, suffixLen).CopyTo(keyBuf[shared..]);
+                offset += suffixLen;
+
+                int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
+                offset += 4;
+
+                int cmp = keyBuf[..keyLen].SequenceCompareTo(targetKey);
+                if (cmp == 0)
+                {
+                    byte[]? value = valueLen == -1 ? null : block.Slice(offset, valueLen).ToArray();
+                    return (value, true);
+                }
+                if (cmp > 0) return (null, false);
+
+                if (valueLen > 0) offset += valueLen;
+                prevKeyLen = keyLen;
             }
-            if (cmp > 0) return (null, false);
 
-            // Skip past value bytes without allocating
-            if (valueLen > 0) offset += valueLen;
-            prevKey = key;
+            return (null, false);
         }
-
-        return (null, false);
+        finally
+        {
+            if (rentedBuf is not null)
+                ArrayPool<byte>.Shared.Return(rentedBuf);
+        }
     }
 
     /// <summary>

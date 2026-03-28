@@ -70,15 +70,16 @@ public class KeyComparerTests
 public class WalTests : TempDirTest
 {
     [Fact]
-    public async Task Append_And_Replay_Puts()
+    public async Task Commit_And_Replay_Puts()
     {
         var path = Path.Combine(TempDir, "test.wal");
 
         await using (var wal = WriteAheadLog.Create(path))
         {
-            wal.AppendPut(Key("key1"), Val("val1"));
-            wal.AppendPut(Key("key2"), Val("val2"));
-            await wal.FlushAsync();
+            await wal.CommitAsync([
+                (Key("key1"), Val("val1")),
+                (Key("key2"), Val("val2")),
+            ]);
         }
 
         var entries = new List<(WalEntryType Type, string Key, string? Value)>();
@@ -94,15 +95,16 @@ public class WalTests : TempDirTest
     }
 
     [Fact]
-    public async Task Append_And_Replay_Deletes()
+    public async Task Commit_And_Replay_Deletes()
     {
         var path = Path.Combine(TempDir, "test.wal");
 
         await using (var wal = WriteAheadLog.Create(path))
         {
-            wal.AppendPut(Key("key1"), Val("val1"));
-            wal.AppendDelete(Key("key1"));
-            await wal.FlushAsync();
+            await wal.CommitAsync([
+                (Key("key1"), Val("val1")),
+                (Key("key1"), (byte[]?)null),
+            ]);
         }
 
         var entries = new List<(WalEntryType Type, string Key)>();
@@ -133,44 +135,37 @@ public class WalTests : TempDirTest
 public class MemTableTests
 {
     [Fact]
-    public void Snapshot_Returns_Immutable_View()
+    public void Apply_Inserts_And_Reads_Back()
     {
         var mt = new MemTable();
-        var snap1 = mt.Snapshot();
+        mt.Apply([(Key("a"), new MemEntry(Val("1"), 1))], 2);
 
-        var newData = snap1.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        Assert.True(mt.TryApply(snap1, newData, 2)); // key(1) + value(1)
-
-        Assert.Empty(snap1);
-
-        var snap2 = mt.Snapshot();
-        Assert.Single(snap2);
+        Assert.Equal(1, mt.Count);
+        Assert.True(mt.Current.TryGetValue(Key("a"), out var entry));
+        Assert.Equal("1", Encoding.UTF8.GetString(entry.Value!));
     }
 
     [Fact]
-    public void TryApply_Fails_On_Stale_Snapshot()
+    public void Apply_Updates_Existing_Key()
     {
         var mt = new MemTable();
-        var snap = mt.Snapshot();
+        mt.Apply([(Key("a"), new MemEntry(Val("1"), 1))], 2);
+        mt.Apply([(Key("a"), new MemEntry(Val("2"), 2))], 0);
 
-        var newData1 = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        Assert.True(mt.TryApply(snap, newData1, 2));
-
-        var newData2 = snap.SetItem(Key("b"), new MemEntry(Val("2"), 2));
-        Assert.False(mt.TryApply(snap, newData2, 2));
+        Assert.Equal(1, mt.Count);
+        Assert.True(mt.Current.TryGetValue(Key("a"), out var entry));
+        Assert.Equal("2", Encoding.UTF8.GetString(entry.Value!));
     }
 
     [Fact]
     public void SwapOut_Returns_Data_And_Resets()
     {
         var mt = new MemTable();
-        var snap = mt.Snapshot();
-        var newData = snap.SetItem(Key("a"), new MemEntry(Val("1"), 1));
-        mt.TryApply(snap, newData, 2);
+        mt.Apply([(Key("a"), new MemEntry(Val("1"), 1))], 2);
 
         var old = mt.SwapOut();
-        Assert.Single(old);
-        Assert.Empty(mt.Snapshot());
+        Assert.Equal(1, old.Count);
+        Assert.Equal(0, mt.Count);
     }
 
     [Fact]
@@ -179,15 +174,86 @@ public class MemTableTests
         var mt = new MemTable();
         Assert.Equal(0, mt.ApproximateSize);
 
-        var snap = mt.Snapshot();
-        var newData = snap.SetItem(Key("abc"), new MemEntry(Val("12345"), 1));
-        mt.TryApply(snap, newData, 8); // key(3) + value(5)
+        mt.Apply([(Key("abc"), new MemEntry(Val("12345"), 1))], 8); // key(3) + value(5)
 
         Assert.Equal(8, mt.ApproximateSize);
     }
 
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
     private static byte[] Val(string s) => Encoding.UTF8.GetBytes(s);
+}
+
+public class SkipListTests
+{
+    [Fact]
+    public void Put_And_TryGetValue()
+    {
+        var sl = new ConcurrentSkipList();
+        sl.Put(Key("hello"), new MemEntry(Val("world"), 1));
+
+        Assert.True(sl.TryGetValue(Key("hello"), out var entry));
+        Assert.Equal("world", Str(entry.Value));
+        Assert.False(sl.TryGetValue(Key("missing"), out _));
+    }
+
+    [Fact]
+    public void Put_Returns_True_For_New_Key_False_For_Update()
+    {
+        var sl = new ConcurrentSkipList();
+        Assert.True(sl.Put(Key("k"), new MemEntry(Val("v1"), 1)));
+        Assert.False(sl.Put(Key("k"), new MemEntry(Val("v2"), 2)));
+
+        Assert.True(sl.TryGetValue(Key("k"), out var entry));
+        Assert.Equal("v2", Str(entry.Value));
+        Assert.Equal(1, sl.Count);
+    }
+
+    [Fact]
+    public void GetEntries_Returns_Sorted_Order()
+    {
+        var sl = new ConcurrentSkipList();
+        sl.Put(Key("cherry"), new MemEntry(Val("3"), 3));
+        sl.Put(Key("apple"), new MemEntry(Val("1"), 1));
+        sl.Put(Key("banana"), new MemEntry(Val("2"), 2));
+
+        var keys = sl.GetEntries().Select(e => Str(e.Key)).ToList();
+        Assert.Equal(["apple", "banana", "cherry"], keys);
+    }
+
+    [Fact]
+    public void Many_Keys_Inserted_And_Retrieved()
+    {
+        var sl = new ConcurrentSkipList();
+        for (int i = 0; i < 1000; i++)
+            sl.Put(Key($"key/{i:D6}"), new MemEntry(Val($"val{i}"), i));
+
+        Assert.Equal(1000, sl.Count);
+        for (int i = 0; i < 1000; i++)
+        {
+            Assert.True(sl.TryGetValue(Key($"key/{i:D6}"), out var entry));
+            Assert.Equal($"val{i}", Str(entry.Value));
+        }
+    }
+
+    [Fact]
+    public void Concurrent_Inserts_Are_Safe()
+    {
+        var sl = new ConcurrentSkipList();
+        int perThread = 500;
+        int threads = 4;
+
+        Parallel.For(0, threads, t =>
+        {
+            for (int i = 0; i < perThread; i++)
+                sl.Put(Key($"t{t}/k{i:D6}"), new MemEntry(Val($"v{i}"), t * perThread + i));
+        });
+
+        Assert.Equal(threads * perThread, sl.Count);
+    }
+
+    private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
+    private static byte[] Val(string s) => Encoding.UTF8.GetBytes(s);
+    private static string Str(byte[]? b) => b is null ? "<null>" : Encoding.UTF8.GetString(b);
 }
 
 public class SSTableTests : TempDirTest
@@ -683,7 +749,7 @@ public class LsmStoreTests : TempDirTest
     }
 
     [Fact]
-    public async Task ReadOnlyTx_Sees_Snapshot()
+    public async Task ReadOnlyTx_Sees_MemTable_Writes()
     {
         await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
 
@@ -695,6 +761,7 @@ public class LsmStoreTests : TempDirTest
 
         using var ro = store.BeginReadOnly();
 
+        // Skip list is shared — writes after RO tx start are visible (read-committed)
         await using (var tx = store.BeginReadWrite())
         {
             tx.Put(Key("k2"), Val("v2"));
@@ -705,11 +772,11 @@ public class LsmStoreTests : TempDirTest
         Assert.Equal("v1", Str(v1));
 
         var v2 = await ro.GetAsync(Key("k2"));
-        Assert.Null(v2);
+        Assert.Equal("v2", Str(v2));
     }
 
     [Fact]
-    public async Task ConflictingTransactions_OneFailsCAS()
+    public async Task ConcurrentTransactions_LastWriterWins()
     {
         await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
 
@@ -720,7 +787,11 @@ public class LsmStoreTests : TempDirTest
         tx2.Put(Key("k"), Val("from_tx2"));
 
         Assert.True(await tx1.CommitAsync());
-        Assert.False(await tx2.CommitAsync());
+        Assert.True(await tx2.CommitAsync()); // skip list: both succeed, last writer wins
+
+        using var ro = store.BeginReadOnly();
+        var val = await ro.GetAsync(Key("k"));
+        Assert.Equal("from_tx2", Str(val));
     }
 
     [Fact]

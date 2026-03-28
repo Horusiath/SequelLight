@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.IO.Pipelines;
+using System.Threading.Channels;
 
 namespace SequelLight.Storage;
 
@@ -23,8 +24,10 @@ public enum WalEntryType : byte
 ///   [M bytes: value]        (only for Put)
 ///   [4 bytes: CRC32 checksum of all preceding bytes in this entry]
 ///
-/// Append methods write into the PipeWriter buffer without flushing.
-/// The caller must call <see cref="FlushAsync"/> to persist a batch.
+/// Group commit: multiple concurrent callers submit batches to CommitAsync.
+/// A single background flusher collects all pending batches, writes them to the PipeWriter,
+/// performs one fsync, then completes all waiting callers. This amortizes one fsync across
+/// N concurrent commits.
 /// </summary>
 public sealed class WriteAheadLog : IAsyncDisposable
 {
@@ -33,11 +36,18 @@ public sealed class WriteAheadLog : IAsyncDisposable
     private readonly string _filePath;
     private bool _disposed;
 
+    // Group commit infrastructure
+    private readonly Channel<WalCommitBatch> _commitQueue;
+    private readonly Task _flusherTask;
+
     private WriteAheadLog(string filePath, FileStream stream)
     {
         _filePath = filePath;
         _stream = stream;
         _writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
+        _commitQueue = Channel.CreateUnbounded<WalCommitBatch>(
+            new UnboundedChannelOptions { SingleReader = true });
+        _flusherTask = Task.Run(FlusherLoopAsync);
     }
 
     public string FilePath => _filePath;
@@ -58,9 +68,57 @@ public sealed class WriteAheadLog : IAsyncDisposable
     }
 
     /// <summary>
-    /// Writes a Put entry into the internal buffer. Does not flush.
+    /// Submits a batch of writes to the WAL and waits for the group flush to complete.
+    /// Multiple concurrent callers' writes are batched into a single fsync.
     /// </summary>
-    public void AppendPut(byte[] key, byte[] value)
+    public Task CommitAsync(List<(byte[] Key, byte[]? Value)> writes)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _commitQueue.Writer.TryWrite(new WalCommitBatch(writes, tcs));
+        return tcs.Task;
+    }
+
+    private async Task FlusherLoopAsync()
+    {
+        var reader = _commitQueue.Reader;
+        var pending = new List<TaskCompletionSource>();
+
+        while (await reader.WaitToReadAsync().ConfigureAwait(false))
+        {
+            pending.Clear();
+
+            // Collect all pending batches
+            while (reader.TryRead(out var batch))
+            {
+                foreach (var (key, value) in batch.Writes)
+                {
+                    if (value is not null) AppendPut(key, value);
+                    else AppendDelete(key);
+                }
+                pending.Add(batch.Completion);
+            }
+
+            if (pending.Count > 0)
+            {
+                try
+                {
+                    // Single flush for all batches
+                    await _writer.FlushAsync().ConfigureAwait(false);
+                    await _stream.FlushAsync().ConfigureAwait(false);
+
+                    foreach (var tcs in pending)
+                        tcs.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    foreach (var tcs in pending)
+                        tcs.TrySetException(ex);
+                }
+            }
+        }
+    }
+
+    private void AppendPut(byte[] key, byte[] value)
     {
         int bodyLen = 1 + 4 + key.Length + 4 + value.Length;
         int totalLen = 4 + bodyLen + 4;
@@ -90,10 +148,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
         _writer.Advance(totalLen);
     }
 
-    /// <summary>
-    /// Writes a Delete entry into the internal buffer. Does not flush.
-    /// </summary>
-    public void AppendDelete(byte[] key)
+    private void AppendDelete(byte[] key)
     {
         int bodyLen = 1 + 4 + key.Length;
         int totalLen = 4 + bodyLen + 4;
@@ -116,15 +171,6 @@ public sealed class WriteAheadLog : IAsyncDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
 
         _writer.Advance(totalLen);
-    }
-
-    /// <summary>
-    /// Flushes all buffered entries to the underlying stream and syncs to disk.
-    /// </summary>
-    public async ValueTask FlushAsync()
-    {
-        await _writer.FlushAsync().ConfigureAwait(false);
-        await _stream.FlushAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -217,7 +263,16 @@ public sealed class WriteAheadLog : IAsyncDisposable
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Signal the flusher to stop and wait for it to drain
+        _commitQueue.Writer.TryComplete();
+        await _flusherTask.ConfigureAwait(false);
+
         await _writer.CompleteAsync().ConfigureAwait(false);
         await _stream.DisposeAsync().ConfigureAwait(false);
     }
+
+    private readonly record struct WalCommitBatch(
+        List<(byte[] Key, byte[]? Value)> Writes,
+        TaskCompletionSource Completion);
 }

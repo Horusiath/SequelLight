@@ -12,6 +12,7 @@ public sealed class SSTableInfo
     public required long FileSize { get; init; }
     public required byte[] MinKey { get; init; }
     public required byte[] MaxKey { get; init; }
+    public SSTableReader? Reader { get; init; }
 }
 
 /// <summary>

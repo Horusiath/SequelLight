@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
+using System.Threading.Channels;
 
 namespace SequelLight.Storage;
 
@@ -26,8 +27,14 @@ public sealed class LsmStore : IAsyncDisposable
 
     private volatile ImmutableList<SSTableInfo> _sstables = ImmutableList<SSTableInfo>.Empty;
     private readonly ConcurrentDictionary<string, SSTableReader> _readerCache = new();
+    private readonly ConcurrentBag<SSTableReader> _retiredReaders = new();
     private int _nextFileId;
     private int _compacting;
+
+    // Background compaction
+    private readonly Channel<byte> _compactionChannel = Channel.CreateBounded<byte>(
+        new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
+    private Task? _compactionTask;
 
     private LsmStore(LsmStoreOptions options)
     {
@@ -42,6 +49,7 @@ public sealed class LsmStore : IAsyncDisposable
 
         var store = new LsmStore(options);
         await store.RecoverAsync().ConfigureAwait(false);
+        store._compactionTask = Task.Run(store.CompactionLoopAsync);
         return store;
     }
 
@@ -69,6 +77,7 @@ public sealed class LsmStore : IAsyncDisposable
                 FileSize = new FileInfo(file).Length,
                 MinKey = reader.MinKey,
                 MaxKey = reader.MaxKey,
+                Reader = reader,
             });
         }
         _sstables = sstList.ToImmutable();
@@ -78,15 +87,15 @@ public sealed class LsmStore : IAsyncDisposable
         var walPath = Path.Combine(_options.Directory, "wal.log");
         if (File.Exists(walPath))
         {
-            var snapshot = _memTable.Snapshot();
-            var recovered = snapshot;
             long maxSeq = 0;
+            var mutations = new List<(byte[] Key, MemEntry Entry)>();
             int sizeDelta = 0;
 
             await WriteAheadLog.ReplayAsync(walPath, (type, key, value) =>
             {
                 maxSeq++;
-                if (recovered.TryGetValue(key, out var existing))
+                // Check if key exists in skip list to compute size delta
+                if (_memTable.Current.TryGetValue(key, out var existing))
                     sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
 
                 var entry = type == WalEntryType.Put
@@ -94,13 +103,13 @@ public sealed class LsmStore : IAsyncDisposable
                     : new MemEntry(null, maxSeq);
 
                 sizeDelta += key.Length + (value?.Length ?? 0);
-                recovered = recovered.SetItem(key, entry);
+                mutations.Add((key, entry));
                 return ValueTask.CompletedTask;
             }).ConfigureAwait(false);
 
             if (maxSeq > 0)
             {
-                _memTable.TryApply(snapshot, recovered, sizeDelta);
+                _memTable.Apply(mutations, sizeDelta);
                 _sequenceNumber = maxSeq;
             }
         }
@@ -128,41 +137,32 @@ public sealed class LsmStore : IAsyncDisposable
 
     public ReadOnlyTransaction BeginReadOnly()
     {
-        return new ReadOnlyTransaction(this, _memTable.Snapshot(), _sstables);
+        return new ReadOnlyTransaction(this, _memTable.Current, _sstables);
     }
 
     public ReadWriteTransaction BeginReadWrite()
     {
-        var snapshot = _memTable.Snapshot();
+        var skipList = _memTable.Current;
         var seq = Interlocked.Read(ref _sequenceNumber);
-        return new ReadWriteTransaction(this, snapshot, _sstables, seq);
+        return new ReadWriteTransaction(this, skipList, _sstables, seq);
     }
 
-    internal async ValueTask<bool> CommitAsync(
-        ImmutableSortedDictionary<byte[], MemEntry> expectedSnapshot,
-        ImmutableSortedDictionary<byte[], MemEntry> newSnapshot,
+    internal async ValueTask CommitAsync(
+        List<(byte[] Key, MemEntry Entry)> mutations,
         List<(byte[] Key, byte[]? Value)> walWrites,
         int sizeDelta)
     {
-        if (walWrites.Count == 0) return true;
+        if (walWrites.Count == 0) return;
 
-        // Batch all WAL writes, then flush once
-        foreach (var (key, value) in walWrites)
-        {
-            if (value is not null)
-                _wal!.AppendPut(key, value);
-            else
-                _wal!.AppendDelete(key);
-        }
-        await _wal!.FlushAsync().ConfigureAwait(false);
+        // Group commit: submits to the WAL's background flusher.
+        // Multiple concurrent CommitAsync calls are batched into a single fsync.
+        await _wal!.CommitAsync(walWrites).ConfigureAwait(false);
 
-        if (!_memTable.TryApply(expectedSnapshot, newSnapshot, sizeDelta))
-            return false;
+        // Apply mutations to the skip list
+        _memTable.Apply(mutations, sizeDelta);
 
         if (_memTable.ApproximateSize >= _options.MemTableFlushThreshold)
             await FlushMemTableAsync().ConfigureAwait(false);
-
-        return true;
     }
 
     internal async ValueTask<(byte[]? Value, bool Found)> GetFromSSTAsync(
@@ -176,8 +176,8 @@ public sealed class LsmStore : IAsyncDisposable
                 KeyComparer.Instance.Compare(key, info.MaxKey) > 0)
                 continue;
 
-            if (!_readerCache.TryGetValue(info.FilePath, out var reader))
-                continue; // compacted away
+            var reader = info.Reader;
+            if (reader is null) continue;
 
             var (value, found) = await reader.GetAsync(key).ConfigureAwait(false);
             if (found) return (value, true);
@@ -196,7 +196,7 @@ public sealed class LsmStore : IAsyncDisposable
 
         await using (var writer = SSTableWriter.Create(sstPath, _options.SSTableBlockSize))
         {
-            foreach (var kvp in frozen)
+            foreach (var kvp in frozen.GetEntries())
                 await writer.WriteEntryAsync(kvp.Key, kvp.Value.Value).ConfigureAwait(false);
             await writer.FinishAsync().ConfigureAwait(false);
         }
@@ -212,6 +212,7 @@ public sealed class LsmStore : IAsyncDisposable
             FileSize = new FileInfo(sstPath).Length,
             MinKey = reader.MinKey,
             MaxKey = reader.MaxKey,
+            Reader = reader,
         };
 
         // Atomically add to SSTable list
@@ -226,26 +227,34 @@ public sealed class LsmStore : IAsyncDisposable
         await _wal!.DisposeAsync().ConfigureAwait(false);
         _wal = WriteAheadLog.Create(Path.Combine(_options.Directory, "wal.log"));
 
-        await TryCompactAsync().ConfigureAwait(false);
+        // Signal background compaction (non-blocking, drops if already signaled)
+        _compactionChannel.Writer.TryWrite(1);
     }
 
-    private async ValueTask TryCompactAsync()
+    private async Task CompactionLoopAsync()
     {
-        if (Interlocked.CompareExchange(ref _compacting, 1, 0) != 0)
-            return;
+        var reader = _compactionChannel.Reader;
+        while (await reader.WaitToReadAsync().ConfigureAwait(false))
+        {
+            // Drain all pending signals
+            while (reader.TryRead(out _)) { }
 
-        try
-        {
-            while (true)
+            if (Interlocked.CompareExchange(ref _compacting, 1, 0) != 0)
+                continue;
+
+            try
             {
-                var plan = _options.CompactionStrategy.Plan(_sstables);
-                if (plan is null) break;
-                await ExecuteCompactionAsync(plan).ConfigureAwait(false);
+                while (true)
+                {
+                    var plan = _options.CompactionStrategy.Plan(_sstables);
+                    if (plan is null) break;
+                    await ExecuteCompactionAsync(plan).ConfigureAwait(false);
+                }
             }
-        }
-        finally
-        {
-            Volatile.Write(ref _compacting, 0);
+            finally
+            {
+                Volatile.Write(ref _compacting, 0);
+            }
         }
     }
 
@@ -264,8 +273,9 @@ public sealed class LsmStore : IAsyncDisposable
         {
             for (int i = 0; i < sortedInputs.Count; i++)
             {
-                if (_readerCache.TryGetValue(sortedInputs[i].FilePath, out var reader))
-                    enumerators[i] = reader.ScanAsync().GetAsyncEnumerator();
+                var inputReader = sortedInputs[i].Reader;
+                if (inputReader is not null)
+                    enumerators[i] = inputReader.ScanAsync().GetAsyncEnumerator();
                 else
                     enumerators[i] = EmptyEnumerator();
             }
@@ -330,6 +340,7 @@ public sealed class LsmStore : IAsyncDisposable
             FileSize = new FileInfo(outputPath).Length,
             MinKey = newReader.MinKey,
             MaxKey = newReader.MaxKey,
+            Reader = newReader,
         };
 
         // Atomically swap in SSTable list
@@ -344,12 +355,15 @@ public sealed class LsmStore : IAsyncDisposable
             updated = builder.ToImmutable();
         } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
 
-        // Close old readers, invalidate cached blocks, and delete old files
+        // Retire old readers and delete old files.
+        // Readers are not disposed here because in-flight transactions may still reference them.
+        // They are disposed when the store is disposed.
         foreach (var input in plan.InputTables)
         {
             _blockCache?.Invalidate(input.FilePath);
-            if (_readerCache.TryRemove(input.FilePath, out var oldReader))
-                await oldReader.DisposeAsync().ConfigureAwait(false);
+            _readerCache.TryRemove(input.FilePath, out _);
+            if (input.Reader is not null)
+                _retiredReaders.Add(input.Reader);
             try { File.Delete(input.FilePath); } catch { }
         }
     }
@@ -362,12 +376,21 @@ public sealed class LsmStore : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Stop background compaction
+        _compactionChannel.Writer.TryComplete();
+        if (_compactionTask is not null)
+            await _compactionTask.ConfigureAwait(false);
+
         if (_wal is not null)
             await _wal.DisposeAsync().ConfigureAwait(false);
 
         foreach (var reader in _readerCache.Values)
             await reader.DisposeAsync().ConfigureAwait(false);
         _readerCache.Clear();
+
+        // Dispose readers retired during compaction
+        while (_retiredReaders.TryTake(out var retired))
+            await retired.DisposeAsync().ConfigureAwait(false);
 
         _blockCache?.Dispose();
     }
@@ -385,18 +408,19 @@ public sealed class LsmStore : IAsyncDisposable
 }
 
 /// <summary>
-/// Read-only transaction. Holds a snapshot of the memtable and SSTable list.
+/// Read-only transaction. Holds a reference to the skip list and SSTable list at
+/// the time the transaction began.
 /// </summary>
 public sealed class ReadOnlyTransaction : IDisposable
 {
     private readonly LsmStore _store;
-    private readonly ImmutableSortedDictionary<byte[], MemEntry> _snapshot;
+    private readonly ConcurrentSkipList _snapshot;
     private readonly ImmutableList<SSTableInfo> _sstables;
     private bool _disposed;
 
     internal ReadOnlyTransaction(
         LsmStore store,
-        ImmutableSortedDictionary<byte[], MemEntry> snapshot,
+        ConcurrentSkipList snapshot,
         ImmutableList<SSTableInfo> sstables)
     {
         _store = store;
@@ -422,16 +446,18 @@ public sealed class ReadOnlyTransaction : IDisposable
 }
 
 /// <summary>
-/// Read-write transaction. Mutations are applied to a local copy of the memtable snapshot.
-/// On commit, the entire modified snapshot is CAS-swapped into the memtable.
+/// Read-write transaction. Mutations are buffered locally and applied to the skip list
+/// atomically on commit. Sequence numbers provide ordering.
 /// </summary>
 public sealed class ReadWriteTransaction : IAsyncDisposable
 {
     private readonly LsmStore _store;
-    private readonly ImmutableSortedDictionary<byte[], MemEntry> _baseSnapshot;
+    private readonly ConcurrentSkipList _readSnapshot;
     private readonly ImmutableList<SSTableInfo> _sstables;
-    private ImmutableSortedDictionary<byte[], MemEntry> _current;
+    private readonly List<(byte[] Key, MemEntry Entry)> _mutations = new();
     private readonly List<(byte[] Key, byte[]? Value)> _walWrites = new();
+    // Local buffer for read-your-own-writes
+    private readonly SortedDictionary<byte[], MemEntry> _localWrites = new(KeyComparer.Instance);
     private long _nextSeq;
     private int _sizeDelta;
     private bool _committed;
@@ -439,13 +465,12 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
 
     internal ReadWriteTransaction(
         LsmStore store,
-        ImmutableSortedDictionary<byte[], MemEntry> snapshot,
+        ConcurrentSkipList readSnapshot,
         ImmutableList<SSTableInfo> sstables,
         long baseSequence)
     {
         _store = store;
-        _baseSnapshot = snapshot;
-        _current = snapshot;
+        _readSnapshot = readSnapshot;
         _sstables = sstables;
         _nextSeq = baseSequence + 1;
     }
@@ -455,11 +480,16 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        if (_current.TryGetValue(key, out var existing))
+        // Track size delta against both local writes and the shared skip list
+        if (_localWrites.TryGetValue(key, out var localExisting))
+            _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
+        else if (_readSnapshot.TryGetValue(key, out var existing))
             _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
         _sizeDelta += key.Length + value.Length;
 
-        _current = _current.SetItem(key, new MemEntry(value, _nextSeq++));
+        var entry = new MemEntry(value, _nextSeq++);
+        _localWrites[key] = entry;
+        _mutations.Add((key, entry));
         _walWrites.Add((key, value));
     }
 
@@ -468,11 +498,15 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        if (_current.TryGetValue(key, out var existing))
+        if (_localWrites.TryGetValue(key, out var localExisting))
+            _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
+        else if (_readSnapshot.TryGetValue(key, out var existing))
             _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
         _sizeDelta += key.Length;
 
-        _current = _current.SetItem(key, new MemEntry(null, _nextSeq++));
+        var entry = new MemEntry(null, _nextSeq++);
+        _localWrites[key] = entry;
+        _mutations.Add((key, entry));
         _walWrites.Add((key, null));
     }
 
@@ -480,7 +514,12 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (_current.TryGetValue(key, out var entry))
+        // Check local writes first (read-your-own-writes)
+        if (_localWrites.TryGetValue(key, out var local))
+            return local.IsTombstone ? null : local.Value;
+
+        // Then check the skip list snapshot
+        if (_readSnapshot.TryGetValue(key, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
         var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
@@ -495,7 +534,8 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
         _committed = true;
         if (_walWrites.Count == 0) return true;
 
-        return await _store.CommitAsync(_baseSnapshot, _current, _walWrites, _sizeDelta).ConfigureAwait(false);
+        await _store.CommitAsync(_mutations, _walWrites, _sizeDelta).ConfigureAwait(false);
+        return true;
     }
 
     public ValueTask DisposeAsync()
