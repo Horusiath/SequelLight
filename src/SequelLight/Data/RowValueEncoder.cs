@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using SequelLight.Schema;
 
 namespace SequelLight.Data;
@@ -12,6 +13,12 @@ namespace SequelLight.Data;
 public static class RowValueEncoder
 {
     private const int StackAllocLimit = 256;
+
+    /// <summary>
+    /// Max varint size (10) + type tag (1) + max value overhead per column.
+    /// Used for pessimistic single-pass sizing.
+    /// </summary>
+    private const int MaxPerColumnOverhead = 10 + 1 + 10; // varint seqNo + tag + varint length prefix
 
     public static int ComputeValueSize(ReadOnlySpan<DbValue> values, ReadOnlySpan<int> seqNos)
     {
@@ -45,14 +52,26 @@ public static class RowValueEncoder
 
     public static byte[] Encode(ReadOnlySpan<DbValue> values, ReadOnlySpan<int> seqNos)
     {
-        int size = ComputeValueSize(values, seqNos);
-        if (size == 0)
+        // Compute pessimistic upper bound to avoid double iteration.
+        // Each non-null column: varint seqNo (≤10) + type tag (1) + value.
+        // For Integer: zigzag varint (≤10). For Real: 8. For Text/Blob: varint len (≤10) + data len.
+        int upperBound = 0;
+        bool allNull = true;
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (values[i].IsNull)
+                continue;
+            allNull = false;
+            upperBound += MaxPerColumnOverhead + DataLength(values[i]);
+        }
+
+        if (allNull)
             return Array.Empty<byte>();
 
         byte[]? rented = null;
-        Span<byte> buf = size <= StackAllocLimit
-            ? stackalloc byte[size]
-            : (rented = ArrayPool<byte>.Shared.Rent(size));
+        Span<byte> buf = upperBound <= StackAllocLimit
+            ? stackalloc byte[upperBound]
+            : (rented = ArrayPool<byte>.Shared.Rent(upperBound));
 
         try
         {
@@ -78,7 +97,7 @@ public static class RowValueEncoder
             int seqNo = (int)rawSeqNo;
             var typeTag = (DbType)src[offset++];
 
-            // Find column index for this seqNo
+            // Linear scan — faster than building a lookup table for typical column counts (≤32).
             int colIdx = -1;
             for (int i = 0; i < columns.Count; i++)
             {
@@ -91,7 +110,6 @@ public static class RowValueEncoder
 
             if (colIdx < 0)
             {
-                // Unknown seqNo — skip the value for forward compat
                 offset += SkipValue(src[offset..], typeTag);
             }
             else
@@ -102,6 +120,21 @@ public static class RowValueEncoder
         }
     }
 
+    /// <summary>
+    /// Returns the raw data length for Text/Blob, or 0 for fixed-width types.
+    /// Used only for pessimistic upper-bound sizing.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int DataLength(DbValue value) => value.Type switch
+    {
+        DbType.Integer => 0, // varint up to 10B, already in MaxPerColumnOverhead
+        DbType.Real => 8,
+        DbType.Text => value.AsText().Length,
+        DbType.Blob => value.AsBlob().Length,
+        _ => 0,
+    };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int EncodedValueSize(DbValue value)
     {
         return value.Type switch
@@ -114,6 +147,7 @@ public static class RowValueEncoder
         };
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int EncodeValue(Span<byte> dest, DbValue value)
     {
         switch (value.Type)
@@ -142,6 +176,7 @@ public static class RowValueEncoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int DecodeValue(ReadOnlySpan<byte> src, DbType type, out DbValue value)
     {
         switch (type)
@@ -175,6 +210,7 @@ public static class RowValueEncoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int SkipValue(ReadOnlySpan<byte> src, DbType type)
     {
         switch (type)
