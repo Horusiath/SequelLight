@@ -7,12 +7,16 @@ namespace SequelLight.Storage;
 /// <summary>
 /// Bidirectional cursor over sorted key-value entries.
 /// Supports seeking, forward and backward iteration.
+///
+/// CurrentKey and CurrentValue return views that are only valid until the
+/// next Seek/MoveNext/MovePrev call. Callers must copy the data if they
+/// need it beyond that point.
 /// </summary>
 public abstract class Cursor : IAsyncDisposable
 {
     public abstract bool IsValid { get; }
-    public abstract byte[] CurrentKey { get; }
-    public abstract byte[]? CurrentValue { get; }
+    public abstract ReadOnlyMemory<byte> CurrentKey { get; }
+    public abstract ReadOnlyMemory<byte> CurrentValue { get; }
     public abstract bool IsTombstone { get; }
 
     /// <summary>
@@ -46,9 +50,9 @@ internal sealed class SkipListCursor : Cursor
     public SkipListCursor(ConcurrentSkipList list) => _list = list;
 
     public override bool IsValid => _current is not null;
-    public override byte[] CurrentKey => _current!.Key;
+    public override ReadOnlyMemory<byte> CurrentKey => _current!.Key;
 
-    public override byte[]? CurrentValue
+    public override ReadOnlyMemory<byte> CurrentValue
     {
         get { Thread.MemoryBarrier(); return _current!.Entry.Value; }
     }
@@ -87,6 +91,11 @@ internal sealed class SkipListCursor : Cursor
     public override ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
+/// <summary>
+/// Cursor over a single SSTable. Keeps the raw block in a pooled buffer and
+/// decodes keys into a contiguous pooled buffer — no per-entry allocation.
+/// Values are returned as slices of the raw block.
+/// </summary>
 internal sealed class SSTableCursor : Cursor
 {
     private readonly SafeFileHandle _handle;
@@ -95,8 +104,27 @@ internal sealed class SSTableCursor : Cursor
     private readonly string _filePath;
 
     private int _blockIdx = -1;
-    private readonly List<(byte[] Key, byte[]? Value)> _entries = new();
     private int _entryIdx = -1;
+
+    // Raw block data — kept alive until next block load or dispose
+    private byte[]? _rawBuf;
+    private int _rawLen;
+
+    // Decoded keys: all keys from current block concatenated into one buffer
+    private byte[] _keysBuf = ArrayPool<byte>.Shared.Rent(512);
+    private int _keysBufLen;
+
+    // Per-entry metadata (offsets into _keysBuf and _rawBuf)
+    private EntryMeta[] _meta = new EntryMeta[32];
+    private int _entryCount;
+
+    private struct EntryMeta
+    {
+        public int KeyStart;    // in _keysBuf
+        public int KeyLength;
+        public int ValueOffset; // in _rawBuf, -1 for tombstone
+        public int ValueLength; // -1 for tombstone
+    }
 
     internal SSTableCursor(SafeFileHandle handle, SSTableReader.IndexEntry[] index,
         BlockCache? blockCache, string filePath)
@@ -107,10 +135,27 @@ internal sealed class SSTableCursor : Cursor
         _filePath = filePath;
     }
 
-    public override bool IsValid => _entryIdx >= 0 && _entryIdx < _entries.Count;
-    public override byte[] CurrentKey => _entries[_entryIdx].Key;
-    public override byte[]? CurrentValue => _entries[_entryIdx].Value;
-    public override bool IsTombstone => _entries[_entryIdx].Value is null;
+    public override bool IsValid => _entryIdx >= 0 && _entryIdx < _entryCount;
+
+    public override ReadOnlyMemory<byte> CurrentKey
+    {
+        get
+        {
+            ref var m = ref _meta[_entryIdx];
+            return _keysBuf.AsMemory(m.KeyStart, m.KeyLength);
+        }
+    }
+
+    public override ReadOnlyMemory<byte> CurrentValue
+    {
+        get
+        {
+            ref var m = ref _meta[_entryIdx];
+            return m.ValueLength <= 0 ? default : _rawBuf.AsMemory(m.ValueOffset, m.ValueLength);
+        }
+    }
+
+    public override bool IsTombstone => _meta[_entryIdx].ValueLength == -1;
 
     public override async ValueTask<bool> SeekAsync(byte[] target)
     {
@@ -121,9 +166,10 @@ internal sealed class SSTableCursor : Cursor
 
         await LoadBlockAsync(blockIdx).ConfigureAwait(false);
 
-        for (int i = 0; i < _entries.Count; i++)
+        for (int i = 0; i < _entryCount; i++)
         {
-            if (_entries[i].Key.AsSpan().SequenceCompareTo(target) >= 0)
+            ref var m = ref _meta[i];
+            if (_keysBuf.AsSpan(m.KeyStart, m.KeyLength).SequenceCompareTo(target) >= 0)
             {
                 _entryIdx = i;
                 return true;
@@ -134,7 +180,7 @@ internal sealed class SSTableCursor : Cursor
         if (blockIdx + 1 < _index.Length)
         {
             await LoadBlockAsync(blockIdx + 1).ConfigureAwait(false);
-            if (_entries.Count > 0) { _entryIdx = 0; return true; }
+            if (_entryCount > 0) { _entryIdx = 0; return true; }
         }
 
         _entryIdx = -1;
@@ -145,8 +191,8 @@ internal sealed class SSTableCursor : Cursor
     {
         if (_index.Length == 0) { _entryIdx = -1; return false; }
         await LoadBlockAsync(_index.Length - 1).ConfigureAwait(false);
-        if (_entries.Count == 0) { _entryIdx = -1; return false; }
-        _entryIdx = _entries.Count - 1;
+        if (_entryCount == 0) { _entryIdx = -1; return false; }
+        _entryIdx = _entryCount - 1;
         return true;
     }
 
@@ -154,12 +200,12 @@ internal sealed class SSTableCursor : Cursor
     {
         if (!IsValid) return false;
         _entryIdx++;
-        if (_entryIdx < _entries.Count) return true;
+        if (_entryIdx < _entryCount) return true;
 
         if (_blockIdx + 1 < _index.Length)
         {
             await LoadBlockAsync(_blockIdx + 1).ConfigureAwait(false);
-            if (_entries.Count > 0) { _entryIdx = 0; return true; }
+            if (_entryCount > 0) { _entryIdx = 0; return true; }
         }
 
         _entryIdx = -1;
@@ -175,7 +221,7 @@ internal sealed class SSTableCursor : Cursor
         if (_blockIdx > 0)
         {
             await LoadBlockAsync(_blockIdx - 1).ConfigureAwait(false);
-            if (_entries.Count > 0) { _entryIdx = _entries.Count - 1; return true; }
+            if (_entryCount > 0) { _entryIdx = _entryCount - 1; return true; }
         }
 
         return false;
@@ -198,35 +244,37 @@ internal sealed class SSTableCursor : Cursor
     {
         if (_blockIdx == blockIdx) return;
         _blockIdx = blockIdx;
-        _entries.Clear();
 
         var idx = _index[blockIdx];
+        EnsureRawBuf(idx.Length);
 
         if (_blockCache is not null && _blockCache.TryGet(_filePath, idx.Offset, out var lease))
         {
-            using (lease) DecodeBlock(lease.Span);
-            return;
+            using (lease)
+            {
+                lease.Span.CopyTo(_rawBuf);
+                _rawLen = lease.Span.Length;
+            }
+        }
+        else
+        {
+            await RandomAccess.ReadAsync(_handle, _rawBuf.AsMemory(0, idx.Length), idx.Offset)
+                .ConfigureAwait(false);
+            _rawLen = idx.Length;
+            _blockCache?.Insert(_filePath, idx.Offset, _rawBuf.AsSpan(0, _rawLen));
         }
 
-        var buf = ArrayPool<byte>.Shared.Rent(idx.Length);
-        try
-        {
-            await RandomAccess.ReadAsync(_handle, buf.AsMemory(0, idx.Length), idx.Offset)
-                .ConfigureAwait(false);
-            var span = buf.AsSpan(0, idx.Length);
-            _blockCache?.Insert(_filePath, idx.Offset, span);
-            DecodeBlock(span);
-        }
-        finally { ArrayPool<byte>.Shared.Return(buf); }
+        DecodeEntries();
     }
 
-    private void DecodeBlock(ReadOnlySpan<byte> block)
+    private void DecodeEntries()
     {
-        _entries.Clear();
+        _entryCount = 0;
+        _keysBufLen = 0;
         int offset = 0;
-        byte[] prevKey = Array.Empty<byte>();
+        var block = _rawBuf.AsSpan(0, _rawLen);
 
-        while (offset + 4 <= block.Length)
+        while (offset + 4 <= _rawLen)
         {
             ushort shared = BinaryPrimitives.ReadUInt16LittleEndian(block[offset..]);
             offset += 2;
@@ -234,26 +282,67 @@ internal sealed class SSTableCursor : Cursor
             offset += 2;
 
             int keyLen = shared + suffixLen;
-            if (offset + suffixLen + 4 > block.Length) break;
+            if (offset + suffixLen + 4 > _rawLen) break;
 
-            var key = new byte[keyLen];
-            if (shared > 0) prevKey.AsSpan(0, shared).CopyTo(key);
-            block.Slice(offset, suffixLen).CopyTo(key.AsSpan(shared));
+            // Decode key into contiguous keys buffer
+            EnsureKeysBuf(_keysBufLen + keyLen);
+            if (shared > 0 && _entryCount > 0)
+            {
+                ref var prev = ref _meta[_entryCount - 1];
+                _keysBuf.AsSpan(prev.KeyStart, shared).CopyTo(_keysBuf.AsSpan(_keysBufLen));
+            }
+            block.Slice(offset, suffixLen).CopyTo(_keysBuf.AsSpan(_keysBufLen + shared));
+            int keyStart = _keysBufLen;
+            _keysBufLen += keyLen;
             offset += suffixLen;
 
             int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[offset..]);
             offset += 4;
 
-            byte[]? value;
-            if (valueLen == -1) { value = null; }
-            else { value = block.Slice(offset, valueLen).ToArray(); offset += valueLen; }
+            int valueOffset = offset;
+            if (valueLen > 0) offset += valueLen;
 
-            _entries.Add((key, value));
-            prevKey = key;
+            EnsureMeta(_entryCount + 1);
+            _meta[_entryCount] = new EntryMeta
+            {
+                KeyStart = keyStart,
+                KeyLength = keyLen,
+                ValueOffset = valueLen == -1 ? -1 : valueOffset,
+                ValueLength = valueLen,
+            };
+            _entryCount++;
         }
     }
 
-    public override ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    private void EnsureRawBuf(int needed)
+    {
+        if (_rawBuf is not null && _rawBuf.Length >= needed) return;
+        if (_rawBuf is not null) ArrayPool<byte>.Shared.Return(_rawBuf);
+        _rawBuf = ArrayPool<byte>.Shared.Rent(needed);
+    }
+
+    private void EnsureKeysBuf(int needed)
+    {
+        if (needed <= _keysBuf.Length) return;
+        var old = _keysBuf;
+        _keysBuf = ArrayPool<byte>.Shared.Rent(Math.Max(needed, old.Length * 2));
+        old.AsSpan(0, _keysBufLen).CopyTo(_keysBuf);
+        ArrayPool<byte>.Shared.Return(old);
+    }
+
+    private void EnsureMeta(int needed)
+    {
+        if (needed <= _meta.Length) return;
+        Array.Resize(ref _meta, Math.Max(needed, _meta.Length * 2));
+    }
+
+    public override ValueTask DisposeAsync()
+    {
+        if (_rawBuf is not null) { ArrayPool<byte>.Shared.Return(_rawBuf); _rawBuf = null; }
+        ArrayPool<byte>.Shared.Return(_keysBuf);
+        _keysBuf = null!;
+        return ValueTask.CompletedTask;
+    }
 }
 
 /// <summary>
@@ -274,8 +363,8 @@ internal sealed class ArrayCursor : Cursor
     }
 
     public override bool IsValid => _pos >= 0 && _pos < _entries.Length;
-    public override byte[] CurrentKey => _entries[_pos].Key;
-    public override byte[]? CurrentValue => _entries[_pos].Value;
+    public override ReadOnlyMemory<byte> CurrentKey => _entries[_pos].Key;
+    public override ReadOnlyMemory<byte> CurrentValue => _entries[_pos].Value;
     public override bool IsTombstone => _entries[_pos].Value is null;
 
     public override ValueTask<bool> SeekAsync(byte[] target)
@@ -319,23 +408,29 @@ internal sealed class ArrayCursor : Cursor
 /// Merges N child cursors in sorted order. Children are ordered by priority
 /// (index 0 = highest). When multiple children share the same key, the
 /// highest-priority child's value wins.
+///
+/// Owns a key comparison buffer so that child cursors can freely reuse their
+/// internal buffers without corrupting in-flight comparisons.
 /// </summary>
 internal sealed class MergingCursor : Cursor
 {
     private readonly Cursor[] _children;
     private int _winnerIdx = -1;
-    private byte[]? _currentKey;
-    private byte[]? _currentValue;
     private bool _isTombstone;
     private Direction _dir = Direction.None;
+
+    // Owned key buffer — the current key is always copied here so it remains
+    // valid even after child cursors move and overwrite their internal buffers.
+    private byte[] _keyBuf = new byte[64];
+    private int _keyLen;
 
     private enum Direction : byte { None, Forward, Backward }
 
     public MergingCursor(Cursor[] children) => _children = children;
 
     public override bool IsValid => _winnerIdx >= 0;
-    public override byte[] CurrentKey => _currentKey!;
-    public override byte[]? CurrentValue => _currentValue;
+    public override ReadOnlyMemory<byte> CurrentKey => _keyBuf.AsMemory(0, _keyLen);
+    public override ReadOnlyMemory<byte> CurrentValue => _children[_winnerIdx].CurrentValue;
     public override bool IsTombstone => _isTombstone;
 
     public override async ValueTask<bool> SeekAsync(byte[] target)
@@ -360,23 +455,20 @@ internal sealed class MergingCursor : Cursor
 
         if (_dir == Direction.Backward)
         {
-            // Reposition children that fell behind current key
-            var key = _currentKey!;
             for (int i = 0; i < _children.Length; i++)
             {
                 var c = _children[i];
-                if (!c.IsValid || c.CurrentKey.AsSpan().SequenceCompareTo(key) < 0)
-                    await c.SeekAsync(key).ConfigureAwait(false);
+                if (!c.IsValid || CompareChildToKey(c) < 0)
+                    await c.SeekAsync(GetKeyCopy()).ConfigureAwait(false);
             }
             _dir = Direction.Forward;
         }
 
-        // Advance all children sitting at the current key
-        var curKey = _currentKey!;
+        // Advance all children sitting at the current key.
         for (int i = 0; i < _children.Length; i++)
         {
             var c = _children[i];
-            if (c.IsValid && c.CurrentKey.AsSpan().SequenceCompareTo(curKey) == 0)
+            if (c.IsValid && CompareChildToKey(c) == 0)
                 await c.MoveNextAsync().ConfigureAwait(false);
         }
 
@@ -389,67 +481,72 @@ internal sealed class MergingCursor : Cursor
 
         if (_dir == Direction.Forward)
         {
-            // Reposition children that ran ahead of current key
-            var key = _currentKey!;
             for (int i = 0; i < _children.Length; i++)
             {
                 var c = _children[i];
                 if (!c.IsValid)
                 {
-                    // Child exhausted forward — bring it back
                     if (await c.SeekToLastAsync().ConfigureAwait(false))
                     {
-                        if (c.CurrentKey.AsSpan().SequenceCompareTo(key) > 0)
+                        if (CompareChildToKey(c) > 0)
                         {
-                            await c.SeekAsync(key).ConfigureAwait(false);
-                            if (c.IsValid && c.CurrentKey.AsSpan().SequenceCompareTo(key) > 0)
+                            await c.SeekAsync(GetKeyCopy()).ConfigureAwait(false);
+                            if (c.IsValid && CompareChildToKey(c) > 0)
                                 await c.MovePrevAsync().ConfigureAwait(false);
                         }
                     }
                 }
-                else if (c.CurrentKey.AsSpan().SequenceCompareTo(key) > 0)
+                else if (CompareChildToKey(c) > 0)
                 {
-                    await c.SeekAsync(key).ConfigureAwait(false);
-                    if (c.IsValid && c.CurrentKey.AsSpan().SequenceCompareTo(key) > 0)
+                    await c.SeekAsync(GetKeyCopy()).ConfigureAwait(false);
+                    if (c.IsValid && CompareChildToKey(c) > 0)
                         await c.MovePrevAsync().ConfigureAwait(false);
                 }
             }
             _dir = Direction.Backward;
         }
 
-        // Move back all children sitting at the current key
-        var curKey = _currentKey!;
+        // Move back all children sitting at the current key.
         for (int i = 0; i < _children.Length; i++)
         {
             var c = _children[i];
-            if (c.IsValid && c.CurrentKey.AsSpan().SequenceCompareTo(curKey) == 0)
+            if (c.IsValid && CompareChildToKey(c) == 0)
                 await c.MovePrevAsync().ConfigureAwait(false);
         }
 
         return FindLargest();
     }
 
+    /// <summary>Compare child's current key to our saved key buffer. No Span across await.</summary>
+    private int CompareChildToKey(Cursor child)
+        => child.CurrentKey.Span.SequenceCompareTo(_keyBuf.AsSpan(0, _keyLen));
+
+    /// <summary>Returns a copy of the current key as byte[] for SeekAsync calls.</summary>
+    private byte[] GetKeyCopy() => _keyBuf[.._keyLen];
+
     /// <summary>Pick the child with the smallest current key (ties: lowest index wins).</summary>
     private bool FindSmallest()
     {
         _winnerIdx = -1;
-        _currentKey = null;
+        ReadOnlySpan<byte> best = default;
 
         for (int i = 0; i < _children.Length; i++)
         {
             var c = _children[i];
             if (!c.IsValid) continue;
 
-            if (_currentKey is null ||
-                c.CurrentKey.AsSpan().SequenceCompareTo(_currentKey) < 0)
+            var k = c.CurrentKey.Span;
+            if (_winnerIdx < 0 || k.SequenceCompareTo(best) < 0)
             {
                 _winnerIdx = i;
-                _currentKey = c.CurrentKey;
-                _currentValue = c.CurrentValue;
+                best = k;
                 _isTombstone = c.IsTombstone;
             }
             // equal key: first (highest-priority) child already recorded — skip
         }
+
+        if (_winnerIdx >= 0)
+            CopyKey(best);
 
         return _winnerIdx >= 0;
     }
@@ -458,24 +555,34 @@ internal sealed class MergingCursor : Cursor
     private bool FindLargest()
     {
         _winnerIdx = -1;
-        _currentKey = null;
+        ReadOnlySpan<byte> best = default;
 
         for (int i = 0; i < _children.Length; i++)
         {
             var c = _children[i];
             if (!c.IsValid) continue;
 
-            if (_currentKey is null ||
-                c.CurrentKey.AsSpan().SequenceCompareTo(_currentKey) > 0)
+            var k = c.CurrentKey.Span;
+            if (_winnerIdx < 0 || k.SequenceCompareTo(best) > 0)
             {
                 _winnerIdx = i;
-                _currentKey = c.CurrentKey;
-                _currentValue = c.CurrentValue;
+                best = k;
                 _isTombstone = c.IsTombstone;
             }
         }
 
+        if (_winnerIdx >= 0)
+            CopyKey(best);
+
         return _winnerIdx >= 0;
+    }
+
+    private void CopyKey(ReadOnlySpan<byte> key)
+    {
+        if (key.Length > _keyBuf.Length)
+            _keyBuf = new byte[Math.Max(key.Length, _keyBuf.Length * 2)];
+        key.CopyTo(_keyBuf);
+        _keyLen = key.Length;
     }
 
     public override async ValueTask DisposeAsync()

@@ -7,7 +7,7 @@ public class SkipListCursorTests
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
     private static byte[] Val(string s) => Encoding.UTF8.GetBytes(s);
-    private static string Str(byte[]? b) => b is null ? "<null>" : Encoding.UTF8.GetString(b);
+    private static string Str(ReadOnlyMemory<byte> b) => Encoding.UTF8.GetString(b.Span);
 
     private static ConcurrentSkipList BuildList(params (string Key, string? Value)[] entries)
     {
@@ -97,7 +97,7 @@ public class SkipListCursorTests
 
         Assert.True(await cursor.SeekAsync(Key("a")));
         Assert.True(cursor.IsTombstone);
-        Assert.Null(cursor.CurrentValue);
+        Assert.True(cursor.CurrentValue.IsEmpty);
 
         Assert.True(await cursor.MoveNextAsync());
         Assert.False(cursor.IsTombstone);
@@ -107,6 +107,7 @@ public class SkipListCursorTests
 
 public class SSTableCursorTests : TempDirTest
 {
+    private static string Str(ReadOnlyMemory<byte> b) => Encoding.UTF8.GetString(b.Span);
     [Fact]
     public async Task Seek_And_Forward()
     {
@@ -217,7 +218,7 @@ public class SSTableCursorTests : TempDirTest
 
         Assert.True(await cursor.SeekAsync(Key("b")));
         Assert.True(cursor.IsTombstone);
-        Assert.Null(cursor.CurrentValue);
+        Assert.True(cursor.CurrentValue.IsEmpty);
     }
 
     [Fact]
@@ -243,7 +244,7 @@ public class ArrayCursorTests
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
     private static byte[] Val(string s) => Encoding.UTF8.GetBytes(s);
-    private static string Str(byte[]? b) => b is null ? "<null>" : Encoding.UTF8.GetString(b);
+    private static string Str(ReadOnlyMemory<byte> b) => Encoding.UTF8.GetString(b.Span);
 
     [Fact]
     public async Task Seek_And_Iterate()
@@ -295,7 +296,7 @@ public class MergingCursorTests
 {
     private static byte[] Key(string s) => Encoding.UTF8.GetBytes(s);
     private static byte[] Val(string s) => Encoding.UTF8.GetBytes(s);
-    private static string Str(byte[]? b) => b is null ? "<null>" : Encoding.UTF8.GetString(b);
+    private static string Str(ReadOnlyMemory<byte> b) => Encoding.UTF8.GetString(b.Span);
 
     private static SkipListCursor MakeSkipListCursor(params (string Key, string? Value)[] entries)
     {
@@ -346,7 +347,7 @@ public class MergingCursorTests
         await using var merged = new MergingCursor([high, low]);
         Assert.True(await merged.SeekAsync(Key("b")));
         Assert.True(merged.IsTombstone);
-        Assert.Null(merged.CurrentValue);
+        Assert.True(merged.CurrentValue.IsEmpty);
     }
 
     [Fact]
@@ -439,6 +440,8 @@ public class MergingCursorTests
 
 public class TransactionCursorTests : TempDirTest
 {
+    private static string Str(ReadOnlyMemory<byte> b) => Encoding.UTF8.GetString(b.Span);
+
     [Fact]
     public async Task ReadOnly_Cursor_Over_MemTable()
     {
