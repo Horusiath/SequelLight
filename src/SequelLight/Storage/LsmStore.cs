@@ -436,6 +436,25 @@ public sealed class ReadOnlyTransaction : IDisposable
         return found ? value : null;
     }
 
+    /// <summary>
+    /// Creates a merged cursor over the memtable snapshot and all SSTables visible
+    /// to this transaction. Entries are deduplicated by key with newest source winning.
+    /// Tombstones are surfaced (IsTombstone = true).
+    /// </summary>
+    public Cursor CreateCursor()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var children = new List<Cursor> { new SkipListCursor(_snapshot) };
+        for (int i = _sstables.Count - 1; i >= 0; i--)
+        {
+            var reader = _sstables[i].Reader;
+            if (reader is not null)
+                children.Add(reader.CreateCursor());
+        }
+        return new MergingCursor(children.ToArray());
+    }
+
     public void Dispose()
     {
         _disposed = true;
@@ -521,6 +540,28 @@ public sealed class ReadWriteTransaction : IAsyncDisposable
 
         var (value, found) = await _store.GetFromSSTAsync(key, _sstables).ConfigureAwait(false);
         return found ? value : null;
+    }
+
+    /// <summary>
+    /// Creates a merged cursor that includes uncommitted local writes (highest priority),
+    /// the memtable snapshot, and all SSTables visible to this transaction.
+    /// The cursor is a snapshot of local writes at creation time.
+    /// </summary>
+    public Cursor CreateCursor()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var children = new List<Cursor>();
+        if (_localWrites.Count > 0)
+            children.Add(new ArrayCursor(_localWrites));
+        children.Add(new SkipListCursor(_readSnapshot));
+        for (int i = _sstables.Count - 1; i >= 0; i--)
+        {
+            var reader = _sstables[i].Reader;
+            if (reader is not null)
+                children.Add(reader.CreateCursor());
+        }
+        return new MergingCursor(children.ToArray());
     }
 
     public async ValueTask<bool> CommitAsync()

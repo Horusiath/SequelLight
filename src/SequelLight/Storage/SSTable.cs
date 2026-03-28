@@ -573,6 +573,8 @@ public sealed class SSTableReader : IAsyncDisposable
     /// </summary>
     public SSTableScanner CreateScanner() => new SSTableScanner(_handle, _index);
 
+    internal Cursor CreateCursor() => new SSTableCursor(_handle, _index, _blockCache, _filePath);
+
     /// <summary>
     /// Scans all entries in sorted order. Decodes lazily per entry from each block.
     /// </summary>

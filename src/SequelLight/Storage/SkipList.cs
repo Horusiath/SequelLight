@@ -142,6 +142,60 @@ public sealed class ConcurrentSkipList
     }
 
     /// <summary>
+    /// Returns the first node with key &gt;= <paramref name="key"/>, or null.
+    /// </summary>
+    internal Node? SeekToOrAfter(byte[] key)
+    {
+        var node = _head;
+        for (int level = _height - 1; level >= 0; level--)
+        {
+            var next = node.GetNext(level);
+            while (next is not null && next.Key.AsSpan().SequenceCompareTo(key) < 0)
+            {
+                node = next;
+                next = node.GetNext(level);
+            }
+        }
+        return node.GetNext(0);
+    }
+
+    /// <summary>
+    /// Returns the last node with key &lt; <paramref name="key"/>, or null.
+    /// </summary>
+    internal Node? FindLastBefore(byte[] key)
+    {
+        var node = _head;
+        for (int level = _height - 1; level >= 0; level--)
+        {
+            var next = node.GetNext(level);
+            while (next is not null && next.Key.AsSpan().SequenceCompareTo(key) < 0)
+            {
+                node = next;
+                next = node.GetNext(level);
+            }
+        }
+        return node == _head ? null : node;
+    }
+
+    /// <summary>
+    /// Returns the last node in the list, or null if empty.
+    /// </summary>
+    internal Node? FindLast()
+    {
+        var node = _head;
+        for (int level = _height - 1; level >= 0; level--)
+        {
+            var next = node.GetNext(level);
+            while (next is not null)
+            {
+                node = next;
+                next = node.GetNext(level);
+            }
+        }
+        return node == _head ? null : node;
+    }
+
+    /// <summary>
     /// Finds predecessors and successors for <paramref name="key"/> at every level.
     /// Returns true if the key exists at level 0.
     /// </summary>
