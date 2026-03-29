@@ -10,14 +10,16 @@ namespace SequelLight;
 public sealed class SequelLightTransaction : DbTransaction
 {
     private readonly SequelLightConnection _connection;
+    private readonly Database _db;
     private ReadOnlyTransaction? _inner;
     private bool _disposed;
 
     internal SequelLightTransaction(SequelLightConnection connection, IsolationLevel isolationLevel)
     {
         _connection = connection;
+        _db = connection.Db!;
         IsolationLevel = isolationLevel;
-        _inner = connection.Db!.BeginReadWrite();
+        _inner = _db.BeginReadWrite();
     }
 
     internal ReadOnlyTransaction? Inner => _inner;
@@ -40,6 +42,7 @@ public sealed class SequelLightTransaction : DbTransaction
         await rw.CommitAsync().ConfigureAwait(false);
         await rw.DisposeAsync().ConfigureAwait(false);
         _inner = null;
+        _db.ClearSchemaDirty();
     }
 
     public override void Rollback()
@@ -56,6 +59,9 @@ public sealed class SequelLightTransaction : DbTransaction
         // Simply dispose the inner transaction without committing — all buffered mutations are discarded
         await _inner.DisposeAsync().ConfigureAwait(false);
         _inner = null;
+
+        // If DDL was executed within this transaction, reload schema from committed state
+        await _db.ReloadSchemaAsync().ConfigureAwait(false);
     }
 
     public override async ValueTask DisposeAsync()
@@ -66,6 +72,9 @@ public sealed class SequelLightTransaction : DbTransaction
             {
                 await _inner.DisposeAsync().ConfigureAwait(false);
                 _inner = null;
+
+                // Implicit rollback — reload schema if DDL was executed
+                await _db.ReloadSchemaAsync().ConfigureAwait(false);
             }
             _disposed = true;
         }
@@ -76,8 +85,14 @@ public sealed class SequelLightTransaction : DbTransaction
     {
         if (!_disposed && disposing)
         {
-            _inner?.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            _inner = null;
+            if (_inner is not null)
+            {
+                _inner.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                _inner = null;
+
+                // Implicit rollback — reload schema if DDL was executed
+                _db.ReloadSchemaAsync().AsTask().GetAwaiter().GetResult();
+            }
             _disposed = true;
         }
         base.Dispose(disposing);

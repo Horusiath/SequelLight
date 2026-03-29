@@ -28,6 +28,23 @@ public sealed class DatabaseSchema
     public IReadOnlyDictionary<Oid, ViewSchema> Views => _views;
     public IReadOnlyDictionary<Oid, TriggerSchema> Triggers => _triggers;
 
+    /// <summary>
+    /// Removes all registered schema objects and resets the OID counter.
+    /// Used to rebuild the schema from persisted state after a transaction rollback.
+    /// </summary>
+    internal void Clear()
+    {
+        _tables.Clear();
+        _tableNames.Clear();
+        _indexes.Clear();
+        _indexNames.Clear();
+        _views.Clear();
+        _viewNames.Clear();
+        _triggers.Clear();
+        _triggerNames.Clear();
+        RootTable.Columns[0].SetAutoIncrement(0);
+    }
+
     // ---- Name-based lookup ----
 
     public TableSchema? GetTable(string name) =>

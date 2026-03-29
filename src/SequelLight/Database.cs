@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Text;
 using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
@@ -14,6 +16,7 @@ namespace SequelLight;
 public sealed class Database : IAsyncDisposable
 {
     private readonly LsmStore _store;
+    private bool _schemaDirty;
 
     internal Database(LsmStore store, string directory)
     {
@@ -25,6 +28,7 @@ public sealed class Database : IAsyncDisposable
     public string Directory { get; }
     public DatabaseSchema Schema { get; }
     internal LsmStore Store => _store;
+    internal bool SchemaDirty => _schemaDirty;
 
     public ReadOnlyTransaction BeginReadOnly() => _store.BeginReadOnly();
     public ReadWriteTransaction BeginReadWrite() => _store.BeginReadWrite();
@@ -50,6 +54,7 @@ public sealed class Database : IAsyncDisposable
 
         if (transaction is ReadWriteTransaction rw)
         {
+            _schemaDirty = true;
             ApplySchemaChanges(rw, rootTable, changes);
             return changes.Length;
         }
@@ -75,6 +80,76 @@ public sealed class Database : IAsyncDisposable
                     tx.Delete(key);
                     break;
             }
+        }
+    }
+
+    /// <summary>
+    /// Clears the schema dirty flag. Called after a successful commit
+    /// so that a subsequent rollback of a different transaction doesn't
+    /// trigger an unnecessary reload.
+    /// </summary>
+    internal void ClearSchemaDirty() => _schemaDirty = false;
+
+    /// <summary>
+    /// Rebuilds the in-memory <see cref="Schema"/> from the committed <c>__schema</c>
+    /// entries in the LSM store. Called on transaction rollback when DDL was executed
+    /// within the transaction.
+    /// </summary>
+    internal async ValueTask ReloadSchemaAsync()
+    {
+        if (!_schemaDirty)
+            return;
+
+        _schemaDirty = false;
+
+        // Collect all committed __schema entries via a prefix scan on Oid=0
+        var prefix = RowKeyEncoder.EncodeTablePrefix(new Oid(0));
+        var rootTable = Schema.RootTable;
+        var pkTypes = new DbType[] { DbType.Integer };
+        var entries = new List<(Oid Oid, ObjectType Type, string Definition)>();
+
+        using var ro = _store.BeginReadOnly();
+        await using var cursor = ro.CreateCursor();
+        await cursor.SeekAsync(prefix);
+
+        var decodeBuf = new DbValue[rootTable.Columns.Count];
+        var pkBuf = new DbValue[1];
+
+        while (cursor.IsValid)
+        {
+            var key = cursor.CurrentKey.Span;
+            // Stop once we leave the __schema table prefix (first 4 bytes = Oid 0)
+            if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != 0)
+                break;
+
+            if (!cursor.IsTombstone)
+            {
+                RowKeyEncoder.Decode(key, out _, pkBuf, pkTypes);
+                RowValueEncoder.Decode(cursor.CurrentValue.Span, decodeBuf, rootTable.Columns);
+
+                var oid = new Oid((uint)pkBuf[0].AsInteger());
+                var type = (ObjectType)decodeBuf[1].AsInteger();
+                var definition = Encoding.UTF8.GetString(decodeBuf[3].AsText().Span);
+
+                entries.Add((oid, type, definition));
+            }
+
+            if (!await cursor.MoveNextAsync().ConfigureAwait(false))
+                break;
+        }
+
+        // Sort by OID so tables are registered before their dependent indexes/triggers
+        entries.Sort((a, b) => a.Oid.CompareTo(b.Oid));
+
+        // Clear all schema objects and rebuild from stored definitions
+        Schema.Clear();
+
+        foreach (var (oid, type, definition) in entries)
+        {
+            // Set autoincrement so the next AllocateOid() returns exactly this OID
+            rootTable.Columns[0].SetAutoIncrement((long)oid.Value - 1);
+            var stmt = SqlParser.Parse(definition);
+            Schema.Apply(stmt);
         }
     }
 

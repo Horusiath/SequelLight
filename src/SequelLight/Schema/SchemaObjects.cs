@@ -148,6 +148,12 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
     /// </summary>
     public long NextAutoIncrement() => Interlocked.Increment(ref _autoIncrementValue);
 
+    /// <summary>
+    /// Sets the autoincrement counter to a specific value.
+    /// Used during schema reload from persisted state.
+    /// </summary>
+    internal void SetAutoIncrement(long value) => Interlocked.Exchange(ref _autoIncrementValue, value);
+
     // Identity is by SeqNo within a table — avoids deep comparison of SqlExpr trees.
     public bool Equals(ColumnSchema? other) => other is not null && SeqNo == other.SeqNo;
     public override bool Equals(object? obj) => Equals(obj as ColumnSchema);
