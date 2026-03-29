@@ -40,6 +40,7 @@ public sealed class Database : IAsyncDisposable
         {
             CreateTableStmt or CreateIndexStmt or CreateViewStmt or CreateTriggerStmt
                 or DropStmt or AlterTableStmt => await ExecuteDdlAsync(stmt, transaction).ConfigureAwait(false),
+            InsertStmt insert => await ExecuteInsertAsync(insert, transaction).ConfigureAwait(false),
             _ => throw new NotImplementedException()
         };
     }
@@ -166,6 +167,140 @@ public sealed class Database : IAsyncDisposable
         // Set autoincrement to max(oid) so future allocations start at max+1
         if (entries.Count > 0)
             rootTable.Columns[0].SetAutoIncrement((long)entries[^1].Oid.Value);
+    }
+
+    private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, ReadOnlyTransaction? transaction)
+    {
+        var table = Schema.GetTable(stmt.Table)
+            ?? throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
+
+        if (stmt.Source is not SelectInsertSource { Query.First: ValuesBody values })
+            throw new NotSupportedException("Only INSERT ... VALUES is currently supported.");
+
+        // Resolve column mapping: which table column index each INSERT column maps to
+        var insertColumns = stmt.Columns;
+        int[] columnMap; // columnMap[i] = index into table.Columns for the i-th INSERT column
+
+        if (insertColumns is null || insertColumns.Count == 0)
+        {
+            // No column list specified — values must match all columns in order
+            columnMap = new int[table.Columns.Count];
+            for (int i = 0; i < columnMap.Length; i++)
+                columnMap[i] = i;
+        }
+        else
+        {
+            columnMap = new int[insertColumns.Count];
+            for (int i = 0; i < insertColumns.Count; i++)
+            {
+                int found = -1;
+                for (int j = 0; j < table.Columns.Count; j++)
+                {
+                    if (string.Equals(table.Columns[j].Name, insertColumns[i], StringComparison.OrdinalIgnoreCase))
+                    {
+                        found = j;
+                        break;
+                    }
+                }
+                if (found < 0)
+                    throw new InvalidOperationException($"Column '{insertColumns[i]}' does not exist in table '{stmt.Table}'.");
+                columnMap[i] = found;
+            }
+        }
+
+        int totalInserted = 0;
+
+        async ValueTask InsertRows(ReadWriteTransaction rw)
+        {
+            var row = new DbValue[table.Columns.Count];
+
+            foreach (var valueRow in values.Rows)
+            {
+                if (valueRow.Count != columnMap.Length)
+                    throw new InvalidOperationException(
+                        $"INSERT has {columnMap.Length} target column(s) but {valueRow.Count} value(s) were supplied.");
+
+                // Initialize row with defaults/nulls
+                for (int i = 0; i < row.Length; i++)
+                    row[i] = DbValue.Null;
+
+                // Fill in explicitly provided values
+                for (int i = 0; i < valueRow.Count; i++)
+                {
+                    var colIdx = columnMap[i];
+                    row[colIdx] = EvaluateLiteral(valueRow[i], table.Columns[colIdx]);
+                }
+
+                // Fill defaults and validate NOT NULL for columns not in the INSERT column list
+                for (int i = 0; i < table.Columns.Count; i++)
+                {
+                    if (!row[i].IsNull)
+                        continue;
+
+                    var col = table.Columns[i];
+
+                    if (col.IsAutoincrement)
+                    {
+                        row[i] = DbValue.Integer(col.NextAutoIncrement());
+                        continue;
+                    }
+
+                    if (col.DefaultValue is not null)
+                    {
+                        row[i] = EvaluateLiteral(col.DefaultValue, col);
+                        continue;
+                    }
+
+                    if (col.IsNotNull)
+                        throw new InvalidOperationException(
+                            $"Column '{col.Name}' is NOT NULL and has no default value.");
+                }
+
+                rw.Put(table.EncodeRowKey(row), table.EncodeRowValue(row));
+                totalInserted++;
+            }
+        }
+
+        if (transaction is ReadWriteTransaction rwTx)
+        {
+            await InsertRows(rwTx).ConfigureAwait(false);
+            return totalInserted;
+        }
+
+        // Auto-commit
+        await using var autoTx = _store.BeginReadWrite();
+        await InsertRows(autoTx).ConfigureAwait(false);
+        await autoTx.CommitAsync().ConfigureAwait(false);
+        return totalInserted;
+    }
+
+    /// <summary>
+    /// Evaluates a SQL expression (currently only literals) into a <see cref="DbValue"/>
+    /// compatible with the target column's type affinity.
+    /// </summary>
+    private static DbValue EvaluateLiteral(SqlExpr expr, ColumnSchema column)
+    {
+        if (expr is not LiteralExpr literal)
+            throw new NotSupportedException($"Only literal expressions are currently supported in INSERT values, got {expr.GetType().Name}.");
+
+        if (literal.Kind == LiteralKind.Null)
+            return DbValue.Null;
+
+        var affinity = TypeAffinity.Resolve(column.TypeName);
+        return (literal.Kind, affinity) switch
+        {
+            (LiteralKind.Integer, DbType.Integer) => DbValue.Integer(long.Parse(literal.Value)),
+            (LiteralKind.Integer, DbType.Real) => DbValue.Real(double.Parse(literal.Value)),
+            (LiteralKind.Real, DbType.Real) => DbValue.Real(double.Parse(literal.Value)),
+            (LiteralKind.Real, DbType.Integer) => DbValue.Integer((long)double.Parse(literal.Value)),
+            (LiteralKind.String, DbType.Text) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
+            (LiteralKind.String, DbType.Blob) => DbValue.Blob(Encoding.UTF8.GetBytes(literal.Value)),
+            (LiteralKind.Blob, DbType.Blob) => DbValue.Blob(Convert.FromHexString(literal.Value)),
+            (LiteralKind.True, DbType.Integer) => DbValue.Integer(1),
+            (LiteralKind.False, DbType.Integer) => DbValue.Integer(0),
+            _ => throw new InvalidOperationException(
+                $"Cannot convert {literal.Kind} literal to {affinity} for column '{column.Name}'.")
+        };
     }
 
     internal async ValueTask<object?> ExecuteScalarAsync(string sql, ReadOnlyTransaction? transaction)

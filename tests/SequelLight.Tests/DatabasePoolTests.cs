@@ -228,8 +228,8 @@ public class SequelLightConnectionTests : TempDirTest
         var cmd = conn.CreateCommand();
         cmd.CommandText = "INSERT INTO t (id) VALUES (1)";
 
-        // Execution is not yet implemented, but SQL is parsed — should throw NotImplementedException, not SqlParseException
-        await Assert.ThrowsAsync<NotImplementedException>(() => cmd.ExecuteNonQueryAsync());
+        // Table 't' does not exist — should throw InvalidOperationException
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cmd.ExecuteNonQueryAsync());
 
         await conn.CloseAsync();
     }
