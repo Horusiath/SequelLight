@@ -1,4 +1,5 @@
 using System.Text;
+using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
 
@@ -38,6 +39,52 @@ public enum ColumnFlags : byte
     Autoincrement = 1 << 2,
     Unique        = 1 << 3,
     Stored        = 1 << 4,
+}
+
+/// <summary>
+/// Identifies the kind of schema object stored in the root catalog table.
+/// </summary>
+public enum ObjectType : byte
+{
+    Table = 1,
+    Index = 2,
+    View = 3,
+    Trigger = 4,
+}
+
+public enum SchemaChangeKind : byte
+{
+    Insert,
+    Delete,
+}
+
+/// <summary>
+/// Represents a single mutation to the root <c>__schema</c> catalog table.
+/// <see cref="Row"/> has four elements matching the <see cref="TableSchema.Root"/> columns:
+/// oid, type, name, definition.
+/// </summary>
+public readonly struct SchemaChange
+{
+    public readonly SchemaChangeKind Kind;
+    public readonly DbValue[] Row;
+
+    private SchemaChange(SchemaChangeKind kind, DbValue[] row)
+    {
+        Kind = kind;
+        Row = row;
+    }
+
+    public static SchemaChange Insert(Oid oid, ObjectType type, string name, string definition) =>
+        new(SchemaChangeKind.Insert,
+        [
+            DbValue.Integer(oid.Value),
+            DbValue.Integer((long)type),
+            DbValue.Text(Encoding.UTF8.GetBytes(name)),
+            DbValue.Text(Encoding.UTF8.GetBytes(definition)),
+        ]);
+
+    public static SchemaChange Delete(Oid oid) =>
+        new(SchemaChangeKind.Delete, [DbValue.Integer(oid.Value), DbValue.Null, DbValue.Null, DbValue.Null]);
 }
 
 /// <summary>

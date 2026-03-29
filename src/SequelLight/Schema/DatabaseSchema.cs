@@ -58,44 +58,33 @@ public sealed class DatabaseSchema
 
     /// <summary>
     /// Applies a DDL statement to mutate the schema catalog.
+    /// Returns the set of <see cref="SchemaChange"/> mutations to apply to the
+    /// <see cref="TableSchema.Root"/> catalog table.
     /// </summary>
-    public void Apply(SqlStmt stmt)
+    public SchemaChange[] Apply(SqlStmt stmt)
     {
-        switch (stmt)
+        return stmt switch
         {
-            case CreateTableStmt create:
-                ApplyCreateTable(create);
-                break;
-            case CreateIndexStmt create:
-                ApplyCreateIndex(create);
-                break;
-            case CreateViewStmt create:
-                ApplyCreateView(create);
-                break;
-            case CreateTriggerStmt create:
-                ApplyCreateTrigger(create);
-                break;
-            case DropStmt drop:
-                ApplyDrop(drop);
-                break;
-            case AlterTableStmt alter:
-                ApplyAlterTable(alter);
-                break;
-            default:
-                throw new InvalidOperationException($"Unsupported DDL statement: {stmt.GetType().Name}");
-        }
+            CreateTableStmt create => ApplyCreateTable(create),
+            CreateIndexStmt create => ApplyCreateIndex(create),
+            CreateViewStmt create => ApplyCreateView(create),
+            CreateTriggerStmt create => ApplyCreateTrigger(create),
+            DropStmt drop => ApplyDrop(drop),
+            AlterTableStmt alter => ApplyAlterTable(alter),
+            _ => throw new InvalidOperationException($"Unsupported DDL statement: {stmt.GetType().Name}")
+        };
     }
 
     private Oid AllocateOid() => new(++_nextOid);
 
-    private void ApplyCreateTable(CreateTableStmt stmt)
+    private SchemaChange[] ApplyCreateTable(CreateTableStmt stmt)
     {
         if (stmt.Body is AsSelectTableBody)
             throw new NotSupportedException("CREATE TABLE AS SELECT cannot be resolved without query execution.");
 
         if (_tableNames.ContainsKey(stmt.Table))
         {
-            if (stmt.IfNotExists) return;
+            if (stmt.IfNotExists) return [];
             throw new InvalidOperationException($"Table '{stmt.Table}' already exists.");
         }
 
@@ -171,7 +160,7 @@ public sealed class DatabaseSchema
         }
 
         var oid = AllocateOid();
-        _tables[oid] = new TableSchema(
+        var table = new TableSchema(
             oid,
             stmt.Table,
             stmt.Temporary,
@@ -183,14 +172,17 @@ public sealed class DatabaseSchema
             (IReadOnlyList<UniqueConstraintSchema>?)uniqueConstraints ?? Array.Empty<UniqueConstraintSchema>(),
             (IReadOnlyList<CheckConstraintSchema>?)checkConstraints ?? Array.Empty<CheckConstraintSchema>(),
             (IReadOnlyList<ForeignKeyConstraintSchema>?)foreignKeys ?? Array.Empty<ForeignKeyConstraintSchema>());
+        _tables[oid] = table;
         _tableNames[stmt.Table] = oid;
+
+        return [SchemaChange.Insert(oid, ObjectType.Table, table.Name, table.ToString())];
     }
 
-    private void ApplyCreateIndex(CreateIndexStmt stmt)
+    private SchemaChange[] ApplyCreateIndex(CreateIndexStmt stmt)
     {
         if (_indexNames.ContainsKey(stmt.Index))
         {
-            if (stmt.IfNotExists) return;
+            if (stmt.IfNotExists) return [];
             throw new InvalidOperationException($"Index '{stmt.Index}' already exists.");
         }
 
@@ -198,28 +190,34 @@ public sealed class DatabaseSchema
             throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
 
         var oid = AllocateOid();
-        _indexes[oid] = new IndexSchema(oid, stmt.Index, tableOid, stmt.Table, stmt.Unique, stmt.Columns, stmt.Where);
+        var index = new IndexSchema(oid, stmt.Index, tableOid, stmt.Table, stmt.Unique, stmt.Columns, stmt.Where);
+        _indexes[oid] = index;
         _indexNames[stmt.Index] = oid;
+
+        return [SchemaChange.Insert(oid, ObjectType.Index, index.Name, index.ToString())];
     }
 
-    private void ApplyCreateView(CreateViewStmt stmt)
+    private SchemaChange[] ApplyCreateView(CreateViewStmt stmt)
     {
         if (_viewNames.ContainsKey(stmt.View))
         {
-            if (stmt.IfNotExists) return;
+            if (stmt.IfNotExists) return [];
             throw new InvalidOperationException($"View '{stmt.View}' already exists.");
         }
 
         var oid = AllocateOid();
-        _views[oid] = new ViewSchema(oid, stmt.View, stmt.Temporary, stmt.Columns, stmt.Query);
+        var view = new ViewSchema(oid, stmt.View, stmt.Temporary, stmt.Columns, stmt.Query);
+        _views[oid] = view;
         _viewNames[stmt.View] = oid;
+
+        return [SchemaChange.Insert(oid, ObjectType.View, view.Name, view.ToString())];
     }
 
-    private void ApplyCreateTrigger(CreateTriggerStmt stmt)
+    private SchemaChange[] ApplyCreateTrigger(CreateTriggerStmt stmt)
     {
         if (_triggerNames.ContainsKey(stmt.Trigger))
         {
-            if (stmt.IfNotExists) return;
+            if (stmt.IfNotExists) return [];
             throw new InvalidOperationException($"Trigger '{stmt.Trigger}' already exists.");
         }
 
@@ -227,39 +225,48 @@ public sealed class DatabaseSchema
             throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
 
         var oid = AllocateOid();
-        _triggers[oid] = new TriggerSchema(
+        var trigger = new TriggerSchema(
             oid, stmt.Trigger, stmt.Temporary, tableOid, stmt.Table,
             stmt.Timing, stmt.Event, stmt.ForEachRow, stmt.When, stmt.Body);
+        _triggers[oid] = trigger;
         _triggerNames[stmt.Trigger] = oid;
+
+        return [SchemaChange.Insert(oid, ObjectType.Trigger, trigger.Name, trigger.ToString())];
     }
 
-    private void ApplyDrop(DropStmt stmt)
+    private SchemaChange[] ApplyDrop(DropStmt stmt)
     {
+        var changes = new List<SchemaChange>();
         bool removed = stmt.Kind switch
         {
-            DropObjectKind.Table => DropTable(stmt.Name),
-            DropObjectKind.Index => DropNamed(_indexes, _indexNames, stmt.Name),
-            DropObjectKind.View => DropNamed(_views, _viewNames, stmt.Name),
-            DropObjectKind.Trigger => DropNamed(_triggers, _triggerNames, stmt.Name),
+            DropObjectKind.Table => DropTable(stmt.Name, changes),
+            DropObjectKind.Index => DropNamed(_indexes, _indexNames, stmt.Name, changes),
+            DropObjectKind.View => DropNamed(_views, _viewNames, stmt.Name, changes),
+            DropObjectKind.Trigger => DropNamed(_triggers, _triggerNames, stmt.Name, changes),
             _ => throw new InvalidOperationException($"Unsupported drop kind: {stmt.Kind}")
         };
 
         if (!removed && !stmt.IfExists)
             throw new InvalidOperationException($"{stmt.Kind} '{stmt.Name}' does not exist.");
+
+        return changes.ToArray();
     }
 
-    private static bool DropNamed<T>(Dictionary<Oid, T> objects, Dictionary<string, Oid> names, string name)
+    private static bool DropNamed<T>(Dictionary<Oid, T> objects, Dictionary<string, Oid> names, string name,
+        List<SchemaChange> changes)
     {
         if (!names.Remove(name, out var oid))
             return false;
+        changes.Add(SchemaChange.Delete(oid));
         objects.Remove(oid);
         return true;
     }
 
-    private bool DropTable(string name)
+    private bool DropTable(string name, List<SchemaChange> changes)
     {
         if (!_tableNames.Remove(name, out var tableOid))
             return false;
+        changes.Add(SchemaChange.Delete(tableOid));
         _tables.Remove(tableOid);
 
         // Remove indexes and triggers that reference this table by Oid
@@ -271,6 +278,7 @@ public sealed class DatabaseSchema
         }
         foreach (var oid in indexesToRemove)
         {
+            changes.Add(SchemaChange.Delete(oid));
             _indexNames.Remove(_indexes[oid].Name);
             _indexes.Remove(oid);
         }
@@ -283,6 +291,7 @@ public sealed class DatabaseSchema
         }
         foreach (var oid in triggersToRemove)
         {
+            changes.Add(SchemaChange.Delete(oid));
             _triggerNames.Remove(_triggers[oid].Name);
             _triggers.Remove(oid);
         }
@@ -290,7 +299,7 @@ public sealed class DatabaseSchema
         return true;
     }
 
-    private void ApplyAlterTable(AlterTableStmt stmt)
+    private SchemaChange[] ApplyAlterTable(AlterTableStmt stmt)
     {
         if (!_tableNames.TryGetValue(stmt.Table, out var tableOid))
             throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
@@ -370,6 +379,27 @@ public sealed class DatabaseSchema
             default:
                 throw new InvalidOperationException($"Unsupported ALTER TABLE action: {stmt.Action.GetType().Name}");
         }
+
+        // The table definition changed — emit an Insert (upsert) for the table
+        var changes = new List<SchemaChange>();
+        changes.Add(SchemaChange.Insert(tableOid, ObjectType.Table, table.Name, table.ToString()));
+
+        // Rename also changes index/trigger definitions (different TableName)
+        if (stmt.Action is RenameTableAction)
+        {
+            foreach (var index in _indexes.Values)
+            {
+                if (index.TableOid == tableOid)
+                    changes.Add(SchemaChange.Insert(index.Oid, ObjectType.Index, index.Name, index.ToString()));
+            }
+            foreach (var trigger in _triggers.Values)
+            {
+                if (trigger.TableOid == tableOid)
+                    changes.Add(SchemaChange.Insert(trigger.Oid, ObjectType.Trigger, trigger.Name, trigger.ToString()));
+            }
+        }
+
+        return changes.ToArray();
     }
 
     private static ColumnSchema BuildColumn(int seqNo, ColumnDef colDef, string[]? tablePkColumns)

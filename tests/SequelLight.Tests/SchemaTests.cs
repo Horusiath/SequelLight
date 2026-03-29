@@ -1,3 +1,5 @@
+using System.Text;
+using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
@@ -1535,5 +1537,215 @@ public class SchemaTests
 
         var sql = trigger.ToString();
         Assert.Contains("\"t2\"", sql);
+    }
+
+    // ==== DDL to Row tests ====
+
+    private static string RowText(DbValue value) => Encoding.UTF8.GetString(value.AsText().Span);
+
+    [Fact]
+    public void DDLToRow_CreateTable()
+    {
+        var schema = new DatabaseSchema();
+        var changes = schema.Apply(SqlParser.Parse(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"));
+
+        Assert.Single(changes);
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(1L, c.Row[0].AsInteger());
+        Assert.Equal((long)ObjectType.Table, c.Row[1].AsInteger());
+        Assert.Equal("users", RowText(c.Row[2]));
+        Assert.Equal(schema.GetTable("users")!.ToString(), RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_CreateIndex()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER, b TEXT)"));
+        var changes = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (a, b)"));
+
+        Assert.Single(changes);
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal((long)ObjectType.Index, c.Row[1].AsInteger());
+        Assert.Equal("idx", RowText(c.Row[2]));
+        Assert.Equal(schema.GetIndex("idx")!.ToString(), RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_CreateUniqueIndex()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER)"));
+        var changes = schema.Apply(SqlParser.Parse("CREATE UNIQUE INDEX idx ON t (a)"));
+
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Contains("UNIQUE", RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_CreateView()
+    {
+        var schema = new DatabaseSchema();
+        var changes = schema.Apply(SqlParser.Parse("CREATE VIEW v AS SELECT 1, 2"));
+
+        Assert.Single(changes);
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal((long)ObjectType.View, c.Row[1].AsInteger());
+        Assert.Equal("v", RowText(c.Row[2]));
+        Assert.Equal(schema.GetView("v")!.ToString(), RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_CreateTrigger()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        var changes = schema.Apply(SqlParser.Parse(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
+
+        Assert.Single(changes);
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal((long)ObjectType.Trigger, c.Row[1].AsInteger());
+        Assert.Equal("trg", RowText(c.Row[2]));
+        Assert.Equal(schema.GetTrigger("trg")!.ToString(), RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_CreateTable_IfNotExists_NoChange()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        var changes = schema.Apply(SqlParser.Parse("CREATE TABLE IF NOT EXISTS t (y TEXT)"));
+
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public void DDLToRow_OidsAreIncrementing()
+    {
+        var schema = new DatabaseSchema();
+        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER)"));
+        var c2 = schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT)"));
+        var c3 = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t1 (x)"));
+
+        Assert.Equal(1L, c1[0].Row[0].AsInteger());
+        Assert.Equal(2L, c2[0].Row[0].AsInteger());
+        Assert.Equal(3L, c3[0].Row[0].AsInteger());
+    }
+
+    [Fact]
+    public void DDLToRow_DropTable_DeletesTableAndDependents()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
+        schema.Apply(SqlParser.Parse(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
+
+        var changes = schema.Apply(SqlParser.Parse("DROP TABLE t"));
+
+        Assert.Equal(3, changes.Length);
+        Assert.All(changes, c => Assert.Equal(SchemaChangeKind.Delete, c.Kind));
+
+        var deletedOids = changes.Select(c => c.Row[0].AsInteger()).OrderBy(o => o).ToArray();
+        Assert.Equal([1L, 2L, 3L], deletedOids);
+    }
+
+    [Fact]
+    public void DDLToRow_DropIndex()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
+
+        var changes = schema.Apply(SqlParser.Parse("DROP INDEX idx"));
+
+        Assert.Single(changes);
+        Assert.Equal(SchemaChangeKind.Delete, changes[0].Kind);
+        Assert.Equal(2L, changes[0].Row[0].AsInteger());
+    }
+
+    [Fact]
+    public void DDLToRow_DropIfExists_NoChange()
+    {
+        var schema = new DatabaseSchema();
+        var changes = schema.Apply(SqlParser.Parse("DROP TABLE IF EXISTS t"));
+
+        Assert.Empty(changes);
+    }
+
+    [Fact]
+    public void DDLToRow_AlterTable_RenameUpdatesAllDependents()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
+        schema.Apply(SqlParser.Parse(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
+
+        var changes = schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
+
+        // Table + index + trigger all get updated definitions
+        Assert.Equal(3, changes.Length);
+        Assert.All(changes, c => Assert.Equal(SchemaChangeKind.Insert, c.Kind));
+
+        var tableChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Table);
+        Assert.Equal("t2", RowText(tableChange.Row[2]));
+        Assert.Contains("\"t2\"", RowText(tableChange.Row[3]));
+
+        var indexChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Index);
+        Assert.Contains("\"t2\"", RowText(indexChange.Row[3]));
+
+        var triggerChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Trigger);
+        Assert.Contains("\"t2\"", RowText(triggerChange.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_AlterTable_AddColumn()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        var changes = schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
+
+        Assert.Single(changes);
+        var c = changes[0];
+        Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal((long)ObjectType.Table, c.Row[1].AsInteger());
+        Assert.Contains("\"y\"", RowText(c.Row[3]));
+    }
+
+    [Fact]
+    public void DDLToRow_DefinitionMatchesToString()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, total REAL NOT NULL, note TEXT DEFAULT 'none')"));
+        schema.Apply(SqlParser.Parse("CREATE INDEX idx_total ON orders (total)"));
+        schema.Apply(SqlParser.Parse("CREATE VIEW v AS SELECT id, total FROM orders WHERE total > 0"));
+        schema.Apply(SqlParser.Parse(
+            "CREATE TRIGGER trg BEFORE INSERT ON orders FOR EACH ROW BEGIN SELECT 1; END"));
+
+        var table = schema.GetTable("orders")!;
+        var index = schema.GetIndex("idx_total")!;
+        var view = schema.GetView("v")!;
+        var trigger = schema.GetTrigger("trg")!;
+
+        // Re-apply each definition to a fresh schema — verifies the DDL is valid
+        var fresh = new DatabaseSchema();
+        fresh.Apply(SqlParser.Parse(table.ToString()));
+        fresh.Apply(SqlParser.Parse(index.ToString()));
+        fresh.Apply(SqlParser.Parse(view.ToString()));
+        fresh.Apply(SqlParser.Parse(trigger.ToString()));
+
+        Assert.NotNull(fresh.GetTable("orders"));
+        Assert.NotNull(fresh.GetIndex("idx_total"));
+        Assert.NotNull(fresh.GetView("v"));
+        Assert.NotNull(fresh.GetTrigger("trg"));
     }
 }
