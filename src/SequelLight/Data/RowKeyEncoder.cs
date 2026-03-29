@@ -82,14 +82,9 @@ public static class RowKeyEncoder
 
     private static int EncodedBytesSize(ReadOnlySpan<byte> data)
     {
-        int size = 2; // terminator 0x00 0x00
-        for (int i = 0; i < data.Length; i++)
-        {
-            size++;
-            if (data[i] == 0x00)
-                size++; // escape byte
-        }
-        return size;
+        // Each 0x00 in data becomes 0x00 0x01 (2 bytes), all other bytes pass through,
+        // plus a 2-byte terminator (0x00 0x00). Count uses SIMD on modern runtimes.
+        return data.Length + data.Count((byte)0x00) + 2;
     }
 
     private static int EncodeColumn(Span<byte> dest, DbValue value, DbType type)
@@ -124,13 +119,24 @@ public static class RowKeyEncoder
 
     private static int EncodeBytes(Span<byte> dest, ReadOnlySpan<byte> data)
     {
+        // Use IndexOf to find 0x00 positions and bulk-copy runs between them.
+        // For typical text/blob data (rare nulls) this is a single SIMD scan + one memcpy.
         int pos = 0;
-        for (int i = 0; i < data.Length; i++)
+        var remaining = data;
+        while (remaining.Length > 0)
         {
-            byte b = data[i];
-            dest[pos++] = b;
-            if (b == 0x00)
-                dest[pos++] = 0x01; // escape: 0x00 -> 0x00 0x01
+            int nullIdx = remaining.IndexOf((byte)0x00);
+            if (nullIdx < 0)
+            {
+                remaining.CopyTo(dest[pos..]);
+                pos += remaining.Length;
+                break;
+            }
+            // Copy everything up to and including the 0x00
+            remaining[..(nullIdx + 1)].CopyTo(dest[pos..]);
+            pos += nullIdx + 1;
+            dest[pos++] = 0x01; // escape byte
+            remaining = remaining[(nullIdx + 1)..];
         }
         dest[pos++] = 0x00; // terminator
         dest[pos++] = 0x00;
@@ -143,10 +149,10 @@ public static class RowKeyEncoder
         {
             case DbType.Integer:
             {
-                Span<byte> tmp = stackalloc byte[8];
-                src[..8].CopyTo(tmp);
-                tmp[0] ^= 0x80;
-                value = DbValue.Integer(BinaryPrimitives.ReadInt64BigEndian(tmp));
+                // XOR the MSB of the big-endian long directly — equivalent to XORing byte[0]
+                // but avoids a stackalloc + 8-byte copy.
+                long v = BinaryPrimitives.ReadInt64BigEndian(src) ^ unchecked((long)0x8000_0000_0000_0000);
+                value = DbValue.Integer(v);
                 return 8;
             }
             case DbType.Real:
@@ -180,48 +186,53 @@ public static class RowKeyEncoder
 
     private static int DecodeBytes(ReadOnlySpan<byte> src, out byte[] data)
     {
-        // First pass: count output length
+        // First pass: find terminator and count output length.
+        // Uses IndexOf (SIMD-accelerated) to skip over runs of non-null bytes.
         int outputLen = 0;
-        int i = 0;
-        while (true)
+        int consumed = 0;
         {
-            if (src[i] == 0x00)
+            var remaining = src;
+            while (true)
             {
-                if (src[i + 1] == 0x00)
+                int nullIdx = remaining.IndexOf((byte)0x00);
+                outputLen += nullIdx; // bytes before the 0x00 are plain output
+
+                if (remaining[nullIdx + 1] == 0x00)
                 {
-                    i += 2;
+                    // Terminator (0x00 0x00)
+                    consumed += nullIdx + 2;
                     break;
                 }
-                // escaped null: 0x00 0x01
+
+                // Escaped null (0x00 0x01) → one decoded 0x00 byte
                 outputLen++;
-                i += 2;
-            }
-            else
-            {
-                outputLen++;
-                i++;
+                int advance = nullIdx + 2;
+                remaining = remaining[advance..];
+                consumed += advance;
             }
         }
 
-        int totalConsumed = i;
-
-        // Second pass: decode
+        // Second pass: decode using bulk copies between 0x00 positions.
         data = new byte[outputLen];
         int pos = 0;
-        i = 0;
-        while (pos < outputLen)
+        var input = src[..(consumed - 2)]; // exclude terminator
+        while (input.Length > 0)
         {
-            if (src[i] == 0x00)
+            int nullIdx = input.IndexOf((byte)0x00);
+            if (nullIdx < 0)
             {
-                data[pos++] = 0x00;
-                i += 2; // skip escape byte
+                input.CopyTo(data.AsSpan(pos));
+                break;
             }
-            else
+            if (nullIdx > 0)
             {
-                data[pos++] = src[i++];
+                input[..nullIdx].CopyTo(data.AsSpan(pos));
+                pos += nullIdx;
             }
+            data[pos++] = 0x00;
+            input = input[(nullIdx + 2)..]; // skip 0x00 0x01
         }
 
-        return totalConsumed;
+        return consumed;
     }
 }

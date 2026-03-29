@@ -98,313 +98,259 @@ public class VarintBenchmarks
         => Varint.WriteSigned(_buf, long.MinValue);
 }
 
+// ---------------------------------------------------------------------------
+//  RowKeyEncoder benchmarks
+//  Coverage: 1-col INTEGER, 1-col TEXT, 2-col (INT+INT), 2-col (INT+TEXT)
+//  Both encode (byte[] allocating) and decode for each shape.
+// ---------------------------------------------------------------------------
+
 [MemoryDiagnoser]
 public class RowKeyEncoderBenchmarks
 {
     private static readonly Oid TableOid = new(42);
-    private static readonly DbType[] IntType = [DbType.Integer];
-    private static readonly DbType[] RealType = [DbType.Real];
-    private static readonly DbType[] TextType = [DbType.Text];
-    private static readonly DbType[] CompositeTypes = [DbType.Integer, DbType.Text, DbType.Real];
 
-    private DbValue[] _intPk = null!;
-    private DbValue[] _realPk = null!;
-    private DbValue[] _shortTextPk = null!;
-    private DbValue[] _longTextPk = null!;
-    private DbValue[] _compositePk = null!;
+    // PK type arrays — reused across iterations, zero allocation.
+    private static readonly DbType[] Int1 = [DbType.Integer];
+    private static readonly DbType[] Text1 = [DbType.Text];
+    private static readonly DbType[] IntInt = [DbType.Integer, DbType.Integer];
+    private static readonly DbType[] IntText = [DbType.Integer, DbType.Text];
 
-    private byte[] _encodedIntKey = null!;
-    private byte[] _encodedRealKey = null!;
-    private byte[] _encodedShortTextKey = null!;
-    private byte[] _encodedLongTextKey = null!;
-    private byte[] _encodedCompositeKey = null!;
+    // Input rows
+    private DbValue[] _pkInt = null!;
+    private DbValue[] _pkText = null!;
+    private DbValue[] _pkIntInt = null!;
+    private DbValue[] _pkIntText = null!;
 
-    private byte[] _keyBuf = null!;
+    // Pre-encoded keys (for decode benchmarks)
+    private byte[] _encInt = null!;
+    private byte[] _encText = null!;
+    private byte[] _encIntInt = null!;
+    private byte[] _encIntText = null!;
 
-    // Pre-allocated decode buffers (DbValue contains ROM<byte>, can't stackalloc)
-    private DbValue[] _decodeBuf1 = null!;
-    private DbValue[] _decodeBuf3 = null!;
+    // Pre-allocated decode output buffers
+    private DbValue[] _dec1 = null!;
+    private DbValue[] _dec2 = null!;
 
     [GlobalSetup]
     public void Setup()
     {
-        _intPk = [DbValue.Integer(1_000_000)];
-        _realPk = [DbValue.Real(3.14159265)];
-        _shortTextPk = [DbValue.Text(Encoding.UTF8.GetBytes("user_123"))];
-        _longTextPk = [DbValue.Text(Encoding.UTF8.GetBytes("this-is-a-much-longer-primary-key-value-used-for-benchmarking-text-encoding"))];
-        _compositePk =
-        [
-            DbValue.Integer(42),
-            DbValue.Text(Encoding.UTF8.GetBytes("order_item")),
-            DbValue.Real(99.95),
-        ];
+        _pkInt = [DbValue.Integer(1_000_000)];
+        _pkText = [DbValue.Text("user_12345"u8.ToArray())];
+        _pkIntInt = [DbValue.Integer(42), DbValue.Integer(7)];
+        _pkIntText = [DbValue.Integer(42), DbValue.Text("order_item_999"u8.ToArray())];
 
-        _encodedIntKey = RowKeyEncoder.Encode(TableOid, _intPk, IntType);
-        _encodedRealKey = RowKeyEncoder.Encode(TableOid, _realPk, RealType);
-        _encodedShortTextKey = RowKeyEncoder.Encode(TableOid, _shortTextPk, TextType);
-        _encodedLongTextKey = RowKeyEncoder.Encode(TableOid, _longTextPk, TextType);
-        _encodedCompositeKey = RowKeyEncoder.Encode(TableOid, _compositePk, CompositeTypes);
+        _encInt = RowKeyEncoder.Encode(TableOid, _pkInt, Int1);
+        _encText = RowKeyEncoder.Encode(TableOid, _pkText, Text1);
+        _encIntInt = RowKeyEncoder.Encode(TableOid, _pkIntInt, IntInt);
+        _encIntText = RowKeyEncoder.Encode(TableOid, _pkIntText, IntText);
 
-        _keyBuf = new byte[256];
-        _decodeBuf1 = new DbValue[1];
-        _decodeBuf3 = new DbValue[3];
+        _dec1 = new DbValue[1];
+        _dec2 = new DbValue[2];
     }
 
-    // --- Encode (allocating byte[]) ---
+    // ---- Encode (allocating byte[]) ----
 
-    [Benchmark(Description = "Key encode: INTEGER PK")]
-    public byte[] EncodeIntKey()
-        => RowKeyEncoder.Encode(TableOid, _intPk, IntType);
+    [Benchmark(Description = "Key encode: 1-col INTEGER")]
+    public byte[] Encode_Int()
+        => RowKeyEncoder.Encode(TableOid, _pkInt, Int1);
 
-    [Benchmark(Description = "Key encode: REAL PK")]
-    public byte[] EncodeRealKey()
-        => RowKeyEncoder.Encode(TableOid, _realPk, RealType);
+    [Benchmark(Description = "Key encode: 1-col TEXT")]
+    public byte[] Encode_Text()
+        => RowKeyEncoder.Encode(TableOid, _pkText, Text1);
 
-    [Benchmark(Description = "Key encode: short TEXT PK (8B)")]
-    public byte[] EncodeShortTextKey()
-        => RowKeyEncoder.Encode(TableOid, _shortTextPk, TextType);
+    [Benchmark(Description = "Key encode: 2-col INT+INT")]
+    public byte[] Encode_IntInt()
+        => RowKeyEncoder.Encode(TableOid, _pkIntInt, IntInt);
 
-    [Benchmark(Description = "Key encode: long TEXT PK (74B)")]
-    public byte[] EncodeLongTextKey()
-        => RowKeyEncoder.Encode(TableOid, _longTextPk, TextType);
+    [Benchmark(Description = "Key encode: 2-col INT+TEXT")]
+    public byte[] Encode_IntText()
+        => RowKeyEncoder.Encode(TableOid, _pkIntText, IntText);
 
-    [Benchmark(Description = "Key encode: composite (INT+TEXT+REAL)")]
-    public byte[] EncodeCompositeKey()
-        => RowKeyEncoder.Encode(TableOid, _compositePk, CompositeTypes);
+    // ---- Decode ----
 
-    // --- Encode into pre-sized Span (no allocation) ---
-
-    [Benchmark(Description = "Key encode Span: INTEGER PK")]
-    public int EncodeIntKeySpan()
-        => RowKeyEncoder.Encode(_keyBuf, TableOid, _intPk, IntType);
-
-    [Benchmark(Description = "Key encode Span: composite (INT+TEXT+REAL)")]
-    public int EncodeCompositeKeySpan()
-        => RowKeyEncoder.Encode(_keyBuf, TableOid, _compositePk, CompositeTypes);
-
-    // --- Decode ---
-
-    [Benchmark(Description = "Key decode: INTEGER PK")]
-    public DbValue DecodeIntKey()
+    [Benchmark(Description = "Key decode: 1-col INTEGER")]
+    public DbValue Decode_Int()
     {
-        RowKeyEncoder.Decode(_encodedIntKey, out _, _decodeBuf1, IntType);
-        return _decodeBuf1[0];
+        RowKeyEncoder.Decode(_encInt, out _, _dec1, Int1);
+        return _dec1[0];
     }
 
-    [Benchmark(Description = "Key decode: REAL PK")]
-    public DbValue DecodeRealKey()
+    [Benchmark(Description = "Key decode: 1-col TEXT")]
+    public DbValue Decode_Text()
     {
-        RowKeyEncoder.Decode(_encodedRealKey, out _, _decodeBuf1, RealType);
-        return _decodeBuf1[0];
+        RowKeyEncoder.Decode(_encText, out _, _dec1, Text1);
+        return _dec1[0];
     }
 
-    [Benchmark(Description = "Key decode: short TEXT PK (8B)")]
-    public DbValue DecodeShortTextKey()
+    [Benchmark(Description = "Key decode: 2-col INT+INT")]
+    public DbValue Decode_IntInt()
     {
-        RowKeyEncoder.Decode(_encodedShortTextKey, out _, _decodeBuf1, TextType);
-        return _decodeBuf1[0];
+        RowKeyEncoder.Decode(_encIntInt, out _, _dec2, IntInt);
+        return _dec2[0];
     }
 
-    [Benchmark(Description = "Key decode: long TEXT PK (74B)")]
-    public DbValue DecodeLongTextKey()
+    [Benchmark(Description = "Key decode: 2-col INT+TEXT")]
+    public DbValue Decode_IntText()
     {
-        RowKeyEncoder.Decode(_encodedLongTextKey, out _, _decodeBuf1, TextType);
-        return _decodeBuf1[0];
+        RowKeyEncoder.Decode(_encIntText, out _, _dec2, IntText);
+        return _dec2[0];
     }
-
-    [Benchmark(Description = "Key decode: composite (INT+TEXT+REAL)")]
-    public DbValue DecodeCompositeKey()
-    {
-        RowKeyEncoder.Decode(_encodedCompositeKey, out _, _decodeBuf3, CompositeTypes);
-        return _decodeBuf3[0];
-    }
-
-    // --- ComputeKeySize ---
-
-    [Benchmark(Description = "ComputeKeySize: composite")]
-    public int ComputeKeySizeComposite()
-        => RowKeyEncoder.ComputeKeySize(TableOid, _compositePk, CompositeTypes);
 }
+
+// ---------------------------------------------------------------------------
+//  RowValueEncoder benchmarks
+//  Coverage: 2-col, 10-col, 40-col rows with mixed types.
+//  Both encode (byte[] allocating) and decode for each width.
+// ---------------------------------------------------------------------------
 
 [MemoryDiagnoser]
 public class RowValueEncoderBenchmarks
 {
-    private DbValue[] _singleInt = null!;
-    private int[] _singleIntSeq = null!;
+    // 2-column row: INTEGER + TEXT
+    private DbValue[] _row2 = null!;
+    private int[] _seq2 = null!;
+    private byte[] _enc2 = null!;
+    private ColumnSchema[] _cols2 = null!;
+    private DbValue[] _dec2 = null!;
 
-    private DbValue[] _mixedRow = null!;
-    private int[] _mixedRowSeq = null!;
+    // 10-column row: mixed types
+    private DbValue[] _row10 = null!;
+    private int[] _seq10 = null!;
+    private byte[] _enc10 = null!;
+    private ColumnSchema[] _cols10 = null!;
+    private DbValue[] _dec10 = null!;
 
-    private DbValue[] _sparseRow = null!;
-    private int[] _sparseRowSeq = null!;
-
-    private DbValue[] _wideRow = null!;
-    private int[] _wideRowSeq = null!;
-
-    private byte[] _encodedSingleInt = null!;
-    private byte[] _encodedMixedRow = null!;
-    private byte[] _encodedSparseRow = null!;
-    private byte[] _encodedWideRow = null!;
-
-    private IReadOnlyList<ColumnSchema> _singleIntCols = null!;
-    private IReadOnlyList<ColumnSchema> _mixedRowCols = null!;
-    private IReadOnlyList<ColumnSchema> _sparseRowCols = null!;
-    private IReadOnlyList<ColumnSchema> _wideRowCols = null!;
-
-    private byte[] _valueBuf = null!;
-
-    // Pre-allocated decode buffers
-    private DbValue[] _decodeBuf1 = null!;
-    private DbValue[] _decodeBuf4 = null!;
-    private DbValue[] _decodeBuf8 = null!;
-    private DbValue[] _decodeBuf16 = null!;
+    // 40-column row: mixed types
+    private DbValue[] _row40 = null!;
+    private int[] _seq40 = null!;
+    private byte[] _enc40 = null!;
+    private ColumnSchema[] _cols40 = null!;
+    private DbValue[] _dec40 = null!;
 
     [GlobalSetup]
     public void Setup()
     {
-        // Single integer column
-        _singleInt = [DbValue.Integer(42)];
-        _singleIntSeq = [1];
-        _singleIntCols = MakeColumns(("id", "INTEGER", 1));
+        // --- 2-column row ---
+        _row2 = [DbValue.Integer(1_000_000), DbValue.Text("Alice Johnson"u8.ToArray())];
+        _seq2 = [1, 2];
+        _cols2 = MakeColumns(("id", "INTEGER", 1), ("name", "TEXT", 2));
 
-        // Mixed 4-column row
-        _mixedRow =
+        // --- 10-column row: INT, TEXT, REAL, BLOB, INT, TEXT, REAL, INT, TEXT, INT ---
+        _row10 =
         [
-            DbValue.Integer(1_000_000),
-            DbValue.Text(Encoding.UTF8.GetBytes("Alice Johnson")),
-            DbValue.Real(99.95),
+            DbValue.Integer(42),
+            DbValue.Text("hello world"u8.ToArray()),
+            DbValue.Real(3.14),
             DbValue.Blob(new byte[16]),
+            DbValue.Integer(-100),
+            DbValue.Text("secondary"u8.ToArray()),
+            DbValue.Real(0.001),
+            DbValue.Integer(999_999),
+            DbValue.Text("metadata_field"u8.ToArray()),
+            DbValue.Integer(0),
         ];
-        _mixedRowSeq = [1, 2, 3, 4];
-        _mixedRowCols = MakeColumns(
-            ("id", "INTEGER", 1),
-            ("name", "TEXT", 2),
-            ("balance", "REAL", 3),
-            ("avatar", "BLOB", 4));
+        _seq10 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        _cols10 = MakeColumns(
+            ("c1", "INTEGER", 1), ("c2", "TEXT", 2), ("c3", "REAL", 3),
+            ("c4", "BLOB", 4), ("c5", "INTEGER", 5), ("c6", "TEXT", 6),
+            ("c7", "REAL", 7), ("c8", "INTEGER", 8), ("c9", "TEXT", 9),
+            ("c10", "INTEGER", 10));
 
-        // Sparse row: 8 columns, only 3 non-null
-        _sparseRow =
-        [
-            DbValue.Integer(7),
-            DbValue.Null,
-            DbValue.Null,
-            DbValue.Text(Encoding.UTF8.GetBytes("active")),
-            DbValue.Null,
-            DbValue.Null,
-            DbValue.Null,
-            DbValue.Integer(100),
-        ];
-        _sparseRowSeq = [1, 2, 3, 4, 5, 6, 7, 8];
-        _sparseRowCols = MakeColumns(
-            ("a", "INTEGER", 1), ("b", "INTEGER", 2), ("c", "TEXT", 3),
-            ("d", "TEXT", 4), ("e", "REAL", 5), ("f", "BLOB", 6),
-            ("g", "INTEGER", 7), ("h", "INTEGER", 8));
-
-        // Wide row: 16 integer columns
-        _wideRow = new DbValue[16];
-        _wideRowSeq = new int[16];
-        var wideCols = new (string, string, int)[16];
-        for (int i = 0; i < 16; i++)
+        // --- 40-column row: repeating pattern of INT, TEXT, REAL, BLOB ---
+        _row40 = new DbValue[40];
+        _seq40 = new int[40];
+        var cols40Defs = new (string, string, int)[40];
+        for (int i = 0; i < 40; i++)
         {
-            _wideRow[i] = DbValue.Integer(i * 1000L + 1);
-            _wideRowSeq[i] = i + 1;
-            wideCols[i] = ($"c{i}", "INTEGER", i + 1);
+            int seqNo = i + 1;
+            _seq40[i] = seqNo;
+            switch (i % 4)
+            {
+                case 0:
+                    _row40[i] = DbValue.Integer(i * 1000L + 1);
+                    cols40Defs[i] = ($"c{seqNo}", "INTEGER", seqNo);
+                    break;
+                case 1:
+                    _row40[i] = DbValue.Text(Encoding.UTF8.GetBytes($"val_{i:D4}"));
+                    cols40Defs[i] = ($"c{seqNo}", "TEXT", seqNo);
+                    break;
+                case 2:
+                    _row40[i] = DbValue.Real(i * 0.123);
+                    cols40Defs[i] = ($"c{seqNo}", "REAL", seqNo);
+                    break;
+                case 3:
+                    _row40[i] = DbValue.Blob(new byte[8]);
+                    cols40Defs[i] = ($"c{seqNo}", "BLOB", seqNo);
+                    break;
+            }
         }
-        _wideRowCols = MakeColumns(wideCols);
+        _cols40 = MakeColumns(cols40Defs);
 
         // Pre-encode for decode benchmarks
-        _encodedSingleInt = RowValueEncoder.Encode(_singleInt, _singleIntSeq);
-        _encodedMixedRow = RowValueEncoder.Encode(_mixedRow, _mixedRowSeq);
-        _encodedSparseRow = RowValueEncoder.Encode(_sparseRow, _sparseRowSeq);
-        _encodedWideRow = RowValueEncoder.Encode(_wideRow, _wideRowSeq);
+        _enc2 = RowValueEncoder.Encode(_row2, _seq2);
+        _enc10 = RowValueEncoder.Encode(_row10, _seq10);
+        _enc40 = RowValueEncoder.Encode(_row40, _seq40);
 
-        _valueBuf = new byte[1024];
-        _decodeBuf1 = new DbValue[1];
-        _decodeBuf4 = new DbValue[4];
-        _decodeBuf8 = new DbValue[8];
-        _decodeBuf16 = new DbValue[16];
+        // Pre-allocate decode output buffers
+        _dec2 = new DbValue[2];
+        _dec10 = new DbValue[10];
+        _dec40 = new DbValue[40];
     }
 
-    // --- Encode (allocating) ---
+    // ---- Encode (allocating byte[]) ----
 
-    [Benchmark(Description = "Value encode: 1 INTEGER")]
-    public byte[] EncodeSingleInt()
-        => RowValueEncoder.Encode(_singleInt, _singleIntSeq);
+    [Benchmark(Description = "Value encode: 2-col")]
+    public byte[] Encode_2()
+        => RowValueEncoder.Encode(_row2, _seq2);
 
-    [Benchmark(Description = "Value encode: 4-col mixed")]
-    public byte[] EncodeMixedRow()
-        => RowValueEncoder.Encode(_mixedRow, _mixedRowSeq);
+    [Benchmark(Description = "Value encode: 10-col")]
+    public byte[] Encode_10()
+        => RowValueEncoder.Encode(_row10, _seq10);
 
-    [Benchmark(Description = "Value encode: 8-col sparse (3 non-null)")]
-    public byte[] EncodeSparseRow()
-        => RowValueEncoder.Encode(_sparseRow, _sparseRowSeq);
+    [Benchmark(Description = "Value encode: 40-col")]
+    public byte[] Encode_40()
+        => RowValueEncoder.Encode(_row40, _seq40);
 
-    [Benchmark(Description = "Value encode: 16-col all-int")]
-    public byte[] EncodeWideRow()
-        => RowValueEncoder.Encode(_wideRow, _wideRowSeq);
+    // ---- Decode ----
 
-    // --- Encode into Span ---
-
-    [Benchmark(Description = "Value encode Span: 4-col mixed")]
-    public int EncodeMixedRowSpan()
-        => RowValueEncoder.Encode(_valueBuf, _mixedRow, _mixedRowSeq);
-
-    [Benchmark(Description = "Value encode Span: 16-col all-int")]
-    public int EncodeWideRowSpan()
-        => RowValueEncoder.Encode(_valueBuf, _wideRow, _wideRowSeq);
-
-    // --- Decode ---
-
-    [Benchmark(Description = "Value decode: 1 INTEGER")]
-    public DbValue DecodeSingleInt()
+    [Benchmark(Description = "Value decode: 2-col")]
+    public DbValue Decode_2()
     {
-        RowValueEncoder.Decode(_encodedSingleInt, _decodeBuf1, _singleIntCols);
-        return _decodeBuf1[0];
+        RowValueEncoder.Decode(_enc2, _dec2, _cols2);
+        return _dec2[0];
     }
 
-    [Benchmark(Description = "Value decode: 4-col mixed")]
-    public DbValue DecodeMixedRow()
+    [Benchmark(Description = "Value decode: 10-col")]
+    public DbValue Decode_10()
     {
-        RowValueEncoder.Decode(_encodedMixedRow, _decodeBuf4, _mixedRowCols);
-        return _decodeBuf4[0];
+        RowValueEncoder.Decode(_enc10, _dec10, _cols10);
+        return _dec10[0];
     }
 
-    [Benchmark(Description = "Value decode: 8-col sparse")]
-    public DbValue DecodeSparseRow()
+    [Benchmark(Description = "Value decode: 40-col")]
+    public DbValue Decode_40()
     {
-        RowValueEncoder.Decode(_encodedSparseRow, _decodeBuf8, _sparseRowCols);
-        return _decodeBuf8[0];
+        RowValueEncoder.Decode(_enc40, _dec40, _cols40);
+        return _dec40[0];
     }
 
-    [Benchmark(Description = "Value decode: 16-col all-int")]
-    public DbValue DecodeWideRow()
+    private static ColumnSchema[] MakeColumns(params (string Name, string TypeName, int SeqNo)[] cols)
     {
-        RowValueEncoder.Decode(_encodedWideRow, _decodeBuf16, _wideRowCols);
-        return _decodeBuf16[0];
-    }
-
-    // --- ComputeValueSize ---
-
-    [Benchmark(Description = "ComputeValueSize: 4-col mixed")]
-    public int ComputeSizeMixed()
-        => RowValueEncoder.ComputeValueSize(_mixedRow, _mixedRowSeq);
-
-    [Benchmark(Description = "ComputeValueSize: 16-col all-int")]
-    public int ComputeSizeWide()
-        => RowValueEncoder.ComputeValueSize(_wideRow, _wideRowSeq);
-
-    private static IReadOnlyList<ColumnSchema> MakeColumns(params (string Name, string TypeName, int SeqNo)[] cols)
-    {
-        return cols.Select(c => new ColumnSchema(
-            seqNo: c.SeqNo,
-            name: c.Name,
-            typeName: c.TypeName,
-            flags: ColumnFlags.None,
-            primaryKeyOrder: null,
-            collation: null,
-            defaultValue: null,
-            checkExpression: null,
-            foreignKey: null,
-            generatedExpression: null)).ToArray();
+        var result = new ColumnSchema[cols.Length];
+        for (int i = 0; i < cols.Length; i++)
+        {
+            result[i] = new ColumnSchema(
+                seqNo: cols[i].SeqNo,
+                name: cols[i].Name,
+                typeName: cols[i].TypeName,
+                flags: ColumnFlags.None,
+                primaryKeyOrder: null,
+                collation: null,
+                defaultValue: null,
+                checkExpression: null,
+                foreignKey: null,
+                generatedExpression: null);
+        }
+        return result;
     }
 }

@@ -137,14 +137,22 @@ public static class RowValueEncoder
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int EncodedValueSize(DbValue value)
     {
-        return value.Type switch
+        switch (value.Type)
         {
-            DbType.Integer => Varint.SizeOfSigned(value.AsInteger()),
-            DbType.Real => 8,
-            DbType.Text => Varint.SizeOfUnsigned((ulong)value.AsText().Length) + value.AsText().Length,
-            DbType.Blob => Varint.SizeOfUnsigned((ulong)value.AsBlob().Length) + value.AsBlob().Length,
-            _ => throw new ArgumentOutOfRangeException(),
-        };
+            case DbType.Integer: return Varint.SizeOfSigned(value.AsInteger());
+            case DbType.Real: return 8;
+            case DbType.Text:
+            {
+                int len = value.AsText().Length;
+                return Varint.SizeOfUnsigned((ulong)len) + len;
+            }
+            case DbType.Blob:
+            {
+                int len = value.AsBlob().Length;
+                return Varint.SizeOfUnsigned((ulong)len) + len;
+            }
+            default: throw new ArgumentOutOfRangeException();
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -216,7 +224,7 @@ public static class RowValueEncoder
         switch (type)
         {
             case DbType.Integer:
-                return Varint.ReadSigned(src, out _);
+                return Varint.Skip(src); // only count bytes, no zigzag decode
             case DbType.Real:
                 return 8;
             case DbType.Text:

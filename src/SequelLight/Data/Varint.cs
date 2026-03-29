@@ -67,4 +67,15 @@ public static class Varint
         ulong zigzag = (ulong)((value << 1) ^ (value >> 63));
         return SizeOfUnsigned(zigzag);
     }
+
+    /// <summary>
+    /// Returns the number of bytes occupied by a varint without decoding its value.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int Skip(ReadOnlySpan<byte> src)
+    {
+        int i = 0;
+        while ((src[i++] & 0x80) != 0) { }
+        return i;
+    }
 }
