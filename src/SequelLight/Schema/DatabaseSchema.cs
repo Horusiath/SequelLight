@@ -1,3 +1,4 @@
+using SequelLight.Data;
 using SequelLight.Parsing.Ast;
 
 namespace SequelLight.Schema;
@@ -162,6 +163,27 @@ public sealed class DatabaseSchema
                     }
                 }
             }
+        }
+
+        // Validate AUTOINCREMENT constraints (SQLite rules):
+        // 1. At most one AUTOINCREMENT column per table
+        // 2. Must be on a column with INTEGER type affinity
+        // 3. Must be a single-column PRIMARY KEY (not part of a composite PK)
+        int autoincrementCount = 0;
+        for (int i = 0; i < columns.Length; i++)
+        {
+            if (!columns[i].IsAutoincrement)
+                continue;
+
+            autoincrementCount++;
+            if (autoincrementCount > 1)
+                throw new InvalidOperationException("A table may have at most one AUTOINCREMENT column.");
+
+            if (TypeAffinity.Resolve(columns[i].TypeName) != Data.DbType.Integer)
+                throw new InvalidOperationException("AUTOINCREMENT is only allowed on INTEGER columns.");
+
+            if (tablePkColumnNames is { Length: > 1 })
+                throw new InvalidOperationException("AUTOINCREMENT is not allowed on a composite PRIMARY KEY.");
         }
 
         // Table options — manual loop avoids LINQ Contains enumerator allocation

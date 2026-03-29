@@ -71,6 +71,33 @@ public class SchemaTests
     }
 
     [Fact]
+    public void Autoincrement_Rejected_On_NonInteger_Column()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            ApplyAll("CREATE TABLE t (id TEXT PRIMARY KEY AUTOINCREMENT)"));
+        Assert.Contains("INTEGER", ex.Message);
+    }
+
+    [Fact]
+    public void Autoincrement_Rejected_On_Multiple_Columns()
+    {
+        // Parser only allows AUTOINCREMENT after PRIMARY KEY, so the only way to get two
+        // autoincrement columns is two column-level PRIMARY KEYs. The validation should still fire.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER PRIMARY KEY AUTOINCREMENT)"));
+        Assert.Contains("at most one", ex.Message);
+    }
+
+    [Fact]
+    public void Autoincrement_Rejected_On_Composite_PrimaryKey()
+    {
+        // Column-level AUTOINCREMENT alongside a table-level composite PRIMARY KEY
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER, PRIMARY KEY (a, b))"));
+        Assert.Contains("composite", ex.Message);
+    }
+
+    [Fact]
     public void CreateTable_ColumnPrimaryKeyWithOrder()
     {
         var schema = ApplyAll("CREATE TABLE t (id INTEGER PRIMARY KEY DESC)");
