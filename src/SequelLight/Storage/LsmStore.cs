@@ -541,6 +541,8 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
     /// Creates a merged cursor that includes uncommitted local writes (highest priority),
     /// the memtable snapshot, and all SSTables visible to this transaction.
     /// The cursor is a snapshot of local writes at creation time.
+    /// The returned cursor supports <see cref="Cursor.DeleteAsync"/> to remove
+    /// the entry at the current position.
     /// </summary>
     public override Cursor CreateCursor()
     {
@@ -556,7 +558,8 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
             if (reader is not null)
                 children.Add(reader.CreateCursor());
         }
-        return new MergingCursor(children.ToArray());
+        var inner = new MergingCursor(children.ToArray());
+        return new WritableCursor(inner, Delete);
     }
 
     public async ValueTask<bool> CommitAsync()

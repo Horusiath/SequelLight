@@ -615,4 +615,253 @@ public class TransactionCursorTests : TempDirTest
 
         Assert.Equal(["d", "c", "b", "a"], keys);
     }
+
+    [Fact]
+    public async Task Delete_Invalidates_Cursor_Position()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        Assert.True(cursor.IsValid);
+
+        await cursor.DeleteAsync();
+        Assert.False(cursor.IsValid);
+    }
+
+    [Fact]
+    public async Task Delete_Then_MoveNext_Goes_To_Next_Entry()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        await cursor.DeleteAsync();
+
+        Assert.True(await cursor.MoveNextAsync());
+        Assert.True(cursor.IsValid);
+        Assert.Equal("c", Str(cursor.CurrentKey));
+    }
+
+    [Fact]
+    public async Task Delete_Then_MovePrev_Goes_To_Previous_Entry()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        await cursor.DeleteAsync();
+
+        Assert.True(await cursor.MovePrevAsync());
+        Assert.True(cursor.IsValid);
+        Assert.Equal("a", Str(cursor.CurrentKey));
+    }
+
+    [Fact]
+    public async Task Delete_First_Entry_Then_MoveNext()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("a")));
+        await cursor.DeleteAsync();
+
+        Assert.True(await cursor.MoveNextAsync());
+        Assert.Equal("b", Str(cursor.CurrentKey));
+    }
+
+    [Fact]
+    public async Task Delete_First_Entry_Then_MovePrev_Returns_False()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("a")));
+        await cursor.DeleteAsync();
+
+        Assert.False(await cursor.MovePrevAsync());
+        Assert.False(cursor.IsValid);
+    }
+
+    [Fact]
+    public async Task Delete_Last_Entry_Then_MoveNext_Returns_False()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekToLastAsync());
+        Assert.Equal("b", Str(cursor.CurrentKey));
+        await cursor.DeleteAsync();
+
+        Assert.False(await cursor.MoveNextAsync());
+        Assert.False(cursor.IsValid);
+    }
+
+    [Fact]
+    public async Task Delete_Last_Entry_Then_MovePrev()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekToLastAsync());
+        await cursor.DeleteAsync();
+
+        Assert.True(await cursor.MovePrevAsync());
+        Assert.Equal("a", Str(cursor.CurrentKey));
+    }
+
+    [Fact]
+    public async Task Delete_Commits_Tombstone_To_Transaction()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using (var cursor = rwTx.CreateCursor())
+        {
+            Assert.True(await cursor.SeekAsync(Key("b")));
+            await cursor.DeleteAsync();
+        }
+
+        // The deletion should be recorded in the transaction
+        var result = await rwTx.GetAsync(Key("b"));
+        Assert.Null(result);
+
+        // Committing should persist the delete
+        await rwTx.CommitAsync();
+
+        using var ro = store.BeginReadOnly();
+        Assert.Null(await ro.GetAsync(Key("b")));
+        Assert.Equal("1"u8.ToArray(), await ro.GetAsync(Key("a")));
+    }
+
+    [Fact]
+    public async Task Delete_On_ReadOnly_Cursor_Throws()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            await tx.CommitAsync();
+        }
+
+        using var ro = store.BeginReadOnly();
+        await using var cursor = ro.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("a")));
+        await Assert.ThrowsAsync<NotSupportedException>(() => cursor.DeleteAsync().AsTask());
+    }
+
+    [Fact]
+    public async Task Delete_On_Invalid_Cursor_Throws()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using var rwTx = store.BeginReadWrite();
+        rwTx.Put(Key("a"), Val("1"));
+        await using var cursor = rwTx.CreateCursor();
+
+        // Cursor not yet seeked — not valid
+        await Assert.ThrowsAsync<InvalidOperationException>(() => cursor.DeleteAsync().AsTask());
+    }
+
+    [Fact]
+    public async Task Delete_Then_Seek_Resumes_Normally()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        await cursor.DeleteAsync();
+        Assert.False(cursor.IsValid);
+
+        // Seeking after delete should work normally
+        Assert.True(await cursor.SeekAsync(Key("a")));
+        Assert.True(cursor.IsValid);
+        Assert.Equal("a", Str(cursor.CurrentKey));
+    }
+
 }

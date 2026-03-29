@@ -39,6 +39,14 @@ public abstract class Cursor : IAsyncDisposable
     /// </summary>
     public abstract ValueTask<bool> MovePrevAsync();
 
+    /// <summary>
+    /// Deletes the entry at the current cursor position. After this call,
+    /// IsValid returns false and CurrentKey/CurrentValue must not be accessed.
+    /// MoveNextAsync/MovePrevAsync still work — they navigate relative to
+    /// the position of the deleted entry.
+    /// </summary>
+    public virtual ValueTask DeleteAsync() => throw new NotSupportedException();
+
     public abstract ValueTask DisposeAsync();
 }
 
@@ -590,4 +598,74 @@ internal sealed class MergingCursor : Cursor
         for (int i = 0; i < _children.Length; i++)
             await _children[i].DisposeAsync().ConfigureAwait(false);
     }
+}
+
+/// <summary>
+/// Wraps an inner cursor and a read-write transaction to support deleting the
+/// entry at the current position. After <see cref="DeleteAsync"/>, the cursor
+/// becomes invalid but retains its position so that
+/// <see cref="MoveNextAsync"/>/<see cref="MovePrevAsync"/> can resume navigation.
+/// </summary>
+internal sealed class WritableCursor : Cursor
+{
+    private readonly Cursor _inner;
+    private readonly Action<byte[]> _deleteCallback;
+    private bool _deleted;
+
+    internal WritableCursor(Cursor inner, Action<byte[]> deleteCallback)
+    {
+        _inner = inner;
+        _deleteCallback = deleteCallback;
+    }
+
+    public override bool IsValid => !_deleted && _inner.IsValid;
+
+    public override ReadOnlyMemory<byte> CurrentKey => _inner.CurrentKey;
+    public override ReadOnlyMemory<byte> CurrentValue => _inner.CurrentValue;
+    public override bool IsTombstone => _inner.IsTombstone;
+
+    public override ValueTask<bool> SeekAsync(byte[] target)
+    {
+        _deleted = false;
+        return _inner.SeekAsync(target);
+    }
+
+    public override ValueTask<bool> SeekToLastAsync()
+    {
+        _deleted = false;
+        return _inner.SeekToLastAsync();
+    }
+
+    public override async ValueTask<bool> MoveNextAsync()
+    {
+        if (_deleted)
+        {
+            // Inner cursor is still positioned on the (now-deleted) entry.
+            // Advance past it.
+            _deleted = false;
+            return await _inner.MoveNextAsync().ConfigureAwait(false);
+        }
+        return await _inner.MoveNextAsync().ConfigureAwait(false);
+    }
+
+    public override async ValueTask<bool> MovePrevAsync()
+    {
+        if (_deleted)
+        {
+            _deleted = false;
+            return await _inner.MovePrevAsync().ConfigureAwait(false);
+        }
+        return await _inner.MovePrevAsync().ConfigureAwait(false);
+    }
+
+    public override ValueTask DeleteAsync()
+    {
+        if (!_inner.IsValid)
+            throw new InvalidOperationException("Cursor is not positioned on a valid entry.");
+        _deleteCallback(_inner.CurrentKey.ToArray());
+        _deleted = true;
+        return ValueTask.CompletedTask;
+    }
+
+    public override ValueTask DisposeAsync() => _inner.DisposeAsync();
 }
