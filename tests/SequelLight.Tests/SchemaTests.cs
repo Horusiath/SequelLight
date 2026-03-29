@@ -21,7 +21,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_BasicColumns()
     {
-        var schema = ApplyAll("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)");
+        var schema = ApplyAll("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
 
         var table = schema.GetTable("users");
         Assert.NotNull(table);
@@ -41,7 +41,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnWithoutType()
     {
-        var schema = ApplyAll("CREATE TABLE t (x)");
+        var schema = ApplyAll("CREATE TABLE t (x PRIMARY KEY)");
 
         var table = schema.GetTable("t")!;
         Assert.Null(table.Columns[0].TypeName);
@@ -50,7 +50,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_Temporary()
     {
-        var schema = ApplyAll("CREATE TEMP TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TEMP TABLE t (x INTEGER PRIMARY KEY)");
 
         Assert.True(schema.GetTable("t")!.IsTemporary);
     }
@@ -98,6 +98,22 @@ public class SchemaTests
     }
 
     [Fact]
+    public void CreateTable_Without_PrimaryKey_Rejected()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            ApplyAll("CREATE TABLE t (x INTEGER, y TEXT)"));
+        Assert.Contains("PRIMARY KEY", ex.Message);
+    }
+
+    [Fact]
+    public void CreateTable_SingleColumn_Without_PrimaryKey_Rejected()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            ApplyAll("CREATE TABLE t (x INTEGER)"));
+        Assert.Contains("PRIMARY KEY", ex.Message);
+    }
+
+    [Fact]
     public void CreateTable_ColumnPrimaryKeyWithOrder()
     {
         var schema = ApplyAll("CREATE TABLE t (id INTEGER PRIMARY KEY DESC)");
@@ -110,7 +126,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnNotNull()
     {
-        var schema = ApplyAll("CREATE TABLE t (name TEXT NOT NULL)");
+        var schema = ApplyAll("CREATE TABLE t (name TEXT PRIMARY KEY NOT NULL)");
 
         Assert.True(schema.GetTable("t")!.Columns[0].IsNotNull);
     }
@@ -118,7 +134,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnUnique()
     {
-        var schema = ApplyAll("CREATE TABLE t (email TEXT UNIQUE)");
+        var schema = ApplyAll("CREATE TABLE t (email TEXT PRIMARY KEY UNIQUE)");
 
         Assert.True(schema.GetTable("t")!.Columns[0].IsUnique);
     }
@@ -126,7 +142,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnDefault()
     {
-        var schema = ApplyAll("CREATE TABLE t (age INTEGER DEFAULT 0)");
+        var schema = ApplyAll("CREATE TABLE t (age INTEGER PRIMARY KEY DEFAULT 0)");
 
         var col = schema.GetTable("t")!.Columns[0];
         Assert.NotNull(col.DefaultValue);
@@ -137,7 +153,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnCheck()
     {
-        var schema = ApplyAll("CREATE TABLE t (age INTEGER CHECK (age >= 0))");
+        var schema = ApplyAll("CREATE TABLE t (age INTEGER PRIMARY KEY CHECK (age >= 0))");
 
         Assert.NotNull(schema.GetTable("t")!.Columns[0].CheckExpression);
     }
@@ -145,7 +161,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_ColumnCollate()
     {
-        var schema = ApplyAll("CREATE TABLE t (name TEXT COLLATE NOCASE)");
+        var schema = ApplyAll("CREATE TABLE t (name TEXT PRIMARY KEY COLLATE NOCASE)");
 
         Assert.Equal("NOCASE", schema.GetTable("t")!.Columns[0].Collation);
     }
@@ -155,7 +171,7 @@ public class SchemaTests
     {
         var schema = ApplyAll(
             "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)");
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)");
 
         var col = schema.GetTable("orders")!.Columns[1];
         Assert.NotNull(col.ForeignKey);
@@ -167,7 +183,7 @@ public class SchemaTests
     public void CreateTable_ColumnGenerated()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)");
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)");
 
         var col = schema.GetTable("t")!.Columns[2];
         Assert.NotNull(col.GeneratedExpression);
@@ -193,7 +209,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_TableUniqueConstraint()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT, UNIQUE (a, b))");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, UNIQUE (a, b))");
 
         var table = schema.GetTable("t")!;
         Assert.Single(table.UniqueConstraints);
@@ -203,7 +219,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_TableCheckConstraint()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > b))");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, CHECK (a > b))");
 
         var table = schema.GetTable("t")!;
         Assert.Single(table.CheckConstraints);
@@ -215,7 +231,7 @@ public class SchemaTests
     {
         var schema = ApplyAll(
             "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE orders (id INTEGER, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)");
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)");
 
         var table = schema.GetTable("orders")!;
         Assert.Single(table.ForeignKeys);
@@ -237,7 +253,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_Strict()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER) STRICT");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY) STRICT");
 
         Assert.True(schema.GetTable("t")!.IsStrict);
     }
@@ -258,7 +274,7 @@ public class SchemaTests
     public void CreateTable_IfNotExists_Noop()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TABLE IF NOT EXISTS t (y TEXT)");
 
         // Original table preserved
@@ -270,7 +286,7 @@ public class SchemaTests
     [Fact]
     public void CreateTable_Duplicate_Throws()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
         var stmt = SqlParser.Parse("CREATE TABLE t (y TEXT)");
 
         Assert.Throws<InvalidOperationException>(() => schema.Apply(stmt));
@@ -291,7 +307,7 @@ public class SchemaTests
     public void CreateIndex_Basic()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
             "CREATE INDEX idx ON t (a)");
 
         var index = schema.GetIndex("idx");
@@ -307,7 +323,7 @@ public class SchemaTests
     public void CreateIndex_Unique()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE UNIQUE INDEX idx ON t (a)");
 
         Assert.True(schema.GetIndex("idx")!.IsUnique);
@@ -317,7 +333,7 @@ public class SchemaTests
     public void CreateIndex_MultiColumn()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER, b TEXT, c REAL)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)",
             "CREATE INDEX idx ON t (a, b DESC)");
 
         var index = schema.GetIndex("idx")!;
@@ -329,7 +345,7 @@ public class SchemaTests
     public void CreateIndex_Partial()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (a) WHERE a > 0");
 
         Assert.NotNull(schema.GetIndex("idx")!.Where);
@@ -339,7 +355,7 @@ public class SchemaTests
     public void CreateIndex_IfNotExists_Noop()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (a)",
             "CREATE INDEX IF NOT EXISTS idx ON t (a)");
 
@@ -350,7 +366,7 @@ public class SchemaTests
     public void CreateIndex_Duplicate_Throws()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (a)");
 
         Assert.Throws<InvalidOperationException>(() =>
@@ -426,7 +442,7 @@ public class SchemaTests
     public void CreateTrigger_Basic()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
         var trigger = schema.GetTrigger("trg");
@@ -444,7 +460,7 @@ public class SchemaTests
     public void CreateTrigger_BeforeDelete_ForEachRow()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg BEFORE DELETE ON t FOR EACH ROW BEGIN SELECT 1; END");
 
         var trigger = schema.GetTrigger("trg")!;
@@ -466,7 +482,7 @@ public class SchemaTests
     public void CreateTrigger_Duplicate_Throws()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
         Assert.Throws<InvalidOperationException>(() =>
@@ -479,7 +495,7 @@ public class SchemaTests
     public void DropTable_Removes()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "DROP TABLE t");
 
         Assert.Null(schema.GetTable("t"));
@@ -489,7 +505,7 @@ public class SchemaTests
     public void DropTable_CascadesIndexesAndTriggers()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
             "DROP TABLE t");
@@ -520,7 +536,7 @@ public class SchemaTests
     public void DropIndex_Removes()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "DROP INDEX idx");
 
@@ -542,7 +558,7 @@ public class SchemaTests
     public void DropTrigger_Removes()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
             "DROP TRIGGER trg");
 
@@ -556,7 +572,7 @@ public class SchemaTests
     public void AlterTable_RenameTable()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "ALTER TABLE t RENAME TO t2");
 
@@ -574,7 +590,7 @@ public class SchemaTests
     public void AlterTable_RenameColumn()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (old_name TEXT, other INTEGER)",
+            "CREATE TABLE t (old_name TEXT PRIMARY KEY, other INTEGER)",
             "ALTER TABLE t RENAME COLUMN old_name TO new_name");
 
         var table = schema.GetTable("t")!;
@@ -585,7 +601,7 @@ public class SchemaTests
     [Fact]
     public void AlterTable_RenameColumn_Missing_Throws()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
 
         Assert.Throws<InvalidOperationException>(() =>
             schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME COLUMN nonexistent TO y")));
@@ -595,7 +611,7 @@ public class SchemaTests
     public void AlterTable_AddColumn()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "ALTER TABLE t ADD COLUMN y TEXT NOT NULL DEFAULT 'hello'");
 
         var table = schema.GetTable("t")!;
@@ -611,7 +627,7 @@ public class SchemaTests
     public void AlterTable_DropColumn()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER, y TEXT, z REAL)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT, z REAL)",
             "ALTER TABLE t DROP COLUMN y");
 
         var table = schema.GetTable("t")!;
@@ -623,7 +639,7 @@ public class SchemaTests
     [Fact]
     public void AlterTable_DropColumn_Missing_Throws()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
 
         Assert.Throws<InvalidOperationException>(() =>
             schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN nonexistent")));
@@ -644,7 +660,7 @@ public class SchemaTests
     public void Lookup_CaseInsensitive()
     {
         var schema = ApplyAll(
-            "CREATE TABLE Users (id INTEGER)",
+            "CREATE TABLE Users (id INTEGER PRIMARY KEY)",
             "CREATE INDEX idx_users ON Users (id)",
             "CREATE VIEW UserView AS SELECT id FROM Users");
 
@@ -714,7 +730,7 @@ public class SchemaTests
     [Fact]
     public void Oid_AssignedOnCreate()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
 
         var table = schema.GetTable("t")!;
         Assert.NotEqual(Oid.None, table.Oid);
@@ -724,8 +740,8 @@ public class SchemaTests
     public void Oid_MonotonicallyIncreasing()
     {
         var schema = ApplyAll(
-            "CREATE TABLE a (x INTEGER)",
-            "CREATE TABLE b (x INTEGER)",
+            "CREATE TABLE a (x INTEGER PRIMARY KEY)",
+            "CREATE TABLE b (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON b (x)",
             "CREATE VIEW v AS SELECT 1");
 
@@ -743,7 +759,7 @@ public class SchemaTests
     public void Oid_UniqueAcrossObjectTypes()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE VIEW v AS SELECT 1",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
@@ -762,7 +778,7 @@ public class SchemaTests
     public void Oid_LookupByOid()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE VIEW v AS SELECT 1",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
@@ -791,7 +807,7 @@ public class SchemaTests
     public void Oid_StableAfterRenameTable()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
@@ -823,7 +839,7 @@ public class SchemaTests
     [Fact]
     public void Oid_StableAfterRenameColumn()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
         var oidBefore = schema.GetTable("t")!.Oid;
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME COLUMN x TO y"));
@@ -834,7 +850,7 @@ public class SchemaTests
     [Fact]
     public void Oid_StableAfterAddColumn()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY)");
         var oidBefore = schema.GetTable("t")!.Oid;
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
@@ -845,7 +861,7 @@ public class SchemaTests
     [Fact]
     public void Oid_StableAfterDropColumn()
     {
-        var schema = ApplyAll("CREATE TABLE t (x INTEGER, y TEXT)");
+        var schema = ApplyAll("CREATE TABLE t (x INTEGER PRIMARY KEY, y TEXT)");
         var oidBefore = schema.GetTable("t")!.Oid;
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN y"));
@@ -857,9 +873,9 @@ public class SchemaTests
     public void Oid_NotReusedAfterDrop()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "DROP TABLE t",
-            "CREATE TABLE t (y TEXT)");
+            "CREATE TABLE t (y TEXT PRIMARY KEY)");
 
         // New table gets a different (higher) Oid
         var table = schema.GetTable("t")!;
@@ -870,7 +886,7 @@ public class SchemaTests
     public void Oid_IndexAndTrigger_ReferenceTableByOid()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
@@ -883,7 +899,7 @@ public class SchemaTests
     public void Oid_DropTableCascade_ClearsOidMappings()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
@@ -906,7 +922,7 @@ public class SchemaTests
     public void Oid_MatchesBetweenNameAndOidLookup()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)");
 
         var tableByName = schema.GetTable("t")!;
@@ -923,7 +939,7 @@ public class SchemaTests
     [Fact]
     public void ColumnSeqNo_AssignedStartingAtOne()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT, c REAL)");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)");
 
         var cols = schema.GetTable("t")!.Columns;
         Assert.Equal(1, cols[0].SeqNo);
@@ -934,7 +950,7 @@ public class SchemaTests
     [Fact]
     public void ColumnSeqNo_StableAfterRenameColumn()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
         var seqBefore = schema.GetTable("t")!.Columns[0].SeqNo;
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME COLUMN a TO z"));
@@ -948,7 +964,7 @@ public class SchemaTests
     public void ColumnSeqNo_AddedColumnGetsNextSeq()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
             "ALTER TABLE t ADD COLUMN c REAL");
 
         var cols = schema.GetTable("t")!.Columns;
@@ -961,7 +977,7 @@ public class SchemaTests
     public void ColumnSeqNo_NotReusedAfterDrop()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (a INTEGER, b TEXT, c REAL)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)",
             "ALTER TABLE t DROP COLUMN b",
             "ALTER TABLE t ADD COLUMN d INTEGER");
 
@@ -974,7 +990,7 @@ public class SchemaTests
     [Fact]
     public void ColumnSeqNo_MultipleDropAndAdd()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT, c REAL)");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)");
 
         // Drop all original columns except 'a', then add two new ones
         schema.Apply(SqlParser.Parse("ALTER TABLE t DROP COLUMN b"));
@@ -992,7 +1008,7 @@ public class SchemaTests
     [Fact]
     public void ColumnSeqNo_NextColumnSeqNoTracked()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
 
         var table = schema.GetTable("t")!;
         Assert.Equal(3, table.NextColumnSeqNo); // next after 1,2
@@ -1011,8 +1027,8 @@ public class SchemaTests
     public void ColumnSeqNo_IndependentPerTable()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t1 (a INTEGER, b TEXT)",
-            "CREATE TABLE t2 (x REAL, y INTEGER, z TEXT)");
+            "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT)",
+            "CREATE TABLE t2 (x REAL PRIMARY KEY, y INTEGER, z TEXT)");
 
         var cols1 = schema.GetTable("t1")!.Columns;
         var cols2 = schema.GetTable("t2")!.Columns;
@@ -1029,7 +1045,7 @@ public class SchemaTests
     [Fact]
     public void ColumnSeqNo_PreservedAcrossTableRename()
     {
-        var schema = ApplyAll("CREATE TABLE t (a INTEGER, b TEXT)");
+        var schema = ApplyAll("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
         var seqA = schema.GetTable("t")!.Columns[0].SeqNo;
         var seqB = schema.GetTable("t")!.Columns[1].SeqNo;
 
@@ -1117,7 +1133,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_BasicColumns()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)");
+        var (orig, rt) = Roundtrip("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
 
         var expected = orig.GetTable("users")!;
         var actual = rt.GetTable("users")!;
@@ -1127,7 +1143,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnWithoutType()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (x)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (x PRIMARY KEY)");
 
         var actual = rt.GetTable("t")!;
         Assert.Single(actual.Columns);
@@ -1137,7 +1153,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_Temporary()
     {
-        var (_, rt) = Roundtrip("CREATE TEMP TABLE t (x INTEGER)");
+        var (_, rt) = Roundtrip("CREATE TEMP TABLE t (x INTEGER PRIMARY KEY)");
         Assert.True(rt.GetTable("t")!.IsTemporary);
     }
 
@@ -1157,7 +1173,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnNotNull()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT NOT NULL)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT PRIMARY KEY NOT NULL)");
 
         var actual = rt.GetTable("t")!;
         Assert.True(actual.Columns[0].IsNotNull);
@@ -1167,7 +1183,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnUnique()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (email TEXT UNIQUE)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (email TEXT PRIMARY KEY UNIQUE)");
 
         var actual = rt.GetTable("t")!;
         Assert.True(actual.Columns[0].IsUnique);
@@ -1177,7 +1193,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnDefault()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER DEFAULT 0)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER PRIMARY KEY DEFAULT 0)");
 
         var actual = rt.GetTable("t")!;
         Assert.NotNull(actual.Columns[0].DefaultValue);
@@ -1189,7 +1205,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnDefaultNegative()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (val REAL DEFAULT -1.5)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (val REAL PRIMARY KEY DEFAULT -1.5)");
 
         var actual = rt.GetTable("t")!;
         var literal = Assert.IsType<LiteralExpr>(actual.Columns[0].DefaultValue);
@@ -1199,7 +1215,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnDefaultString()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT DEFAULT 'hello')");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT PRIMARY KEY DEFAULT 'hello')");
 
         var actual = rt.GetTable("t")!;
         var literal = Assert.IsType<LiteralExpr>(actual.Columns[0].DefaultValue);
@@ -1209,7 +1225,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnCheck()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER CHECK (age >= 0))");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER PRIMARY KEY CHECK (age >= 0))");
 
         var actual = rt.GetTable("t")!;
         Assert.NotNull(actual.Columns[0].CheckExpression);
@@ -1219,7 +1235,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_ColumnCollate()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT COLLATE NOCASE)");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT PRIMARY KEY COLLATE NOCASE)");
 
         var actual = rt.GetTable("t")!;
         Assert.Equal("NOCASE", actual.Columns[0].Collation);
@@ -1231,7 +1247,7 @@ public class SchemaTests
     {
         var (orig, rt) = Roundtrip(
             "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)");
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)");
 
         var actual = rt.GetTable("orders")!;
         Assert.NotNull(actual.Columns[1].ForeignKey);
@@ -1244,7 +1260,7 @@ public class SchemaTests
     public void Roundtrip_Table_ColumnGenerated()
     {
         var (orig, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)");
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)");
 
         var actual = rt.GetTable("t")!;
         Assert.NotNull(actual.Columns[2].GeneratedExpression);
@@ -1268,7 +1284,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_UniqueConstraint()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER, b TEXT, UNIQUE (a, b))");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, UNIQUE (a, b))");
 
         var actual = rt.GetTable("t")!;
         Assert.Single(actual.UniqueConstraints);
@@ -1279,7 +1295,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_CheckConstraint()
     {
-        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > b))");
+        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, CHECK (a > b))");
 
         var actual = rt.GetTable("t")!;
         Assert.Single(actual.CheckConstraints);
@@ -1291,7 +1307,7 @@ public class SchemaTests
     {
         var (orig, rt) = Roundtrip(
             "CREATE TABLE users (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE orders (id INTEGER, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)");
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)");
 
         var actual = rt.GetTable("orders")!;
         Assert.Single(actual.ForeignKeys);
@@ -1312,7 +1328,7 @@ public class SchemaTests
     [Fact]
     public void Roundtrip_Table_Strict()
     {
-        var (_, rt) = Roundtrip("CREATE TABLE t (x INTEGER) STRICT");
+        var (_, rt) = Roundtrip("CREATE TABLE t (x INTEGER PRIMARY KEY) STRICT");
         Assert.True(rt.GetTable("t")!.IsStrict);
     }
 
@@ -1363,7 +1379,7 @@ public class SchemaTests
     public void Roundtrip_Index_Basic()
     {
         var (orig, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
             "CREATE INDEX idx ON t (a)");
 
         var expected = orig.GetIndex("idx")!;
@@ -1378,7 +1394,7 @@ public class SchemaTests
     public void Roundtrip_Index_Unique()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE UNIQUE INDEX idx ON t (a)");
 
         Assert.True(rt.GetIndex("idx")!.IsUnique);
@@ -1388,7 +1404,7 @@ public class SchemaTests
     public void Roundtrip_Index_MultiColumnWithOrder()
     {
         var (orig, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER, b TEXT, c REAL)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)",
             "CREATE INDEX idx ON t (a, b DESC)");
 
         var actual = rt.GetIndex("idx")!;
@@ -1400,7 +1416,7 @@ public class SchemaTests
     public void Roundtrip_Index_Partial()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (a) WHERE a > 0");
 
         Assert.NotNull(rt.GetIndex("idx")!.Where);
@@ -1443,7 +1459,7 @@ public class SchemaTests
     public void Roundtrip_View_ComplexSelect()
     {
         var (orig, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
             "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 0 ORDER BY b");
 
         var actual = rt.GetView("v")!;
@@ -1456,7 +1472,7 @@ public class SchemaTests
     public void Roundtrip_Trigger_AfterInsert()
     {
         var (orig, rt) = Roundtrip(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
         var actual = rt.GetTrigger("trg")!;
@@ -1472,7 +1488,7 @@ public class SchemaTests
     public void Roundtrip_Trigger_BeforeDeleteForEachRow()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg BEFORE DELETE ON t FOR EACH ROW BEGIN SELECT 1; END");
 
         var actual = rt.GetTrigger("trg")!;
@@ -1485,7 +1501,7 @@ public class SchemaTests
     public void Roundtrip_Trigger_UpdateWithColumns()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
             "CREATE TRIGGER trg AFTER UPDATE OF a, b ON t BEGIN SELECT 1; END");
 
         var actual = rt.GetTrigger("trg")!;
@@ -1498,7 +1514,7 @@ public class SchemaTests
     public void Roundtrip_Trigger_WithWhenClause()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg BEFORE INSERT ON t WHEN NEW.x > 0 BEGIN SELECT 1; END");
 
         Assert.NotNull(rt.GetTrigger("trg")!.When);
@@ -1508,7 +1524,7 @@ public class SchemaTests
     public void Roundtrip_Trigger_Temporary()
     {
         var (_, rt) = Roundtrip(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TEMP TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
         Assert.True(rt.GetTrigger("trg")!.IsTemporary);
@@ -1537,7 +1553,7 @@ public class SchemaTests
     public void Roundtrip_IndexTableNameUpdatedOnRename()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE INDEX idx ON t (x)");
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
@@ -1554,7 +1570,7 @@ public class SchemaTests
     public void Roundtrip_TriggerTableNameUpdatedOnRename()
     {
         var schema = ApplyAll(
-            "CREATE TABLE t (x INTEGER)",
+            "CREATE TABLE t (x INTEGER PRIMARY KEY)",
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
 
         schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
@@ -1590,7 +1606,7 @@ public class SchemaTests
     public void DDLToRow_CreateIndex()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER, b TEXT)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"));
         var changes = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (a, b)"));
 
         Assert.Single(changes);
@@ -1606,7 +1622,7 @@ public class SchemaTests
     public void DDLToRow_CreateUniqueIndex()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER PRIMARY KEY)"));
         var changes = schema.Apply(SqlParser.Parse("CREATE UNIQUE INDEX idx ON t (a)"));
 
         var c = changes[0];
@@ -1634,7 +1650,7 @@ public class SchemaTests
     public void DDLToRow_CreateTrigger()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         var changes = schema.Apply(SqlParser.Parse(
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
 
@@ -1651,7 +1667,7 @@ public class SchemaTests
     public void DDLToRow_CreateTable_IfNotExists_NoChange()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         var changes = schema.Apply(SqlParser.Parse("CREATE TABLE IF NOT EXISTS t (y TEXT)"));
 
         Assert.Empty(changes);
@@ -1661,8 +1677,8 @@ public class SchemaTests
     public void DDLToRow_OidsAreIncrementing()
     {
         var schema = new DatabaseSchema();
-        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER)"));
-        var c2 = schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT)"));
+        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER PRIMARY KEY)"));
+        var c2 = schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT PRIMARY KEY)"));
         var c3 = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t1 (x)"));
 
         Assert.Equal(1L, c1[0].Row[0].AsInteger());
@@ -1674,7 +1690,7 @@ public class SchemaTests
     public void DDLToRow_DropTable_DeletesTableAndDependents()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
         schema.Apply(SqlParser.Parse(
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
@@ -1692,7 +1708,7 @@ public class SchemaTests
     public void DDLToRow_DropIndex()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
 
         var changes = schema.Apply(SqlParser.Parse("DROP INDEX idx"));
@@ -1715,7 +1731,7 @@ public class SchemaTests
     public void DDLToRow_AlterTable_RenameUpdatesAllDependents()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (x)"));
         schema.Apply(SqlParser.Parse(
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
@@ -1744,7 +1760,7 @@ public class SchemaTests
     public void DDLToRow_AlterTable_AddColumn()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER)"));
+        schema.Apply(SqlParser.Parse("CREATE TABLE t (x INTEGER PRIMARY KEY)"));
         var changes = schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
 
         Assert.Single(changes);
@@ -1804,11 +1820,11 @@ public class SchemaTests
     public void DDLToRow_Oids_NeverReusedAfterDrop()
     {
         var schema = new DatabaseSchema();
-        schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER)")); // oid=1
-        schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT)"));    // oid=2
+        schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER PRIMARY KEY)")); // oid=1
+        schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT PRIMARY KEY)"));    // oid=2
         schema.Apply(SqlParser.Parse("DROP TABLE t1"));               // deletes oid=1
 
-        var changes = schema.Apply(SqlParser.Parse("CREATE TABLE t3 (z REAL)")); // oid=3, not 1
+        var changes = schema.Apply(SqlParser.Parse("CREATE TABLE t3 (z REAL PRIMARY KEY)")); // oid=3, not 1
 
         Assert.Equal(3L, changes[0].Row[0].AsInteger());
     }
@@ -1817,7 +1833,7 @@ public class SchemaTests
     public void DDLToRow_AllObjectTypes_GetUniqueOids()
     {
         var schema = new DatabaseSchema();
-        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER, b TEXT)"));
+        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"));
         var c2 = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (a)"));
         var c3 = schema.Apply(SqlParser.Parse("CREATE VIEW v AS SELECT a FROM t"));
         var c4 = schema.Apply(SqlParser.Parse(

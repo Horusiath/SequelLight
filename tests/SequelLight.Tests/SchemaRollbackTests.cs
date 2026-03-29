@@ -18,7 +18,7 @@ public class SchemaRollbackTests : TempDirTest
         {
             var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             Assert.NotNull(conn.Db!.Schema.GetTable("t"));
@@ -64,7 +64,7 @@ public class SchemaRollbackTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         await using (var tx = conn.BeginTransaction())
@@ -90,7 +90,7 @@ public class SchemaRollbackTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         var originalColCount = conn.Db!.Schema.GetTable("t")!.Columns.Count;
@@ -116,7 +116,7 @@ public class SchemaRollbackTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         await using (var tx = conn.BeginTransaction())
@@ -140,7 +140,7 @@ public class SchemaRollbackTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
         cmd.CommandText = "CREATE INDEX idx ON t (x)";
         await cmd.ExecuteNonQueryAsync();
@@ -171,7 +171,7 @@ public class SchemaRollbackTests : TempDirTest
         {
             var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             Assert.NotNull(conn.Db!.Schema.GetTable("t"));
@@ -190,7 +190,7 @@ public class SchemaRollbackTests : TempDirTest
         {
             var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             await tx.CommitAsync();

@@ -55,7 +55,7 @@ public class DdlExecutionTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (a INTEGER, b TEXT)";
+        cmd.CommandText = "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
         await cmd.ExecuteNonQueryAsync();
 
         cmd.CommandText = "CREATE INDEX idx ON t (a)";
@@ -79,7 +79,7 @@ public class DdlExecutionTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         cmd.CommandText = "DROP TABLE t";
@@ -95,7 +95,7 @@ public class DdlExecutionTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
         cmd.CommandText = "CREATE INDEX idx ON t (x)";
         await cmd.ExecuteNonQueryAsync();
@@ -118,7 +118,7 @@ public class DdlExecutionTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         cmd.CommandText = "ALTER TABLE t ADD COLUMN y TEXT";
@@ -142,7 +142,7 @@ public class DdlExecutionTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         cmd.CommandText = "CREATE TABLE IF NOT EXISTS t (y TEXT)";
@@ -158,7 +158,7 @@ public class DdlExecutionTests : TempDirTest
 
         var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         // Before commit: not visible from a separate read-only snapshot
@@ -178,7 +178,7 @@ public class DdlExecutionTests : TempDirTest
         {
             var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             await tx.RollbackAsync();

@@ -186,6 +186,10 @@ public sealed class DatabaseSchema
                 throw new InvalidOperationException("AUTOINCREMENT is not allowed on a composite PRIMARY KEY.");
         }
 
+        // Every table must have a primary key with at least one column
+        if (primaryKey is null || primaryKey.Columns.Count == 0)
+            throw new InvalidOperationException($"Table '{stmt.Table}' must have a PRIMARY KEY.");
+
         // Table options — manual loop avoids LINQ Contains enumerator allocation
         bool withoutRowId = false;
         bool isStrict = false;

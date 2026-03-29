@@ -56,7 +56,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
             cmd.CommandText = "DROP TABLE t";
             await cmd.ExecuteNonQueryAsync();
@@ -75,9 +75,9 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t1 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t1 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
-            cmd.CommandText = "CREATE TABLE t2 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t2 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             firstOid = conn.Db!.Schema.GetTableOid("t2");
@@ -86,7 +86,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t3 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t3 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             var newOid = conn.Db!.Schema.GetTableOid("t3");
@@ -102,9 +102,9 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t1 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t1 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
-            cmd.CommandText = "CREATE TABLE t2 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t2 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
             // Drop the highest-OID table
             cmd.CommandText = "DROP TABLE t2";
@@ -114,7 +114,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t3 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t3 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             var t1Oid = conn.Db!.Schema.GetTableOid("t1");
@@ -131,7 +131,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
             cmd.CommandText = "ALTER TABLE t RENAME TO t2";
             await cmd.ExecuteNonQueryAsync();
@@ -150,7 +150,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using (var conn = await OpenConnectionAsync())
         {
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
             cmd.CommandText = "ALTER TABLE t ADD COLUMN y TEXT";
             await cmd.ExecuteNonQueryAsync();
@@ -172,7 +172,7 @@ public class SchemaPersistenceTests : TempDirTest
         {
             // Commit t1
             var cmd = conn.CreateCommand();
-            cmd.CommandText = "CREATE TABLE t1 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t1 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
 
             // Create t2 in transaction, then rollback
@@ -180,7 +180,7 @@ public class SchemaPersistenceTests : TempDirTest
             {
                 cmd = conn.CreateCommand();
                 cmd.Transaction = tx;
-                cmd.CommandText = "CREATE TABLE t2 (x INTEGER)";
+                cmd.CommandText = "CREATE TABLE t2 (x INTEGER PRIMARY KEY)";
                 await cmd.ExecuteNonQueryAsync();
                 await tx.RollbackAsync();
             }
@@ -199,7 +199,7 @@ public class SchemaPersistenceTests : TempDirTest
         await using var conn = await OpenConnectionAsync();
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t1 (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t1 (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         var t1Oid = conn.Db!.Schema.GetTableOid("t1");
@@ -209,14 +209,14 @@ public class SchemaPersistenceTests : TempDirTest
         {
             cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = "CREATE TABLE t2 (x INTEGER)";
+            cmd.CommandText = "CREATE TABLE t2 (x INTEGER PRIMARY KEY)";
             await cmd.ExecuteNonQueryAsync();
             await tx.RollbackAsync();
         }
 
         // Next allocation should still get an OID greater than t1
         cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t3 (x INTEGER)";
+        cmd.CommandText = "CREATE TABLE t3 (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
         var t3Oid = conn.Db!.Schema.GetTableOid("t3");
