@@ -130,11 +130,23 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
     public ForeignKeyClause? ForeignKey { get; }
     public SqlExpr? GeneratedExpression { get; }
 
+    private long _autoIncrementValue;
+
     public bool IsNotNull => (Flags & ColumnFlags.NotNull) != 0;
     public bool IsPrimaryKey => (Flags & ColumnFlags.PrimaryKey) != 0;
     public bool IsAutoincrement => (Flags & ColumnFlags.Autoincrement) != 0;
     public bool IsUnique => (Flags & ColumnFlags.Unique) != 0;
     public bool IsStored => (Flags & ColumnFlags.Stored) != 0;
+
+    /// <summary>
+    /// Current autoincrement counter value. Only meaningful when <see cref="IsAutoincrement"/> is true.
+    /// </summary>
+    public long AutoIncrementValue => Interlocked.Read(ref _autoIncrementValue);
+
+    /// <summary>
+    /// Atomically increments and returns the next autoincrement value.
+    /// </summary>
+    public long NextAutoIncrement() => Interlocked.Increment(ref _autoIncrementValue);
 
     // Identity is by SeqNo within a table — avoids deep comparison of SqlExpr trees.
     public bool Equals(ColumnSchema? other) => other is not null && SeqNo == other.SeqNo;
@@ -183,10 +195,10 @@ public sealed record ForeignKeyConstraintSchema(
 public sealed class TableSchema : IEquatable<TableSchema>
 {
     /// <summary>
-    /// Root catalog table that stores metadata for all schema objects.
-    /// Always assigned Oid 0.
+    /// Creates a new root catalog table instance that stores metadata for all schema objects.
+    /// Always assigned Oid 0. Each caller gets a fresh copy with independent autoincrement state.
     /// </summary>
-    public static readonly TableSchema Root = new(
+    public static TableSchema CreateRoot() => new(
         new Oid(0),
         "__schema",
         isTemporary: false,

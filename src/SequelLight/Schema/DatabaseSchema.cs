@@ -9,7 +9,7 @@ namespace SequelLight.Schema;
 /// </summary>
 public sealed class DatabaseSchema
 {
-    private uint _nextOid;
+    public TableSchema RootTable { get; } = TableSchema.CreateRoot();
 
     private readonly Dictionary<Oid, TableSchema> _tables = new();
     private readonly Dictionary<string, Oid> _tableNames = new(StringComparer.OrdinalIgnoreCase);
@@ -75,7 +75,7 @@ public sealed class DatabaseSchema
         };
     }
 
-    private Oid AllocateOid() => new(++_nextOid);
+    private Oid AllocateOid() => new((uint)RootTable.Columns[0].NextAutoIncrement());
 
     private SchemaChange[] ApplyCreateTable(CreateTableStmt stmt)
     {

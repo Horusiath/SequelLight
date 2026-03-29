@@ -1569,6 +1569,7 @@ public class SchemaTests
         Assert.Single(changes);
         var c = changes[0];
         Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(2L, c.Row[0].AsInteger()); // table=1, index=2
         Assert.Equal((long)ObjectType.Index, c.Row[1].AsInteger());
         Assert.Equal("idx", RowText(c.Row[2]));
         Assert.Equal(schema.GetIndex("idx")!.ToString(), RowText(c.Row[3]));
@@ -1583,6 +1584,7 @@ public class SchemaTests
 
         var c = changes[0];
         Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(2L, c.Row[0].AsInteger()); // table=1, index=2
         Assert.Contains("UNIQUE", RowText(c.Row[3]));
     }
 
@@ -1595,6 +1597,7 @@ public class SchemaTests
         Assert.Single(changes);
         var c = changes[0];
         Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(1L, c.Row[0].AsInteger()); // first object
         Assert.Equal((long)ObjectType.View, c.Row[1].AsInteger());
         Assert.Equal("v", RowText(c.Row[2]));
         Assert.Equal(schema.GetView("v")!.ToString(), RowText(c.Row[3]));
@@ -1611,6 +1614,7 @@ public class SchemaTests
         Assert.Single(changes);
         var c = changes[0];
         Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(2L, c.Row[0].AsInteger()); // table=1, trigger=2
         Assert.Equal((long)ObjectType.Trigger, c.Row[1].AsInteger());
         Assert.Equal("trg", RowText(c.Row[2]));
         Assert.Equal(schema.GetTrigger("trg")!.ToString(), RowText(c.Row[3]));
@@ -1696,13 +1700,16 @@ public class SchemaTests
         Assert.All(changes, c => Assert.Equal(SchemaChangeKind.Insert, c.Kind));
 
         var tableChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Table);
+        Assert.Equal(1L, tableChange.Row[0].AsInteger()); // preserves original oid
         Assert.Equal("t2", RowText(tableChange.Row[2]));
         Assert.Contains("\"t2\"", RowText(tableChange.Row[3]));
 
         var indexChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Index);
+        Assert.Equal(2L, indexChange.Row[0].AsInteger());
         Assert.Contains("\"t2\"", RowText(indexChange.Row[3]));
 
         var triggerChange = changes.First(c => c.Row[1].AsInteger() == (long)ObjectType.Trigger);
+        Assert.Equal(3L, triggerChange.Row[0].AsInteger());
         Assert.Contains("\"t2\"", RowText(triggerChange.Row[3]));
     }
 
@@ -1716,6 +1723,7 @@ public class SchemaTests
         Assert.Single(changes);
         var c = changes[0];
         Assert.Equal(SchemaChangeKind.Insert, c.Kind);
+        Assert.Equal(1L, c.Row[0].AsInteger()); // same oid as original table
         Assert.Equal((long)ObjectType.Table, c.Row[1].AsInteger());
         Assert.Contains("\"y\"", RowText(c.Row[3]));
     }
@@ -1747,5 +1755,50 @@ public class SchemaTests
         Assert.NotNull(fresh.GetIndex("idx_total"));
         Assert.NotNull(fresh.GetView("v"));
         Assert.NotNull(fresh.GetTrigger("trg"));
+    }
+
+    // ==== Autoincrement tests ====
+
+    [Fact]
+    public void ColumnSchema_NextAutoIncrement_StartsAtOneAndIncrements()
+    {
+        var col = new ColumnSchema(1, "id", "INTEGER",
+            ColumnFlags.PrimaryKey | ColumnFlags.Autoincrement,
+            null, null, null, null, null, null);
+
+        Assert.Equal(0, col.AutoIncrementValue);
+        Assert.Equal(1, col.NextAutoIncrement());
+        Assert.Equal(2, col.NextAutoIncrement());
+        Assert.Equal(3, col.NextAutoIncrement());
+        Assert.Equal(3, col.AutoIncrementValue);
+    }
+
+    [Fact]
+    public void DDLToRow_Oids_NeverReusedAfterDrop()
+    {
+        var schema = new DatabaseSchema();
+        schema.Apply(SqlParser.Parse("CREATE TABLE t1 (x INTEGER)")); // oid=1
+        schema.Apply(SqlParser.Parse("CREATE TABLE t2 (y TEXT)"));    // oid=2
+        schema.Apply(SqlParser.Parse("DROP TABLE t1"));               // deletes oid=1
+
+        var changes = schema.Apply(SqlParser.Parse("CREATE TABLE t3 (z REAL)")); // oid=3, not 1
+
+        Assert.Equal(3L, changes[0].Row[0].AsInteger());
+    }
+
+    [Fact]
+    public void DDLToRow_AllObjectTypes_GetUniqueOids()
+    {
+        var schema = new DatabaseSchema();
+        var c1 = schema.Apply(SqlParser.Parse("CREATE TABLE t (a INTEGER, b TEXT)"));
+        var c2 = schema.Apply(SqlParser.Parse("CREATE INDEX idx ON t (a)"));
+        var c3 = schema.Apply(SqlParser.Parse("CREATE VIEW v AS SELECT a FROM t"));
+        var c4 = schema.Apply(SqlParser.Parse(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END"));
+
+        Assert.Equal(1L, c1[0].Row[0].AsInteger());
+        Assert.Equal(2L, c2[0].Row[0].AsInteger());
+        Assert.Equal(3L, c3[0].Row[0].AsInteger());
+        Assert.Equal(4L, c4[0].Row[0].AsInteger());
     }
 }
