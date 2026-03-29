@@ -135,6 +135,29 @@ public sealed record ForeignKeyConstraintSchema(
 /// </summary>
 public sealed class TableSchema : IEquatable<TableSchema>
 {
+    /// <summary>
+    /// Root catalog table that stores metadata for all schema objects.
+    /// Always assigned Oid 0.
+    /// </summary>
+    public static readonly TableSchema Root = new(
+        new Oid(0),
+        "__schema",
+        isTemporary: false,
+        withoutRowId: false,
+        isStrict: false,
+        columns:
+        [
+            new ColumnSchema(1, "oid", "INTEGER", ColumnFlags.PrimaryKey | ColumnFlags.Autoincrement, null, null, null, null, null, null),
+            new ColumnSchema(2, "type", "INTEGER", ColumnFlags.NotNull, null, null, null, null, null, null),
+            new ColumnSchema(3, "name", "TEXT", ColumnFlags.None, null, null, null, null, null, null),
+            new ColumnSchema(4, "definition", "TEXT", ColumnFlags.None, null, null, null, null, null, null),
+        ],
+        nextColumnSeqNo: 5,
+        primaryKey: new PrimaryKeySchema(null, [new IndexedColumn(new ColumnRefExpr(null, null, "oid"), null, null)], null),
+        uniqueConstraints: [],
+        checkConstraints: [],
+        foreignKeys: []);
+
     public TableSchema(
         Oid oid,
         string name,
