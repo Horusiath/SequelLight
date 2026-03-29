@@ -1010,4 +1010,530 @@ public class SchemaTests
         Assert.Equal(seqA, cols[0].SeqNo);
         Assert.Equal(seqB, cols[1].SeqNo);
     }
+
+    // ==== Schema ToString roundtrip tests ====
+
+    /// <summary>
+    /// Creates a schema from SQL, serializes it back via ToString(), re-parses,
+    /// and applies to a fresh schema. Returns both the original and roundtripped schemas.
+    /// </summary>
+    private static (DatabaseSchema original, DatabaseSchema roundtripped) Roundtrip(params string[] sqls)
+    {
+        var original = ApplyAll(sqls);
+        var roundtripped = new DatabaseSchema();
+
+        // Re-apply tables first (indexes/triggers depend on them)
+        foreach (var table in original.Tables.Values)
+            roundtripped.Apply(SqlParser.Parse(table.ToString()));
+
+        foreach (var index in original.Indexes.Values)
+            roundtripped.Apply(SqlParser.Parse(index.ToString()));
+
+        foreach (var view in original.Views.Values)
+            roundtripped.Apply(SqlParser.Parse(view.ToString()));
+
+        foreach (var trigger in original.Triggers.Values)
+            roundtripped.Apply(SqlParser.Parse(trigger.ToString()));
+
+        return (original, roundtripped);
+    }
+
+    private static void AssertTableRoundtrip(TableSchema expected, TableSchema actual)
+    {
+        Assert.Equal(expected.Name, actual.Name);
+        Assert.Equal(expected.IsTemporary, actual.IsTemporary);
+        Assert.Equal(expected.WithoutRowId, actual.WithoutRowId);
+        Assert.Equal(expected.IsStrict, actual.IsStrict);
+        Assert.Equal(expected.Columns.Count, actual.Columns.Count);
+
+        for (int i = 0; i < expected.Columns.Count; i++)
+        {
+            var ec = expected.Columns[i];
+            var ac = actual.Columns[i];
+            Assert.Equal(ec.Name, ac.Name);
+            Assert.Equal(ec.TypeName, ac.TypeName);
+            Assert.Equal(ec.IsNotNull, ac.IsNotNull);
+            Assert.Equal(ec.IsPrimaryKey, ac.IsPrimaryKey);
+            Assert.Equal(ec.IsAutoincrement, ac.IsAutoincrement);
+            Assert.Equal(ec.IsUnique, ac.IsUnique);
+            Assert.Equal(ec.IsStored, ac.IsStored);
+            Assert.Equal(ec.Collation, ac.Collation);
+            Assert.Equal(ec.DefaultValue != null, ac.DefaultValue != null);
+            Assert.Equal(ec.CheckExpression != null, ac.CheckExpression != null);
+            Assert.Equal(ec.GeneratedExpression != null, ac.GeneratedExpression != null);
+            Assert.Equal(ec.ForeignKey != null, ac.ForeignKey != null);
+            if (ec.ForeignKey != null)
+            {
+                Assert.Equal(ec.ForeignKey.Table, ac.ForeignKey!.Table);
+                Assert.Equal(ec.ForeignKey.OnDelete, ac.ForeignKey.OnDelete);
+                Assert.Equal(ec.ForeignKey.OnUpdate, ac.ForeignKey.OnUpdate);
+                Assert.Equal(ec.ForeignKey.Columns?.Count, ac.ForeignKey.Columns?.Count);
+            }
+        }
+
+        Assert.Equal(expected.PrimaryKey != null, actual.PrimaryKey != null);
+        if (expected.PrimaryKey != null)
+        {
+            Assert.Equal(expected.PrimaryKey.Columns.Count, actual.PrimaryKey!.Columns.Count);
+            Assert.Equal(expected.PrimaryKey.OnConflict, actual.PrimaryKey.OnConflict);
+        }
+
+        Assert.Equal(expected.UniqueConstraints.Count, actual.UniqueConstraints.Count);
+        Assert.Equal(expected.CheckConstraints.Count, actual.CheckConstraints.Count);
+        Assert.Equal(expected.ForeignKeys.Count, actual.ForeignKeys.Count);
+    }
+
+    // ---- Table roundtrip tests ----
+
+    [Fact]
+    public void Roundtrip_Table_BasicColumns()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)");
+
+        var expected = orig.GetTable("users")!;
+        var actual = rt.GetTable("users")!;
+        AssertTableRoundtrip(expected, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnWithoutType()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (x)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.Single(actual.Columns);
+        Assert.Null(actual.Columns[0].TypeName);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_Temporary()
+    {
+        var (_, rt) = Roundtrip("CREATE TEMP TABLE t (x INTEGER)");
+        Assert.True(rt.GetTable("t")!.IsTemporary);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_PrimaryKeyAutoincrement()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)");
+
+        var table = rt.GetTable("t")!;
+        Assert.True(table.Columns[0].IsPrimaryKey);
+        Assert.True(table.Columns[0].IsAutoincrement);
+        Assert.NotNull(table.PrimaryKey);
+        Assert.Single(table.PrimaryKey.Columns);
+        AssertTableRoundtrip(orig.GetTable("t")!, table);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnNotNull()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT NOT NULL)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.True(actual.Columns[0].IsNotNull);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnUnique()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (email TEXT UNIQUE)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.True(actual.Columns[0].IsUnique);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnDefault()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER DEFAULT 0)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.NotNull(actual.Columns[0].DefaultValue);
+        var literal = Assert.IsType<LiteralExpr>(actual.Columns[0].DefaultValue);
+        Assert.Equal("0", literal.Value);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnDefaultNegative()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (val REAL DEFAULT -1.5)");
+
+        var actual = rt.GetTable("t")!;
+        var literal = Assert.IsType<LiteralExpr>(actual.Columns[0].DefaultValue);
+        Assert.Equal("-1.5", literal.Value);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnDefaultString()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT DEFAULT 'hello')");
+
+        var actual = rt.GetTable("t")!;
+        var literal = Assert.IsType<LiteralExpr>(actual.Columns[0].DefaultValue);
+        Assert.Equal("hello", literal.Value);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnCheck()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (age INTEGER CHECK (age >= 0))");
+
+        var actual = rt.GetTable("t")!;
+        Assert.NotNull(actual.Columns[0].CheckExpression);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnCollate()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (name TEXT COLLATE NOCASE)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.Equal("NOCASE", actual.Columns[0].Collation);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnForeignKey()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE)");
+
+        var actual = rt.GetTable("orders")!;
+        Assert.NotNull(actual.Columns[1].ForeignKey);
+        Assert.Equal("users", actual.Columns[1].ForeignKey.Table);
+        Assert.Equal(ForeignKeyAction.Cascade, actual.Columns[1].ForeignKey.OnDelete);
+        AssertTableRoundtrip(orig.GetTable("orders")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ColumnGenerated()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)");
+
+        var actual = rt.GetTable("t")!;
+        Assert.NotNull(actual.Columns[2].GeneratedExpression);
+        Assert.True(actual.Columns[2].IsStored);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_CompositePrimaryKey()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER, b INTEGER, PRIMARY KEY (a, b))");
+
+        var actual = rt.GetTable("t")!;
+        Assert.NotNull(actual.PrimaryKey);
+        Assert.Equal(2, actual.PrimaryKey.Columns.Count);
+        Assert.True(actual.Columns[0].IsPrimaryKey);
+        Assert.True(actual.Columns[1].IsPrimaryKey);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_UniqueConstraint()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER, b TEXT, UNIQUE (a, b))");
+
+        var actual = rt.GetTable("t")!;
+        Assert.Single(actual.UniqueConstraints);
+        Assert.Equal(2, actual.UniqueConstraints[0].Columns.Count);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_CheckConstraint()
+    {
+        var (orig, rt) = Roundtrip("CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > b))");
+
+        var actual = rt.GetTable("t")!;
+        Assert.Single(actual.CheckConstraints);
+        AssertTableRoundtrip(orig.GetTable("t")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_ForeignKeyConstraint()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE orders (id INTEGER, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE)");
+
+        var actual = rt.GetTable("orders")!;
+        Assert.Single(actual.ForeignKeys);
+        Assert.Equal("users", actual.ForeignKeys[0].ForeignKey.Table);
+        Assert.Equal(ForeignKeyAction.Cascade, actual.ForeignKeys[0].ForeignKey.OnDelete);
+        AssertTableRoundtrip(orig.GetTable("orders")!, actual);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_WithoutRowId()
+    {
+        var (_, rt) = Roundtrip("CREATE TABLE t (x INTEGER PRIMARY KEY) WITHOUT ROWID");
+
+        var actual = rt.GetTable("t")!;
+        Assert.True(actual.WithoutRowId);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_Strict()
+    {
+        var (_, rt) = Roundtrip("CREATE TABLE t (x INTEGER) STRICT");
+        Assert.True(rt.GetTable("t")!.IsStrict);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_WithoutRowIdAndStrict()
+    {
+        var (_, rt) = Roundtrip("CREATE TABLE t (x INTEGER PRIMARY KEY) WITHOUT ROWID, STRICT");
+
+        var actual = rt.GetTable("t")!;
+        Assert.True(actual.WithoutRowId);
+        Assert.True(actual.IsStrict);
+    }
+
+    [Fact]
+    public void Roundtrip_Table_FullFeatured()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY)",
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount REAL DEFAULT 0.0 CHECK (amount >= 0),
+                status TEXT NOT NULL COLLATE NOCASE,
+                UNIQUE (user_id, status),
+                CHECK (amount < 1000000)
+            )
+            """);
+
+        var expected = orig.GetTable("orders")!;
+        var actual = rt.GetTable("orders")!;
+        AssertTableRoundtrip(expected, actual);
+
+        Assert.True(actual.Columns[0].IsPrimaryKey);
+        Assert.True(actual.Columns[0].IsAutoincrement);
+        Assert.True(actual.Columns[1].IsNotNull);
+        Assert.NotNull(actual.Columns[1].ForeignKey);
+        Assert.NotNull(actual.Columns[2].DefaultValue);
+        Assert.NotNull(actual.Columns[2].CheckExpression);
+        Assert.Equal("NOCASE", actual.Columns[3].Collation);
+        Assert.Single(actual.UniqueConstraints);
+        Assert.Single(actual.CheckConstraints);
+    }
+
+    // ---- Index roundtrip tests ----
+
+    [Fact]
+    public void Roundtrip_Index_Basic()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE INDEX idx ON t (a)");
+
+        var expected = orig.GetIndex("idx")!;
+        var actual = rt.GetIndex("idx")!;
+        Assert.Equal(expected.Name, actual.Name);
+        Assert.Equal(expected.IsUnique, actual.IsUnique);
+        Assert.Equal(expected.Columns.Count, actual.Columns.Count);
+        Assert.Null(actual.Where);
+    }
+
+    [Fact]
+    public void Roundtrip_Index_Unique()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE UNIQUE INDEX idx ON t (a)");
+
+        Assert.True(rt.GetIndex("idx")!.IsUnique);
+    }
+
+    [Fact]
+    public void Roundtrip_Index_MultiColumnWithOrder()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER, b TEXT, c REAL)",
+            "CREATE INDEX idx ON t (a, b DESC)");
+
+        var actual = rt.GetIndex("idx")!;
+        Assert.Equal(2, actual.Columns.Count);
+        Assert.Equal(SortOrder.Desc, actual.Columns[1].Order);
+    }
+
+    [Fact]
+    public void Roundtrip_Index_Partial()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE INDEX idx ON t (a) WHERE a > 0");
+
+        Assert.NotNull(rt.GetIndex("idx")!.Where);
+    }
+
+    // ---- View roundtrip tests ----
+
+    [Fact]
+    public void Roundtrip_View_Basic()
+    {
+        var (orig, rt) = Roundtrip("CREATE VIEW v AS SELECT 1");
+
+        var actual = rt.GetView("v")!;
+        Assert.Equal("v", actual.Name);
+        Assert.False(actual.IsTemporary);
+        Assert.Null(actual.Columns);
+        Assert.NotNull(actual.Query);
+    }
+
+    [Fact]
+    public void Roundtrip_View_Temporary()
+    {
+        var (_, rt) = Roundtrip("CREATE TEMP VIEW v AS SELECT 1");
+        Assert.True(rt.GetView("v")!.IsTemporary);
+    }
+
+    [Fact]
+    public void Roundtrip_View_WithColumns()
+    {
+        var (orig, rt) = Roundtrip("CREATE VIEW v (a, b) AS SELECT 1, 2");
+
+        var actual = rt.GetView("v")!;
+        Assert.NotNull(actual.Columns);
+        Assert.Equal(2, actual.Columns.Count);
+        Assert.Equal("a", actual.Columns[0]);
+        Assert.Equal("b", actual.Columns[1]);
+    }
+
+    [Fact]
+    public void Roundtrip_View_ComplexSelect()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE VIEW v AS SELECT a, b FROM t WHERE a > 0 ORDER BY b");
+
+        var actual = rt.GetView("v")!;
+        Assert.NotNull(actual.Query);
+    }
+
+    // ---- Trigger roundtrip tests ----
+
+    [Fact]
+    public void Roundtrip_Trigger_AfterInsert()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        var actual = rt.GetTrigger("trg")!;
+        Assert.Equal("trg", actual.Name);
+        Assert.Equal(TriggerTiming.After, actual.Timing);
+        Assert.IsType<InsertTriggerEvent>(actual.Event);
+        Assert.False(actual.ForEachRow);
+        Assert.Null(actual.When);
+        Assert.NotEmpty(actual.Body);
+    }
+
+    [Fact]
+    public void Roundtrip_Trigger_BeforeDeleteForEachRow()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE TRIGGER trg BEFORE DELETE ON t FOR EACH ROW BEGIN SELECT 1; END");
+
+        var actual = rt.GetTrigger("trg")!;
+        Assert.Equal(TriggerTiming.Before, actual.Timing);
+        Assert.IsType<DeleteTriggerEvent>(actual.Event);
+        Assert.True(actual.ForEachRow);
+    }
+
+    [Fact]
+    public void Roundtrip_Trigger_UpdateWithColumns()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (a INTEGER, b TEXT)",
+            "CREATE TRIGGER trg AFTER UPDATE OF a, b ON t BEGIN SELECT 1; END");
+
+        var actual = rt.GetTrigger("trg")!;
+        var updEvent = Assert.IsType<UpdateTriggerEvent>(actual.Event);
+        Assert.NotNull(updEvent.Columns);
+        Assert.Equal(2, updEvent.Columns.Count);
+    }
+
+    [Fact]
+    public void Roundtrip_Trigger_WithWhenClause()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE TRIGGER trg BEFORE INSERT ON t WHEN NEW.x > 0 BEGIN SELECT 1; END");
+
+        Assert.NotNull(rt.GetTrigger("trg")!.When);
+    }
+
+    [Fact]
+    public void Roundtrip_Trigger_Temporary()
+    {
+        var (_, rt) = Roundtrip(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE TEMP TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        Assert.True(rt.GetTrigger("trg")!.IsTemporary);
+    }
+
+    // ---- Combined roundtrip test ----
+
+    [Fact]
+    public void Roundtrip_AllObjectTypes()
+    {
+        var (orig, rt) = Roundtrip(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)",
+            "CREATE INDEX idx_name ON users (name)",
+            "CREATE VIEW user_names AS SELECT name FROM users",
+            "CREATE TRIGGER trg_insert AFTER INSERT ON users BEGIN SELECT 1; END");
+
+        Assert.NotNull(rt.GetTable("users"));
+        Assert.NotNull(rt.GetIndex("idx_name"));
+        Assert.NotNull(rt.GetView("user_names"));
+        Assert.NotNull(rt.GetTrigger("trg_insert"));
+
+        AssertTableRoundtrip(orig.GetTable("users")!, rt.GetTable("users")!);
+    }
+
+    [Fact]
+    public void Roundtrip_IndexTableNameUpdatedOnRename()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE INDEX idx ON t (x)");
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
+
+        var index = schema.GetIndex("idx")!;
+        Assert.Equal("t2", index.TableName);
+
+        // Verify the index ToString uses the updated table name
+        var sql = index.ToString();
+        Assert.Contains("\"t2\"", sql);
+    }
+
+    [Fact]
+    public void Roundtrip_TriggerTableNameUpdatedOnRename()
+    {
+        var schema = ApplyAll(
+            "CREATE TABLE t (x INTEGER)",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END");
+
+        schema.Apply(SqlParser.Parse("ALTER TABLE t RENAME TO t2"));
+
+        var trigger = schema.GetTrigger("trg")!;
+        Assert.Equal("t2", trigger.TableName);
+
+        var sql = trigger.ToString();
+        Assert.Contains("\"t2\"", sql);
+    }
 }

@@ -976,7 +976,7 @@ public sealed partial class SqlParser
         var firstName = ParseName();
         string typeName;
 
-        if (!IsAnyName() || _current.Kind == TokenKind.OpenParen)
+        if (!IsAnyName() || _current.Kind == TokenKind.OpenParen || IsColumnConstraintStart())
         {
             typeName = firstName;
         }
@@ -988,7 +988,7 @@ public sealed partial class SqlParser
             do
             {
                 builder.Add(ParseName());
-            } while (IsAnyName() && _current.Kind != TokenKind.OpenParen);
+            } while (IsAnyName() && _current.Kind != TokenKind.OpenParen && !IsColumnConstraintStart());
             var names = builder.ToArray();
             typeName = string.Join(" ", names);
         }

@@ -198,7 +198,7 @@ public sealed class DatabaseSchema
             throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
 
         var oid = AllocateOid();
-        _indexes[oid] = new IndexSchema(oid, stmt.Index, tableOid, stmt.Unique, stmt.Columns, stmt.Where);
+        _indexes[oid] = new IndexSchema(oid, stmt.Index, tableOid, stmt.Table, stmt.Unique, stmt.Columns, stmt.Where);
         _indexNames[stmt.Index] = oid;
     }
 
@@ -228,7 +228,7 @@ public sealed class DatabaseSchema
 
         var oid = AllocateOid();
         _triggers[oid] = new TriggerSchema(
-            oid, stmt.Trigger, stmt.Temporary, tableOid,
+            oid, stmt.Trigger, stmt.Temporary, tableOid, stmt.Table,
             stmt.Timing, stmt.Event, stmt.ForEachRow, stmt.When, stmt.Body);
         _triggerNames[stmt.Trigger] = oid;
     }
@@ -304,7 +304,17 @@ public sealed class DatabaseSchema
                 _tableNames.Remove(stmt.Table);
                 _tableNames[rename.NewName] = tableOid;
                 table.Name = rename.NewName;
-                // Indexes/triggers reference by Oid — no updates needed
+                // Update denormalized table name on indexes and triggers
+                foreach (var index in _indexes.Values)
+                {
+                    if (index.TableOid == tableOid)
+                        index.TableName = rename.NewName;
+                }
+                foreach (var trigger in _triggers.Values)
+                {
+                    if (trigger.TableOid == tableOid)
+                        trigger.TableName = rename.NewName;
+                }
                 break;
             }
             case RenameColumnAction renameCol:
