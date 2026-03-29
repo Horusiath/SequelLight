@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
@@ -31,8 +32,50 @@ public sealed class Database : IAsyncDisposable
     internal async ValueTask<int> ExecuteNonQueryAsync(string sql, ReadOnlyTransaction? transaction)
     {
         var stmt = SqlParser.Parse(sql);
-        // TODO: execute statement against store/transaction
-        throw new NotImplementedException();
+        return stmt switch
+        {
+            CreateTableStmt or CreateIndexStmt or CreateViewStmt or CreateTriggerStmt
+                or DropStmt or AlterTableStmt => await ExecuteDdlAsync(stmt, transaction).ConfigureAwait(false),
+            _ => throw new NotImplementedException()
+        };
+    }
+
+    private async ValueTask<int> ExecuteDdlAsync(SqlStmt stmt, ReadOnlyTransaction? transaction)
+    {
+        var changes = Schema.Apply(stmt);
+        if (changes.Length == 0)
+            return 0;
+
+        var rootTable = Schema.RootTable;
+
+        if (transaction is ReadWriteTransaction rw)
+        {
+            ApplySchemaChanges(rw, rootTable, changes);
+            return changes.Length;
+        }
+
+        // Auto-commit when no explicit transaction is provided
+        await using var autoTx = _store.BeginReadWrite();
+        ApplySchemaChanges(autoTx, rootTable, changes);
+        await autoTx.CommitAsync().ConfigureAwait(false);
+        return changes.Length;
+    }
+
+    private static void ApplySchemaChanges(ReadWriteTransaction tx, TableSchema rootTable, SchemaChange[] changes)
+    {
+        for (int i = 0; i < changes.Length; i++)
+        {
+            var key = rootTable.EncodeRowKey(changes[i].Row);
+            switch (changes[i].Kind)
+            {
+                case SchemaChangeKind.Insert:
+                    tx.Put(key, rootTable.EncodeRowValue(changes[i].Row));
+                    break;
+                case SchemaChangeKind.Delete:
+                    tx.Delete(key);
+                    break;
+            }
+        }
     }
 
     internal async ValueTask<object?> ExecuteScalarAsync(string sql, ReadOnlyTransaction? transaction)

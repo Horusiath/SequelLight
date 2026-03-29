@@ -255,6 +255,82 @@ public sealed class TableSchema : IEquatable<TableSchema>
     public IReadOnlyList<CheckConstraintSchema> CheckConstraints { get; }
     public IReadOnlyList<ForeignKeyConstraintSchema> ForeignKeys { get; }
 
+    // Encoding metadata — lazily initialized, invalidated when Columns reference changes.
+    private IReadOnlyList<ColumnSchema>? _encodingColumns;
+    private int[]? _pkColumnIndices;
+    private DbType[]? _pkColumnTypes;
+    private int[]? _valueColumnIndices;
+    private int[]? _valueColumnSeqNos;
+
+    private void EnsureEncodingMetadata()
+    {
+        if (ReferenceEquals(_encodingColumns, Columns))
+            return;
+
+        int pkCount = 0, valCount = 0;
+        for (int i = 0; i < Columns.Count; i++)
+        {
+            if (Columns[i].IsPrimaryKey) pkCount++;
+            else valCount++;
+        }
+
+        var pkIndices = new int[pkCount];
+        var pkTypes = new DbType[pkCount];
+        var valIndices = new int[valCount];
+        var valSeqNos = new int[valCount];
+        int pk = 0, val = 0;
+
+        for (int i = 0; i < Columns.Count; i++)
+        {
+            if (Columns[i].IsPrimaryKey)
+            {
+                pkIndices[pk] = i;
+                pkTypes[pk] = TypeAffinity.Resolve(Columns[i].TypeName);
+                pk++;
+            }
+            else
+            {
+                valIndices[val] = i;
+                valSeqNos[val] = Columns[i].SeqNo;
+                val++;
+            }
+        }
+
+        _pkColumnIndices = pkIndices;
+        _pkColumnTypes = pkTypes;
+        _valueColumnIndices = valIndices;
+        _valueColumnSeqNos = valSeqNos;
+        _encodingColumns = Columns;
+    }
+
+    /// <summary>
+    /// Encodes the primary-key portion of a row into a byte[] key suitable for LSM storage.
+    /// The key is prefixed with the table's <see cref="Oid"/>.
+    /// </summary>
+    public byte[] EncodeRowKey(DbValue[] row)
+    {
+        EnsureEncodingMetadata();
+        var indices = _pkColumnIndices!;
+        var pkValues = new DbValue[indices.Length];
+        for (int i = 0; i < indices.Length; i++)
+            pkValues[i] = row[indices[i]];
+        return RowKeyEncoder.Encode(Oid, pkValues, _pkColumnTypes!);
+    }
+
+    /// <summary>
+    /// Encodes the non-primary-key columns of a row into a byte[] value for LSM storage.
+    /// Each column is tagged with its <see cref="ColumnSchema.SeqNo"/> for forward compatibility.
+    /// </summary>
+    public byte[] EncodeRowValue(DbValue[] row)
+    {
+        EnsureEncodingMetadata();
+        var indices = _valueColumnIndices!;
+        var values = new DbValue[indices.Length];
+        for (int i = 0; i < indices.Length; i++)
+            values[i] = row[indices[i]];
+        return RowValueEncoder.Encode(values, _valueColumnSeqNos!);
+    }
+
     public bool Equals(TableSchema? other) => other is not null && Oid == other.Oid;
     public override bool Equals(object? obj) => Equals(obj as TableSchema);
     public override int GetHashCode() => Oid.GetHashCode();
