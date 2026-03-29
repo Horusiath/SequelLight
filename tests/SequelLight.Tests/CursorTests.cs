@@ -864,4 +864,66 @@ public class TransactionCursorTests : TempDirTest
         Assert.Equal("a", Str(cursor.CurrentKey));
     }
 
+    [Fact]
+    public async Task Cursor_Delete_Visible_Through_Transaction_Get()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        await using var rwTx = store.BeginReadWrite();
+
+        // Confirm entry exists before cursor delete
+        Assert.Equal(Val("2"), await rwTx.GetAsync(Key("b")));
+
+        await using var cursor = rwTx.CreateCursor();
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        await cursor.DeleteAsync();
+
+        // Transaction's GetAsync should see the tombstone immediately
+        Assert.Null(await rwTx.GetAsync(Key("b")));
+
+        // Other entries remain intact
+        Assert.Equal(Val("1"), await rwTx.GetAsync(Key("a")));
+        Assert.Equal(Val("3"), await rwTx.GetAsync(Key("c")));
+    }
+
+    [Fact]
+    public async Task Cursor_Delete_Isolated_From_Concurrent_ReadOnly_Transaction()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            await tx.CommitAsync();
+        }
+
+        // Start a read-only transaction before the delete
+        using var roBefore = store.BeginReadOnly();
+
+        await using var rwTx = store.BeginReadWrite();
+        await using var cursor = rwTx.CreateCursor();
+        Assert.True(await cursor.SeekAsync(Key("b")));
+        await cursor.DeleteAsync();
+
+        // Start another read-only transaction after the delete (but before commit)
+        using var roAfter = store.BeginReadOnly();
+
+        // Both read-only transactions should still see the original value —
+        // the delete is isolated within the uncommitted read-write transaction
+        Assert.Equal(Val("2"), await roBefore.GetAsync(Key("b")));
+        Assert.Equal(Val("2"), await roAfter.GetAsync(Key("b")));
+
+        // The writing transaction itself sees the delete
+        Assert.Null(await rwTx.GetAsync(Key("b")));
+    }
 }
