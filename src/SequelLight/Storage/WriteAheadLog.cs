@@ -10,24 +10,35 @@ public enum WalEntryType : byte
 {
     Put = 1,
     Delete = 2,
+    Commit = 3,
 }
 
 /// <summary>
-/// Write-Ahead Log for crash recovery. Entries are length-prefixed with a CRC32 checksum.
+/// Write-Ahead Log for crash recovery. Entries are length-prefixed with a rolling CRC32
+/// checksum that chains across all entries within a transaction.
 ///
-/// Format per entry:
+/// Format per data entry (Put/Delete):
 ///   [4 bytes: total entry length (excluding this field)]
 ///   [1 byte: entry type (Put=1, Delete=2)]
 ///   [4 bytes: key length]
 ///   [N bytes: key]
 ///   [4 bytes: value length] (only for Put)
 ///   [M bytes: value]        (only for Put)
-///   [4 bytes: CRC32 checksum of all preceding bytes in this entry]
+///   [4 bytes: rolling CRC32 = CRC32(prevCrc ++ body)]
+///
+/// Format per commit entry:
+///   [4 bytes: total entry length (excluding this field) = 5]
+///   [1 byte: entry type (Commit=3)]
+///   [4 bytes: rolling CRC32 = CRC32(prevCrc ++ body)]
+///
+/// The rolling CRC chains entries within a transaction: each entry's CRC is computed
+/// over its body bytes prepended with the previous entry's CRC (or 0 for the first entry).
+/// A Commit entry signals the end of a transaction. During replay, only entries from
+/// transactions with a valid Commit record are delivered.
 ///
 /// Group commit: multiple concurrent callers submit batches to CommitAsync.
 /// A single background flusher collects all pending batches, writes them to the PipeWriter,
-/// performs one fsync, then completes all waiting callers. This amortizes one fsync across
-/// N concurrent commits.
+/// performs one fsync, then completes all waiting callers.
 /// </summary>
 public sealed class WriteAheadLog : IAsyncDisposable
 {
@@ -35,6 +46,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
     private readonly PipeWriter _writer;
     private readonly string _filePath;
     private bool _disposed;
+    private long _lastCommitPosition;
 
     // Group commit infrastructure
     private readonly Channel<WalCommitBatch> _commitQueue;
@@ -47,6 +59,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
         _writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
         _commitQueue = Channel.CreateUnbounded<WalCommitBatch>(
             new UnboundedChannelOptions { SingleReader = true });
+        _lastCommitPosition = stream.Position;
         _flusherTask = Task.Run(FlusherLoopAsync);
     }
 
@@ -90,10 +103,16 @@ public sealed class WriteAheadLog : IAsyncDisposable
             // Collect all pending batches
             while (reader.TryRead(out var batch))
             {
-                foreach (var (key, value) in batch.Writes)
+                if (batch.Writes.Count > 0)
                 {
-                    if (value is not null) AppendPut(key, value);
-                    else AppendDelete(key);
+                    uint rollingCrc = 0;
+                    foreach (var (key, value) in batch.Writes)
+                    {
+                        rollingCrc = value is not null
+                            ? AppendPut(key, value, rollingCrc)
+                            : AppendDelete(key, rollingCrc);
+                    }
+                    AppendCommit(rollingCrc);
                 }
                 pending.Add(batch.Completion);
             }
@@ -105,6 +124,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
                     // Single flush for all batches
                     await _writer.FlushAsync().ConfigureAwait(false);
                     await _stream.FlushAsync().ConfigureAwait(false);
+                    _lastCommitPosition = _stream.Position;
 
                     foreach (var tcs in pending)
                         tcs.TrySetResult();
@@ -118,7 +138,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
         }
     }
 
-    private void AppendPut(byte[] key, byte[] value)
+    private uint AppendPut(byte[] key, byte[] value, uint prevCrc)
     {
         int bodyLen = 1 + 4 + key.Length + 4 + value.Length;
         int totalLen = 4 + bodyLen + 4;
@@ -142,13 +162,14 @@ public sealed class WriteAheadLog : IAsyncDisposable
         value.CopyTo(span[offset..]);
         offset += value.Length;
 
-        uint crc = Crc32.HashToUInt32(span[crcStart..offset]);
+        uint crc = ComputeRollingCrc(span[crcStart..offset], prevCrc);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
 
         _writer.Advance(totalLen);
+        return crc;
     }
 
-    private void AppendDelete(byte[] key)
+    private uint AppendDelete(byte[] key, uint prevCrc)
     {
         int bodyLen = 1 + 4 + key.Length;
         int totalLen = 4 + bodyLen + 4;
@@ -167,23 +188,61 @@ public sealed class WriteAheadLog : IAsyncDisposable
         key.CopyTo(span[offset..]);
         offset += key.Length;
 
-        uint crc = Crc32.HashToUInt32(span[crcStart..offset]);
+        uint crc = ComputeRollingCrc(span[crcStart..offset], prevCrc);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
+
+        _writer.Advance(totalLen);
+        return crc;
+    }
+
+    private void AppendCommit(uint prevCrc)
+    {
+        const int bodyLen = 1;
+        const int totalLen = 4 + bodyLen + 4;
+
+        var span = _writer.GetSpan(totalLen);
+        int offset = 0;
+
+        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], bodyLen + 4);
+        offset += 4;
+
+        int crcStart = offset;
+        span[offset++] = (byte)WalEntryType.Commit;
+
+        uint crc = ComputeRollingCrc(span[crcStart..offset], prevCrc);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
 
         _writer.Advance(totalLen);
     }
 
-    /// <summary>
-    /// Replays all entries from a WAL file, invoking the callback for each valid entry.
-    /// </summary>
-    public static async ValueTask ReplayAsync(string filePath, Func<WalEntryType, byte[], byte[]?, ValueTask> onEntry)
+    internal static uint ComputeRollingCrc(ReadOnlySpan<byte> body, uint prevCrc)
     {
-        if (!File.Exists(filePath)) return;
+        var crc = new Crc32();
+        Span<byte> seed = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(seed, prevCrc);
+        crc.Append(seed);
+        crc.Append(body);
+        return crc.GetCurrentHashAsUInt32();
+    }
+
+    /// <summary>
+    /// Replays committed transactions from a WAL file. Only entries belonging to transactions
+    /// that have a valid Commit record are delivered to the callback. Incomplete transactions
+    /// (missing or corrupted Commit record) are silently discarded.
+    /// Returns the file offset immediately after the last complete transaction.
+    /// </summary>
+    public static async ValueTask<long> ReplayAsync(string filePath, Func<WalEntryType, byte[], byte[]?, ValueTask> onEntry)
+    {
+        if (!File.Exists(filePath)) return 0;
 
         await using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 4096, useAsync: true);
 
         var reader = PipeReader.Create(stream);
+        var pendingEntries = new List<(WalEntryType Type, byte[] Key, byte[]? Value)>();
+        uint rollingCrc = 0;
+        long position = 0;
+        long lastCommitPosition = 0;
 
         try
         {
@@ -192,9 +251,24 @@ public sealed class WriteAheadLog : IAsyncDisposable
                 var readResult = await reader.ReadAsync().ConfigureAwait(false);
                 var buffer = readResult.Buffer;
 
-                while (TryReadEntry(ref buffer, out var entryType, out var key, out var value))
+                while (TryReadEntry(ref buffer, rollingCrc, out var entryType, out var key,
+                    out var value, out var entryCrc, out int bytesConsumed))
                 {
-                    await onEntry(entryType, key, value).ConfigureAwait(false);
+                    position += bytesConsumed;
+
+                    if (entryType == WalEntryType.Commit)
+                    {
+                        foreach (var (t, k, v) in pendingEntries)
+                            await onEntry(t, k, v).ConfigureAwait(false);
+                        pendingEntries.Clear();
+                        rollingCrc = 0;
+                        lastCommitPosition = position;
+                    }
+                    else
+                    {
+                        pendingEntries.Add((entryType, key, value));
+                        rollingCrc = entryCrc;
+                    }
                 }
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
@@ -207,14 +281,29 @@ public sealed class WriteAheadLog : IAsyncDisposable
         {
             await reader.CompleteAsync().ConfigureAwait(false);
         }
+
+        // Entries without a Commit record are silently discarded (incomplete transaction)
+        return lastCommitPosition;
     }
 
-    private static bool TryReadEntry(ref ReadOnlySequence<byte> buffer, out WalEntryType entryType,
-        out byte[] key, out byte[]? value)
+    /// <summary>
+    /// Truncates a WAL file to the given position, discarding any trailing incomplete data.
+    /// </summary>
+    public static void Truncate(string filePath, long position)
+    {
+        using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Write);
+        stream.SetLength(position);
+    }
+
+    private static bool TryReadEntry(ref ReadOnlySequence<byte> buffer, uint prevCrc,
+        out WalEntryType entryType, out byte[] key, out byte[]? value, out uint entryCrc,
+        out int bytesConsumed)
     {
         entryType = default;
         key = Array.Empty<byte>();
         value = null;
+        entryCrc = 0;
+        bytesConsumed = 0;
 
         if (buffer.Length < 4) return false;
 
@@ -232,25 +321,31 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
             int bodyLen = entryLen - 4;
             uint storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(span[bodyLen..]);
-            uint computedCrc = Crc32.HashToUInt32(span[..bodyLen]);
+            uint computedCrc = ComputeRollingCrc(span[..bodyLen], prevCrc);
             if (storedCrc != computedCrc)
                 return false;
 
             int offset = 0;
             entryType = (WalEntryType)span[offset++];
-            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
-            offset += 4;
-            key = span.Slice(offset, keyLen).ToArray();
-            offset += keyLen;
 
-            if (entryType == WalEntryType.Put)
+            if (entryType != WalEntryType.Commit)
             {
-                int valLen = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
+                int keyLen = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
                 offset += 4;
-                value = span.Slice(offset, valLen).ToArray();
+                key = span.Slice(offset, keyLen).ToArray();
+                offset += keyLen;
+
+                if (entryType == WalEntryType.Put)
+                {
+                    int valLen = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
+                    offset += 4;
+                    value = span.Slice(offset, valLen).ToArray();
+                }
             }
 
-            buffer = buffer.Slice(4 + entryLen);
+            entryCrc = storedCrc;
+            bytesConsumed = 4 + entryLen;
+            buffer = buffer.Slice(bytesConsumed);
             return true;
         }
         finally

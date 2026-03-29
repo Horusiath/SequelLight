@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Collections.Immutable;
+using System.IO.Hashing;
 using System.Text;
 using SequelLight.Storage;
 
@@ -129,6 +131,172 @@ public class WalTests : TempDirTest
             return ValueTask.CompletedTask;
         });
         Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task Replay_Incomplete_Transaction_Not_Delivered()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        // Write entries without a Commit record
+        await using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var writer = new BinaryWriter(stream))
+        {
+            WriteRawPut(writer, Key("key1"), Val("val1"), 0);
+        }
+
+        var entries = new List<(WalEntryType Type, string Key, string? Value)>();
+        await WriteAheadLog.ReplayAsync(path, (type, key, value) =>
+        {
+            entries.Add((type, Str(key), value is null ? null : Str(value)));
+            return ValueTask.CompletedTask;
+        });
+
+        Assert.Empty(entries);
+    }
+
+    [Fact]
+    public async Task Replay_Only_Committed_Transactions_Delivered()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var writer = new BinaryWriter(stream))
+        {
+            // Transaction 1: committed
+            uint crc = WriteRawPut(writer, Key("key1"), Val("val1"), 0);
+            WriteRawCommit(writer, crc);
+
+            // Transaction 2: committed (multiple entries)
+            crc = WriteRawPut(writer, Key("key2"), Val("val2"), 0);
+            crc = WriteRawPut(writer, Key("key3"), Val("val3"), crc);
+            WriteRawCommit(writer, crc);
+
+            // Transaction 3: incomplete (no commit)
+            WriteRawPut(writer, Key("key4"), Val("val4"), 0);
+        }
+
+        var entries = new List<(WalEntryType Type, string Key, string? Value)>();
+        await WriteAheadLog.ReplayAsync(path, (type, key, value) =>
+        {
+            entries.Add((type, Str(key), value is null ? null : Str(value)));
+            return ValueTask.CompletedTask;
+        });
+
+        Assert.Equal(3, entries.Count);
+        Assert.Equal((WalEntryType.Put, "key1", "val1"), entries[0]);
+        Assert.Equal((WalEntryType.Put, "key2", "val2"), entries[1]);
+        Assert.Equal((WalEntryType.Put, "key3", "val3"), entries[2]);
+    }
+
+    [Fact]
+    public async Task Replay_Returns_Last_Commit_Position_And_Truncate()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var writer = new BinaryWriter(stream))
+        {
+            uint crc = WriteRawPut(writer, Key("key1"), Val("val1"), 0);
+            WriteRawCommit(writer, crc);
+
+            // Incomplete transaction
+            WriteRawPut(writer, Key("key2"), Val("val2"), 0);
+        }
+
+        long lastCommitPos = await WriteAheadLog.ReplayAsync(path, (_, _, _) => ValueTask.CompletedTask);
+
+        var fileLen = new FileInfo(path).Length;
+        Assert.True(lastCommitPos > 0);
+        Assert.True(lastCommitPos < fileLen);
+
+        // After truncation, only the committed transaction survives
+        WriteAheadLog.Truncate(path, lastCommitPos);
+
+        var entries = new List<string>();
+        await WriteAheadLog.ReplayAsync(path, (_, key, _) =>
+        {
+            entries.Add(Str(key));
+            return ValueTask.CompletedTask;
+        });
+
+        Assert.Single(entries);
+        Assert.Equal("key1", entries[0]);
+    }
+
+    [Fact]
+    public async Task Replay_Corrupted_Entry_Breaks_Rolling_Chain()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        // Write two committed transactions via the WAL
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync([(Key("key1"), Val("val1"))]);
+            await wal.CommitAsync([(Key("key2"), Val("val2"))]);
+        }
+
+        // Corrupt a byte in the second transaction's Put entry body.
+        // First tx: Put(25 bytes) + Commit(9 bytes) = 34 bytes offset.
+        var bytes = await File.ReadAllBytesAsync(path);
+        bytes[34 + 10] ^= 0xFF;
+        await File.WriteAllBytesAsync(path, bytes);
+
+        var entries = new List<string>();
+        await WriteAheadLog.ReplayAsync(path, (_, key, _) =>
+        {
+            entries.Add(Str(key));
+            return ValueTask.CompletedTask;
+        });
+
+        // Only first transaction delivered; second is discarded due to CRC chain break
+        Assert.Single(entries);
+        Assert.Equal("key1", entries[0]);
+    }
+
+    private static uint WriteRawPut(BinaryWriter writer, byte[] key, byte[] value, uint prevCrc)
+    {
+        int bodyLen = 1 + 4 + key.Length + 4 + value.Length;
+        writer.Write(bodyLen + 4); // entry length
+
+        var body = new byte[bodyLen];
+        int offset = 0;
+        body[offset++] = (byte)WalEntryType.Put;
+        BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(offset), key.Length);
+        offset += 4;
+        key.CopyTo(body, offset);
+        offset += key.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(offset), value.Length);
+        offset += 4;
+        value.CopyTo(body, offset);
+
+        writer.Write(body);
+
+        uint crc = TestRollingCrc(body, prevCrc);
+        writer.Write(crc);
+        return crc;
+    }
+
+    private static void WriteRawCommit(BinaryWriter writer, uint prevCrc)
+    {
+        const int bodyLen = 1;
+        writer.Write(bodyLen + 4); // entry length = 5
+
+        byte[] body = [(byte)WalEntryType.Commit];
+        writer.Write(body);
+
+        uint crc = TestRollingCrc(body, prevCrc);
+        writer.Write(crc);
+    }
+
+    private static uint TestRollingCrc(byte[] body, uint prevCrc)
+    {
+        var crc = new Crc32();
+        var seed = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(seed, prevCrc);
+        crc.Append(seed);
+        crc.Append(body);
+        return crc.GetCurrentHashAsUInt32();
     }
 }
 
