@@ -101,7 +101,18 @@ public sealed class Database : IAsyncDisposable
             return;
 
         _schemaDirty = false;
+        await LoadSchemaAsync().ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// Loads the schema catalog from the committed <c>__schema</c> entries in the LSM store.
+    /// Called both during database open (to restore persisted schema) and on transaction
+    /// rollback (to revert in-memory mutations).
+    /// The OID autoincrement counter is set to <c>max(oid)</c> so future allocations
+    /// continue from the next unused value.
+    /// </summary>
+    internal async ValueTask LoadSchemaAsync()
+    {
         // Collect all committed __schema entries via a prefix scan on Oid=0
         var prefix = RowKeyEncoder.EncodeTablePrefix(new Oid(0));
         var rootTable = Schema.RootTable;
@@ -146,11 +157,15 @@ public sealed class Database : IAsyncDisposable
 
         foreach (var (oid, type, definition) in entries)
         {
-            // Set autoincrement so the next AllocateOid() returns exactly this OID
+            // Preset autoincrement so AllocateOid() returns exactly this OID
             rootTable.Columns[0].SetAutoIncrement((long)oid.Value - 1);
             var stmt = SqlParser.Parse(definition);
             Schema.Apply(stmt);
         }
+
+        // Set autoincrement to max(oid) so future allocations start at max+1
+        if (entries.Count > 0)
+            rootTable.Columns[0].SetAutoIncrement((long)entries[^1].Oid.Value);
     }
 
     internal async ValueTask<object?> ExecuteScalarAsync(string sql, ReadOnlyTransaction? transaction)
@@ -278,7 +293,9 @@ public sealed class DatabasePool
                 try
                 {
                     var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = _directory }).ConfigureAwait(false);
-                    _initialized.TrySetResult(new Database(store, _directory));
+                    var db = new Database(store, _directory);
+                    await db.LoadSchemaAsync().ConfigureAwait(false);
+                    _initialized.TrySetResult(db);
                 }
                 catch (Exception ex)
                 {
