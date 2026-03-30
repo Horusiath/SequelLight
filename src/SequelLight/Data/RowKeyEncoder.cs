@@ -70,14 +70,11 @@ public static class RowKeyEncoder
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int ColumnKeySize(DbValue value, DbType type)
     {
-        return type switch
-        {
-            DbType.Integer => 8,
-            DbType.Real => 8,
-            DbType.Text => EncodedBytesSize(value.AsText().Span),
-            DbType.Blob => EncodedBytesSize(value.AsBlob().Span),
-            _ => throw new ArgumentOutOfRangeException(nameof(type)),
-        };
+        if (type.IsInteger() || type == DbType.Float64)
+            return 8;
+        if (type == DbType.Bytes)
+            return EncodedBytesSize(value.AsBlob().Span);
+        throw new ArgumentOutOfRangeException(nameof(type));
     }
 
     private static int EncodedBytesSize(ReadOnlySpan<byte> data)
@@ -89,16 +86,17 @@ public static class RowKeyEncoder
 
     private static int EncodeColumn(Span<byte> dest, DbValue value, DbType type)
     {
+        if (type.IsInteger())
+        {
+            long v = value.AsInteger();
+            BinaryPrimitives.WriteInt64BigEndian(dest, v);
+            dest[0] ^= 0x80; // sign-bit flip for sort-preserving comparison
+            return 8;
+        }
+
         switch (type)
         {
-            case DbType.Integer:
-            {
-                long v = value.AsInteger();
-                BinaryPrimitives.WriteInt64BigEndian(dest, v);
-                dest[0] ^= 0x80; // sign-bit flip for sort-preserving comparison
-                return 8;
-            }
-            case DbType.Real:
+            case DbType.Float64:
             {
                 long bits = BitConverter.DoubleToInt64Bits(value.AsReal());
                 if (bits >= 0)
@@ -108,9 +106,7 @@ public static class RowKeyEncoder
                 BinaryPrimitives.WriteInt64BigEndian(dest, bits);
                 return 8;
             }
-            case DbType.Text:
-                return EncodeBytes(dest, value.AsText().Span);
-            case DbType.Blob:
+            case DbType.Bytes:
                 return EncodeBytes(dest, value.AsBlob().Span);
             default:
                 throw new ArgumentOutOfRangeException(nameof(type));
@@ -145,21 +141,18 @@ public static class RowKeyEncoder
 
     private static int DecodeColumn(ReadOnlySpan<byte> src, DbType type, out DbValue value)
     {
+        if (type.IsInteger())
+        {
+            long v = BinaryPrimitives.ReadInt64BigEndian(src) ^ unchecked((long)0x8000_0000_0000_0000);
+            value = DbValue.Integer(v);
+            return 8;
+        }
+
         switch (type)
         {
-            case DbType.Integer:
-            {
-                // XOR the MSB of the big-endian long directly — equivalent to XORing byte[0]
-                // but avoids a stackalloc + 8-byte copy.
-                long v = BinaryPrimitives.ReadInt64BigEndian(src) ^ unchecked((long)0x8000_0000_0000_0000);
-                value = DbValue.Integer(v);
-                return 8;
-            }
-            case DbType.Real:
+            case DbType.Float64:
             {
                 long bits = BinaryPrimitives.ReadInt64BigEndian(src);
-                // Encoding flips: positive → XOR 0x80..00 (MSB 0→1), negative → XOR 0xFF..FF (MSB 1→0)
-                // So stored MSB=1 means original was positive, MSB=0 means original was negative
                 if (bits < 0)
                     bits ^= unchecked((long)0x8000_0000_0000_0000);
                 else
@@ -167,13 +160,7 @@ public static class RowKeyEncoder
                 value = DbValue.Real(BitConverter.Int64BitsToDouble(bits));
                 return 8;
             }
-            case DbType.Text:
-            {
-                int consumed = DecodeBytes(src, out var data);
-                value = DbValue.Text(data);
-                return consumed;
-            }
-            case DbType.Blob:
+            case DbType.Bytes:
             {
                 int consumed = DecodeBytes(src, out var data);
                 value = DbValue.Blob(data);

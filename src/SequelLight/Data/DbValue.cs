@@ -4,10 +4,38 @@ namespace SequelLight.Data;
 
 public enum DbType : byte
 {
-    Integer = 1,
-    Real = 2,
-    Text = 3,
-    Blob = 4,
+    UInt8 = 1,
+    UInt16 = 2,
+    UInt32 = 3,
+    UInt64 = 4,
+    Int8 = 5,
+    Int16 = 6,
+    Int32 = 7,
+    Int64 = 8,
+    Float64 = 9,
+    Bytes = 10,
+}
+
+public static class DbTypeExtensions
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsInteger(this DbType type) => type >= DbType.UInt8 && type <= DbType.Int64;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsUnsigned(this DbType type) => type >= DbType.UInt8 && type <= DbType.UInt64;
+
+    /// <summary>
+    /// Returns the fixed byte size for scalar types, or -1 for variable-length (<see cref="DbType.Bytes"/>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int FixedSize(this DbType type) => type switch
+    {
+        DbType.UInt8 or DbType.Int8 => 1,
+        DbType.UInt16 or DbType.Int16 => 2,
+        DbType.UInt32 or DbType.Int32 => 4,
+        DbType.UInt64 or DbType.Int64 or DbType.Float64 => 8,
+        _ => -1,
+    };
 }
 
 public static class TypeAffinity
@@ -15,20 +43,26 @@ public static class TypeAffinity
     public static DbType Resolve(string? typeName)
     {
         if (typeName is null)
-            return DbType.Blob;
+            return DbType.Bytes;
 
         var upper = typeName.AsSpan();
 
+        if (Contains(upper, "BOOL"))
+            return DbType.UInt8;
+        if (Contains(upper, "TINY") && Contains(upper, "INT"))
+            return DbType.Int8;
+        if (Contains(upper, "SMALL") && Contains(upper, "INT"))
+            return DbType.Int16;
         if (Contains(upper, "INT"))
-            return DbType.Integer;
+            return DbType.Int64;
         if (Contains(upper, "CHAR") || Contains(upper, "CLOB") || Contains(upper, "TEXT"))
-            return DbType.Text;
+            return DbType.Bytes;
         if (upper.Length == 4 && upper.Equals("BLOB", StringComparison.OrdinalIgnoreCase))
-            return DbType.Blob;
+            return DbType.Bytes;
         if (Contains(upper, "REAL") || Contains(upper, "FLOA") || Contains(upper, "DOUB"))
-            return DbType.Real;
+            return DbType.Float64;
 
-        return DbType.Integer; // NUMERIC affinity
+        return DbType.Int64; // NUMERIC affinity
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -55,54 +89,52 @@ public readonly struct DbValue : IEquatable<DbValue>
     public DbType Type => _type;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static DbValue Integer(long value) => new(DbType.Integer, value, default);
+    public static DbValue Integer(long value) => new(DbType.Int64, value, default);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static DbValue Real(double value) => new(DbType.Real, BitConverter.DoubleToInt64Bits(value), default);
+    public static DbValue Real(double value) => new(DbType.Float64, BitConverter.DoubleToInt64Bits(value), default);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static DbValue Text(ReadOnlyMemory<byte> utf8) => new(DbType.Text, 0, utf8);
+    public static DbValue Text(ReadOnlyMemory<byte> utf8) => new(DbType.Bytes, 0, utf8);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static DbValue Blob(ReadOnlyMemory<byte> data) => new(DbType.Blob, 0, data);
+    public static DbValue Blob(ReadOnlyMemory<byte> data) => new(DbType.Bytes, 0, data);
 
     public long AsInteger()
     {
-        if (_type != DbType.Integer) ThrowTypeMismatch(DbType.Integer);
+        if (!_type.IsInteger()) ThrowTypeMismatch("integer");
         return _bits;
     }
 
     public double AsReal()
     {
-        if (_type != DbType.Real) ThrowTypeMismatch(DbType.Real);
+        if (_type != DbType.Float64) ThrowTypeMismatch(DbType.Float64.ToString());
         return BitConverter.Int64BitsToDouble(_bits);
     }
 
     public ReadOnlyMemory<byte> AsText()
     {
-        if (_type != DbType.Text) ThrowTypeMismatch(DbType.Text);
+        if (_type != DbType.Bytes) ThrowTypeMismatch(DbType.Bytes.ToString());
         return _bytes;
     }
 
     public ReadOnlyMemory<byte> AsBlob()
     {
-        if (_type != DbType.Blob) ThrowTypeMismatch(DbType.Blob);
+        if (_type != DbType.Bytes) ThrowTypeMismatch(DbType.Bytes.ToString());
         return _bytes;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private void ThrowTypeMismatch(DbType expected)
+    private void ThrowTypeMismatch(string expected)
         => throw new InvalidOperationException($"Expected {expected}, but value is {(_type == 0 ? "Null" : _type.ToString())}");
 
     public bool Equals(DbValue other)
     {
         if (_type != other._type) return false;
         if (_type == 0) return true;
-        return _type switch
-        {
-            DbType.Integer or DbType.Real => _bits == other._bits,
-            _ => _bytes.Span.SequenceEqual(other._bytes.Span),
-        };
+        if (_type.IsInteger() || _type == DbType.Float64)
+            return _bits == other._bits;
+        return _bytes.Span.SequenceEqual(other._bytes.Span);
     }
 
     public override bool Equals(object? obj) => obj is DbValue other && Equals(other);
@@ -110,11 +142,9 @@ public readonly struct DbValue : IEquatable<DbValue>
     public override int GetHashCode()
     {
         if (_type == 0) return 0;
-        return _type switch
-        {
-            DbType.Integer or DbType.Real => HashCode.Combine(_type, _bits),
-            _ => HashCode.Combine(_type, _bytes.Length),
-        };
+        if (_type.IsInteger() || _type == DbType.Float64)
+            return HashCode.Combine(_type, _bits);
+        return HashCode.Combine(_type, _bytes.Length);
     }
 
     public static bool operator ==(DbValue left, DbValue right) => left.Equals(right);
@@ -123,10 +153,9 @@ public readonly struct DbValue : IEquatable<DbValue>
     public override string ToString() => _type switch
     {
         0 => "NULL",
-        DbType.Integer => _bits.ToString(),
-        DbType.Real => BitConverter.Int64BitsToDouble(_bits).ToString(),
-        DbType.Text => $"'{System.Text.Encoding.UTF8.GetString(_bytes.Span)}'",
-        DbType.Blob => $"x'{Convert.ToHexString(_bytes.Span)}'",
+        DbType.Float64 => BitConverter.Int64BitsToDouble(_bits).ToString(),
+        DbType.Bytes => $"x'{Convert.ToHexString(_bytes.Span)}'",
+        _ when _type.IsInteger() => _bits.ToString(),
         _ => "?",
     };
 }

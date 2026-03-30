@@ -96,7 +96,7 @@ public readonly struct SchemaChange
 public sealed class ColumnSchema : IEquatable<ColumnSchema>
 {
     public ColumnSchema(
-        int seqNo,
+        ushort seqNo,
         string name,
         string? typeName,
         ColumnFlags flags,
@@ -119,7 +119,7 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
         GeneratedExpression = generatedExpression;
     }
 
-    public int SeqNo { get; }
+    public ushort SeqNo { get; }
     public string Name { get; internal set; }
     public string? TypeName { get; }
     public ColumnFlags Flags { get; }
@@ -230,7 +230,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
         bool withoutRowId,
         bool isStrict,
         IReadOnlyList<ColumnSchema> columns,
-        int nextColumnSeqNo,
+        ushort nextColumnSeqNo,
         PrimaryKeySchema? primaryKey,
         IReadOnlyList<UniqueConstraintSchema> uniqueConstraints,
         IReadOnlyList<CheckConstraintSchema> checkConstraints,
@@ -255,7 +255,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
     public bool WithoutRowId { get; }
     public bool IsStrict { get; }
     public IReadOnlyList<ColumnSchema> Columns { get; internal set; }
-    public int NextColumnSeqNo { get; internal set; }
+    public ushort NextColumnSeqNo { get; internal set; }
     public PrimaryKeySchema? PrimaryKey { get; }
     public IReadOnlyList<UniqueConstraintSchema> UniqueConstraints { get; }
     public IReadOnlyList<CheckConstraintSchema> CheckConstraints { get; }
@@ -266,7 +266,8 @@ public sealed class TableSchema : IEquatable<TableSchema>
     private int[]? _pkColumnIndices;
     private DbType[]? _pkColumnTypes;
     private int[]? _valueColumnIndices;
-    private int[]? _valueColumnSeqNos;
+    private ushort[]? _valueColumnSeqNos;
+    private DbType[]? _valueColumnTypes;
 
     private void EnsureEncodingMetadata()
     {
@@ -283,7 +284,8 @@ public sealed class TableSchema : IEquatable<TableSchema>
         var pkIndices = new int[pkCount];
         var pkTypes = new DbType[pkCount];
         var valIndices = new int[valCount];
-        var valSeqNos = new int[valCount];
+        var valSeqNos = new ushort[valCount];
+        var valTypes = new DbType[valCount];
         int pk = 0, val = 0;
 
         for (int i = 0; i < Columns.Count; i++)
@@ -298,6 +300,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
             {
                 valIndices[val] = i;
                 valSeqNos[val] = Columns[i].SeqNo;
+                valTypes[val] = TypeAffinity.Resolve(Columns[i].TypeName);
                 val++;
             }
         }
@@ -306,6 +309,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
         _pkColumnTypes = pkTypes;
         _valueColumnIndices = valIndices;
         _valueColumnSeqNos = valSeqNos;
+        _valueColumnTypes = valTypes;
         _encodingColumns = Columns;
     }
 
@@ -334,7 +338,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
         var values = new DbValue[indices.Length];
         for (int i = 0; i < indices.Length; i++)
             values[i] = row[indices[i]];
-        return RowValueEncoder.Encode(values, _valueColumnSeqNos!);
+        return RowValueEncoder.Encode(values, _valueColumnSeqNos!, _valueColumnTypes!);
     }
 
     public bool Equals(TableSchema? other) => other is not null && Oid == other.Oid;

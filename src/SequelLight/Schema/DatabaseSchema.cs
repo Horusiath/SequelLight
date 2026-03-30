@@ -142,7 +142,7 @@ public sealed class DatabaseSchema
 
         // Build columns, resolving column-level constraints
         var columns = new ColumnSchema[body.Columns.Count];
-        int nextColSeq = 0;
+        ushort nextColSeq = 0;
         for (int i = 0; i < body.Columns.Count; i++)
         {
             var colDef = body.Columns[i];
@@ -179,7 +179,7 @@ public sealed class DatabaseSchema
             if (autoincrementCount > 1)
                 throw new InvalidOperationException("A table may have at most one AUTOINCREMENT column.");
 
-            if (TypeAffinity.Resolve(columns[i].TypeName) != Data.DbType.Integer)
+            if (!TypeAffinity.Resolve(columns[i].TypeName).IsInteger())
                 throw new InvalidOperationException("AUTOINCREMENT is only allowed on INTEGER columns.");
 
             if (tablePkColumnNames is { Length: > 1 })
@@ -210,7 +210,7 @@ public sealed class DatabaseSchema
             withoutRowId,
             isStrict,
             columns,
-            nextColSeq + 1,
+            (ushort)(nextColSeq + 1),
             primaryKey,
             (IReadOnlyList<UniqueConstraintSchema>?)uniqueConstraints ?? Array.Empty<UniqueConstraintSchema>(),
             (IReadOnlyList<CheckConstraintSchema>?)checkConstraints ?? Array.Empty<CheckConstraintSchema>(),
@@ -445,7 +445,7 @@ public sealed class DatabaseSchema
         return changes.ToArray();
     }
 
-    private static ColumnSchema BuildColumn(int seqNo, ColumnDef colDef, string[]? tablePkColumns)
+    private static ColumnSchema BuildColumn(ushort seqNo, ColumnDef colDef, string[]? tablePkColumns)
     {
         var flags = ColumnFlags.None;
         SortOrder? pkOrder = null;

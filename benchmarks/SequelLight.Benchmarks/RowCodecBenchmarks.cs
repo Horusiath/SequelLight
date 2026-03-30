@@ -100,7 +100,7 @@ public class VarintBenchmarks
 
 // ---------------------------------------------------------------------------
 //  RowKeyEncoder benchmarks
-//  Coverage: 1-col INTEGER, 1-col TEXT, 2-col (INT+INT), 2-col (INT+TEXT)
+//  Coverage: 1-col INT64, 1-col BYTES, 2-col (INT64+INT64), 2-col (INT64+BYTES)
 //  Both encode (byte[] allocating) and decode for each shape.
 // ---------------------------------------------------------------------------
 
@@ -110,10 +110,10 @@ public class RowKeyEncoderBenchmarks
     private static readonly Oid TableOid = new(42);
 
     // PK type arrays — reused across iterations, zero allocation.
-    private static readonly DbType[] Int1 = [DbType.Integer];
-    private static readonly DbType[] Text1 = [DbType.Text];
-    private static readonly DbType[] IntInt = [DbType.Integer, DbType.Integer];
-    private static readonly DbType[] IntText = [DbType.Integer, DbType.Text];
+    private static readonly DbType[] Int1 = [DbType.Int64];
+    private static readonly DbType[] Bytes1 = [DbType.Bytes];
+    private static readonly DbType[] IntInt = [DbType.Int64, DbType.Int64];
+    private static readonly DbType[] IntBytes = [DbType.Int64, DbType.Bytes];
 
     // Input rows
     private DbValue[] _pkInt = null!;
@@ -140,9 +140,9 @@ public class RowKeyEncoderBenchmarks
         _pkIntText = [DbValue.Integer(42), DbValue.Text("order_item_999"u8.ToArray())];
 
         _encInt = RowKeyEncoder.Encode(TableOid, _pkInt, Int1);
-        _encText = RowKeyEncoder.Encode(TableOid, _pkText, Text1);
+        _encText = RowKeyEncoder.Encode(TableOid, _pkText, Bytes1);
         _encIntInt = RowKeyEncoder.Encode(TableOid, _pkIntInt, IntInt);
-        _encIntText = RowKeyEncoder.Encode(TableOid, _pkIntText, IntText);
+        _encIntText = RowKeyEncoder.Encode(TableOid, _pkIntText, IntBytes);
 
         _dec1 = new DbValue[1];
         _dec2 = new DbValue[2];
@@ -150,49 +150,49 @@ public class RowKeyEncoderBenchmarks
 
     // ---- Encode (allocating byte[]) ----
 
-    [Benchmark(Description = "Key encode: 1-col INTEGER")]
+    [Benchmark(Description = "Key encode: 1-col INT64")]
     public byte[] Encode_Int()
         => RowKeyEncoder.Encode(TableOid, _pkInt, Int1);
 
-    [Benchmark(Description = "Key encode: 1-col TEXT")]
+    [Benchmark(Description = "Key encode: 1-col BYTES")]
     public byte[] Encode_Text()
-        => RowKeyEncoder.Encode(TableOid, _pkText, Text1);
+        => RowKeyEncoder.Encode(TableOid, _pkText, Bytes1);
 
-    [Benchmark(Description = "Key encode: 2-col INT+INT")]
+    [Benchmark(Description = "Key encode: 2-col INT64+INT64")]
     public byte[] Encode_IntInt()
         => RowKeyEncoder.Encode(TableOid, _pkIntInt, IntInt);
 
-    [Benchmark(Description = "Key encode: 2-col INT+TEXT")]
+    [Benchmark(Description = "Key encode: 2-col INT64+BYTES")]
     public byte[] Encode_IntText()
-        => RowKeyEncoder.Encode(TableOid, _pkIntText, IntText);
+        => RowKeyEncoder.Encode(TableOid, _pkIntText, IntBytes);
 
     // ---- Decode ----
 
-    [Benchmark(Description = "Key decode: 1-col INTEGER")]
+    [Benchmark(Description = "Key decode: 1-col INT64")]
     public DbValue Decode_Int()
     {
         RowKeyEncoder.Decode(_encInt, out _, _dec1, Int1);
         return _dec1[0];
     }
 
-    [Benchmark(Description = "Key decode: 1-col TEXT")]
+    [Benchmark(Description = "Key decode: 1-col BYTES")]
     public DbValue Decode_Text()
     {
-        RowKeyEncoder.Decode(_encText, out _, _dec1, Text1);
+        RowKeyEncoder.Decode(_encText, out _, _dec1, Bytes1);
         return _dec1[0];
     }
 
-    [Benchmark(Description = "Key decode: 2-col INT+INT")]
+    [Benchmark(Description = "Key decode: 2-col INT64+INT64")]
     public DbValue Decode_IntInt()
     {
         RowKeyEncoder.Decode(_encIntInt, out _, _dec2, IntInt);
         return _dec2[0];
     }
 
-    [Benchmark(Description = "Key decode: 2-col INT+TEXT")]
+    [Benchmark(Description = "Key decode: 2-col INT64+BYTES")]
     public DbValue Decode_IntText()
     {
-        RowKeyEncoder.Decode(_encIntText, out _, _dec2, IntText);
+        RowKeyEncoder.Decode(_encIntText, out _, _dec2, IntBytes);
         return _dec2[0];
     }
 }
@@ -206,36 +206,44 @@ public class RowKeyEncoderBenchmarks
 [MemoryDiagnoser]
 public class RowValueEncoderBenchmarks
 {
-    // 2-column row: INTEGER + TEXT
+    // 2-column row: INT64 + BYTES
     private DbValue[] _row2 = null!;
-    private int[] _seq2 = null!;
+    private ushort[] _seq2 = null!;
+    private DbType[] _types2 = null!;
     private byte[] _enc2 = null!;
     private ColumnSchema[] _cols2 = null!;
     private DbValue[] _dec2 = null!;
 
     // 10-column row: mixed types
     private DbValue[] _row10 = null!;
-    private int[] _seq10 = null!;
+    private ushort[] _seq10 = null!;
+    private DbType[] _types10 = null!;
     private byte[] _enc10 = null!;
     private ColumnSchema[] _cols10 = null!;
     private DbValue[] _dec10 = null!;
 
     // 40-column row: mixed types
     private DbValue[] _row40 = null!;
-    private int[] _seq40 = null!;
+    private ushort[] _seq40 = null!;
+    private DbType[] _types40 = null!;
     private byte[] _enc40 = null!;
     private ColumnSchema[] _cols40 = null!;
     private DbValue[] _dec40 = null!;
 
     // DecodeColumns projection buffers
     private DbValue[] _decSubset3 = null!;
-    private int[] _seqSubset3 = null!;
-    private int[] _seqReversed10 = null!;
+    private ushort[] _seqSubset3 = null!;
+    private DbType[] _typesSubset3 = null!;
+    private ushort[] _seqReversed10 = null!;
+    private DbType[] _typesReversed10 = null!;
     private DbValue[] _decSubset5 = null!;
-    private int[] _seqSubset5 = null!;
+    private ushort[] _seqSubset5 = null!;
+    private DbType[] _typesSubset5 = null!;
     private DbValue[] _decSingle = null!;
-    private int[] _seqMid10 = null!;
-    private int[] _seqMid40 = null!;
+    private ushort[] _seqMid10 = null!;
+    private DbType[] _typesMid10 = null!;
+    private ushort[] _seqMid40 = null!;
+    private DbType[] _typesMid40 = null!;
 
     [GlobalSetup]
     public void Setup()
@@ -243,9 +251,10 @@ public class RowValueEncoderBenchmarks
         // --- 2-column row ---
         _row2 = [DbValue.Integer(1_000_000), DbValue.Text("Alice Johnson"u8.ToArray())];
         _seq2 = [1, 2];
+        _types2 = [DbType.Int64, DbType.Bytes];
         _cols2 = MakeColumns(("id", "INTEGER", 1), ("name", "TEXT", 2));
 
-        // --- 10-column row: INT, TEXT, REAL, BLOB, INT, TEXT, REAL, INT, TEXT, INT ---
+        // --- 10-column row: INT64, BYTES, FLOAT64, BYTES, INT64, BYTES, FLOAT64, INT64, BYTES, INT64 ---
         _row10 =
         [
             DbValue.Integer(42),
@@ -260,36 +269,42 @@ public class RowValueEncoderBenchmarks
             DbValue.Integer(0),
         ];
         _seq10 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        _types10 = [DbType.Int64, DbType.Bytes, DbType.Float64, DbType.Bytes, DbType.Int64, DbType.Bytes, DbType.Float64, DbType.Int64, DbType.Bytes, DbType.Int64];
         _cols10 = MakeColumns(
             ("c1", "INTEGER", 1), ("c2", "TEXT", 2), ("c3", "REAL", 3),
             ("c4", "BLOB", 4), ("c5", "INTEGER", 5), ("c6", "TEXT", 6),
             ("c7", "REAL", 7), ("c8", "INTEGER", 8), ("c9", "TEXT", 9),
             ("c10", "INTEGER", 10));
 
-        // --- 40-column row: repeating pattern of INT, TEXT, REAL, BLOB ---
+        // --- 40-column row: repeating pattern of INT64, BYTES, FLOAT64, BYTES ---
         _row40 = new DbValue[40];
-        _seq40 = new int[40];
-        var cols40Defs = new (string, string, int)[40];
+        _seq40 = new ushort[40];
+        _types40 = new DbType[40];
+        var cols40Defs = new (string, string, ushort)[40];
         for (int i = 0; i < 40; i++)
         {
-            int seqNo = i + 1;
+            ushort seqNo = (ushort)(i + 1);
             _seq40[i] = seqNo;
             switch (i % 4)
             {
                 case 0:
                     _row40[i] = DbValue.Integer(i * 1000L + 1);
+                    _types40[i] = DbType.Int64;
                     cols40Defs[i] = ($"c{seqNo}", "INTEGER", seqNo);
                     break;
                 case 1:
                     _row40[i] = DbValue.Text(Encoding.UTF8.GetBytes($"val_{i:D4}"));
+                    _types40[i] = DbType.Bytes;
                     cols40Defs[i] = ($"c{seqNo}", "TEXT", seqNo);
                     break;
                 case 2:
                     _row40[i] = DbValue.Real(i * 0.123);
+                    _types40[i] = DbType.Float64;
                     cols40Defs[i] = ($"c{seqNo}", "REAL", seqNo);
                     break;
                 case 3:
                     _row40[i] = DbValue.Blob(new byte[8]);
+                    _types40[i] = DbType.Bytes;
                     cols40Defs[i] = ($"c{seqNo}", "BLOB", seqNo);
                     break;
             }
@@ -297,9 +312,9 @@ public class RowValueEncoderBenchmarks
         _cols40 = MakeColumns(cols40Defs);
 
         // Pre-encode for decode benchmarks
-        _enc2 = RowValueEncoder.Encode(_row2, _seq2);
-        _enc10 = RowValueEncoder.Encode(_row10, _seq10);
-        _enc40 = RowValueEncoder.Encode(_row40, _seq40);
+        _enc2 = RowValueEncoder.Encode(_row2, _seq2, _types2);
+        _enc10 = RowValueEncoder.Encode(_row10, _seq10, _types10);
+        _enc40 = RowValueEncoder.Encode(_row40, _seq40, _types40);
 
         // Pre-allocate decode output buffers
         _dec2 = new DbValue[2];
@@ -309,27 +324,35 @@ public class RowValueEncoderBenchmarks
         // DecodeColumns projection buffers
         _decSubset3 = new DbValue[3];
         _seqSubset3 = [2, 5, 9];
+        _typesSubset3 = [DbType.Bytes, DbType.Int64, DbType.Bytes]; // cols 2, 5, 9 from 10-col types
+
         _seqReversed10 = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        _typesReversed10 = [DbType.Int64, DbType.Bytes, DbType.Int64, DbType.Float64, DbType.Bytes, DbType.Int64, DbType.Bytes, DbType.Float64, DbType.Bytes, DbType.Int64];
+
         _decSubset5 = new DbValue[5];
         _seqSubset5 = [3, 10, 20, 30, 38];
+        _typesSubset5 = [DbType.Float64, DbType.Bytes, DbType.Bytes, DbType.Bytes, DbType.Bytes]; // cols 3, 10, 20, 30, 38 from 40-col types
+
         _decSingle = new DbValue[1];
         _seqMid10 = [5];   // middle of 10-col row
+        _typesMid10 = [DbType.Int64]; // col 5 = Int64
         _seqMid40 = [20];  // middle of 40-col row
+        _typesMid40 = [DbType.Bytes]; // col 20 = pattern index 19 => 19%4=3 => Bytes
     }
 
     // ---- Encode (allocating byte[]) ----
 
     [Benchmark(Description = "Value encode: 2-col")]
     public byte[] Encode_2()
-        => RowValueEncoder.Encode(_row2, _seq2);
+        => RowValueEncoder.Encode(_row2, _seq2, _types2);
 
     [Benchmark(Description = "Value encode: 10-col")]
     public byte[] Encode_10()
-        => RowValueEncoder.Encode(_row10, _seq10);
+        => RowValueEncoder.Encode(_row10, _seq10, _types10);
 
     [Benchmark(Description = "Value encode: 40-col")]
     public byte[] Encode_40()
-        => RowValueEncoder.Encode(_row40, _seq40);
+        => RowValueEncoder.Encode(_row40, _seq40, _types40);
 
     // ---- Decode ----
 
@@ -359,53 +382,53 @@ public class RowValueEncoderBenchmarks
     [Benchmark(Description = "Value decodeColumns: all 10-col")]
     public DbValue DecodeColumns_All_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seq10);
+        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seq10, _types10);
         return _dec10[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 3 of 10-col")]
     public DbValue DecodeColumns_Subset_3of10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _decSubset3, _seqSubset3);
+        RowValueEncoder.DecodeColumns(_enc10, _decSubset3, _seqSubset3, _typesSubset3);
         return _decSubset3[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: all 10-col reversed")]
     public DbValue DecodeColumns_Reversed_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seqReversed10);
+        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seqReversed10, _typesReversed10);
         return _dec10[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 5 of 40-col")]
     public DbValue DecodeColumns_Subset_5of40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _decSubset5, _seqSubset5);
+        RowValueEncoder.DecodeColumns(_enc40, _decSubset5, _seqSubset5, _typesSubset5);
         return _decSubset5[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 1 mid of 10-col")]
     public DbValue DecodeColumns_SingleMid_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _decSingle, _seqMid10);
+        RowValueEncoder.DecodeColumns(_enc10, _decSingle, _seqMid10, _typesMid10);
         return _decSingle[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 1 mid of 40-col")]
     public DbValue DecodeColumns_SingleMid_40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _decSingle, _seqMid40);
+        RowValueEncoder.DecodeColumns(_enc40, _decSingle, _seqMid40, _typesMid40);
         return _decSingle[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: all 40-col")]
     public DbValue DecodeColumns_All_40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _dec40, _seq40);
+        RowValueEncoder.DecodeColumns(_enc40, _dec40, _seq40, _types40);
         return _dec40[0];
     }
 
-    private static ColumnSchema[] MakeColumns(params (string Name, string TypeName, int SeqNo)[] cols)
+    private static ColumnSchema[] MakeColumns(params (string Name, string TypeName, ushort SeqNo)[] cols)
     {
         var result = new ColumnSchema[cols.Length];
         for (int i = 0; i < cols.Length; i++)

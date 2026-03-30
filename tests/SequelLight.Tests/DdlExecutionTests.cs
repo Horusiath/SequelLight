@@ -8,7 +8,7 @@ namespace SequelLight.Tests;
 public class DdlExecutionTests : TempDirTest
 {
     private static readonly Oid RootOid = new(0);
-    private static readonly DbType[] PkTypes = [DbType.Integer];
+    private static readonly DbType[] PkTypes = [DbType.Int64];
 
     private static byte[] SchemaKey(long oid)
     {

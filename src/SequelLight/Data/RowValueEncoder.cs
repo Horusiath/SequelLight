@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using SequelLight.Schema;
@@ -6,83 +5,109 @@ using SequelLight.Schema;
 namespace SequelLight.Data;
 
 /// <summary>
-/// Encodes/decodes row values in a protobuf-like format.
-/// Layout per non-NULL column: [varint(seqNo)] [type_tag(1 byte)] [encoded_value]
-/// The type tag enables skipping unknown seqNos for forward compatibility.
+/// Encodes/decodes row values in a FlatBuffer-style format with O(1) random field access.
+///
+/// Layout:
+/// <code>
+/// [u16 slot_count]                                // max seqNo + 1
+/// [u16 slot[0]] ... [u16 slot[slot_count-1]]      // absolute byte offsets from buffer start, 0 = null
+/// [field data...]                                  // scalars inline, Bytes as [u32 len][data]
+/// </code>
+///
+/// Offset 0 is an unambiguous null sentinel because field data always starts at
+/// offset ≥ 4 (2 bytes for slot_count + at least 2 bytes for one vtable slot).
 /// </summary>
 public static class RowValueEncoder
 {
-    private const int StackAllocLimit = 256;
-
-    /// <summary>
-    /// Max varint size (10) + type tag (1) + max value overhead per column.
-    /// Used for pessimistic single-pass sizing.
-    /// </summary>
-    private const int MaxPerColumnOverhead = 10 + 1 + 10; // varint seqNo + tag + varint length prefix
-
-    public static int ComputeValueSize(ReadOnlySpan<DbValue> values, ReadOnlySpan<int> seqNos)
+    public static int ComputeValueSize(ReadOnlySpan<DbValue> values, ReadOnlySpan<ushort> seqNos, ReadOnlySpan<DbType> types)
     {
-        int size = 0;
+        if (values.Length == 0) return 0;
+
+        ushort maxSeqNo = 0;
+        bool allNull = true;
+        for (int i = 0; i < seqNos.Length; i++)
+        {
+            if (!values[i].IsNull)
+            {
+                allNull = false;
+                if (seqNos[i] > maxSeqNo) maxSeqNo = seqNos[i];
+            }
+        }
+
+        if (allNull) return 0;
+
+        int slotCount = maxSeqNo + 1;
+        int headerSize = 2 + slotCount * 2;
+
+        int dataSize = 0;
         for (int i = 0; i < values.Length; i++)
         {
-            if (values[i].IsNull)
-                continue;
-
-            size += Varint.SizeOfUnsigned((ulong)seqNos[i]);
-            size += 1; // type tag
-            size += EncodedValueSize(values[i]);
+            if (values[i].IsNull) continue;
+            int fs = types[i].FixedSize();
+            if (fs > 0)
+                dataSize += fs;
+            else
+                dataSize += 4 + values[i].AsBlob().Length;
         }
-        return size;
+
+        return headerSize + dataSize;
     }
 
-    public static int Encode(Span<byte> dest, ReadOnlySpan<DbValue> values, ReadOnlySpan<int> seqNos)
+    public static int Encode(Span<byte> dest, ReadOnlySpan<DbValue> values, ReadOnlySpan<ushort> seqNos, ReadOnlySpan<DbType> types)
     {
-        int offset = 0;
+        if (values.Length == 0) return 0;
+
+        ushort maxSeqNo = 0;
+        for (int i = 0; i < seqNos.Length; i++)
+            if (!values[i].IsNull && seqNos[i] > maxSeqNo)
+                maxSeqNo = seqNos[i];
+
+        int slotCount = maxSeqNo + 1;
+        int headerSize = 2 + slotCount * 2;
+
+        BinaryPrimitives.WriteUInt16LittleEndian(dest, (ushort)slotCount);
+        dest.Slice(2, slotCount * 2).Clear();
+
+        int dataOffset = headerSize;
         for (int i = 0; i < values.Length; i++)
         {
-            if (values[i].IsNull)
-                continue;
+            if (values[i].IsNull) continue;
 
-            offset += Varint.WriteUnsigned(dest[offset..], (ulong)seqNos[i]);
-            dest[offset++] = (byte)values[i].Type;
-            offset += EncodeValue(dest[offset..], values[i]);
+            BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(2 + seqNos[i] * 2), (ushort)dataOffset);
+
+            int fs = types[i].FixedSize();
+            if (fs > 0)
+            {
+                EncodeScalar(dest[dataOffset..], values[i], types[i]);
+                dataOffset += fs;
+            }
+            else
+            {
+                var data = values[i].AsBlob().Span;
+                BinaryPrimitives.WriteUInt32LittleEndian(dest[dataOffset..], (uint)data.Length);
+                data.CopyTo(dest[(dataOffset + 4)..]);
+                dataOffset += 4 + data.Length;
+            }
         }
-        return offset;
+
+        return dataOffset;
     }
 
-    public static byte[] Encode(ReadOnlySpan<DbValue> values, ReadOnlySpan<int> seqNos)
+    public static byte[] Encode(ReadOnlySpan<DbValue> values, ReadOnlySpan<ushort> seqNos, ReadOnlySpan<DbType> types)
     {
-        // Compute pessimistic upper bound to avoid double iteration.
-        // Each non-null column: varint seqNo (≤10) + type tag (1) + value.
-        // For Integer: zigzag varint (≤10). For Real: 8. For Text/Blob: varint len (≤10) + data len.
-        int upperBound = 0;
+        if (values.Length == 0) return [];
+
         bool allNull = true;
         for (int i = 0; i < values.Length; i++)
         {
-            if (values[i].IsNull)
-                continue;
-            allNull = false;
-            upperBound += MaxPerColumnOverhead + DataLength(values[i]);
+            if (!values[i].IsNull) { allNull = false; break; }
         }
+        if (allNull) return [];
 
-        if (allNull)
-            return Array.Empty<byte>();
-
-        byte[]? rented = null;
-        Span<byte> buf = upperBound <= StackAllocLimit
-            ? stackalloc byte[upperBound]
-            : (rented = ArrayPool<byte>.Shared.Rent(upperBound));
-
-        try
-        {
-            int written = Encode(buf, values, seqNos);
-            return buf[..written].ToArray();
-        }
-        finally
-        {
-            if (rented is not null)
-                ArrayPool<byte>.Shared.Return(rented);
-        }
+        int size = ComputeValueSize(values, seqNos, types);
+        var result = new byte[size];
+        Encode(result, values, seqNos, types);
+        return result;
     }
 
     public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, IReadOnlyList<ColumnSchema> columns)
@@ -90,196 +115,101 @@ public static class RowValueEncoder
         for (int i = 0; i < values.Length; i++)
             values[i] = DbValue.Null;
 
-        int offset = 0;
-        while (offset < src.Length)
+        if (src.IsEmpty) return;
+
+        ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(src);
+
+        for (int i = 0; i < columns.Count; i++)
         {
-            offset += Varint.ReadUnsigned(src[offset..], out ulong rawSeqNo);
-            int seqNo = (int)rawSeqNo;
-            var typeTag = (DbType)src[offset++];
+            ushort seqNo = columns[i].SeqNo;
+            if (seqNo >= slotCount) continue;
 
-            // Linear scan — faster than building a lookup table for typical column counts (≤32).
-            int colIdx = -1;
-            for (int i = 0; i < columns.Count; i++)
-            {
-                if (columns[i].SeqNo == seqNo)
-                {
-                    colIdx = i;
-                    break;
-                }
-            }
+            ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(2 + seqNo * 2));
+            if (fieldOffset == 0) continue;
 
-            if (colIdx < 0)
-            {
-                offset += SkipValue(src[offset..], typeTag);
-            }
-            else
-            {
-                offset += DecodeValue(src[offset..], typeTag, out var value);
-                values[colIdx] = value;
-            }
+            var type = TypeAffinity.Resolve(columns[i].TypeName);
+            values[i] = DecodeField(src, fieldOffset, type);
         }
     }
 
     /// <summary>
-    /// Decodes only the requested columns from encoded row value bytes.
+    /// Decodes only the requested columns. O(1) per column via vtable lookup.
     /// <paramref name="values"/>[i] receives the value for <paramref name="requestedSeqNos"/>[i].
-    /// Columns not found in the encoded data are set to <see cref="DbValue.Null"/>.
-    /// The type tag stored inline allows skipping unrequested fields without schema metadata.
     /// </summary>
-    public static void DecodeColumns(ReadOnlySpan<byte> src, Span<DbValue> values, ReadOnlySpan<int> requestedSeqNos)
+    public static void DecodeColumns(
+        ReadOnlySpan<byte> src,
+        Span<DbValue> values,
+        ReadOnlySpan<ushort> requestedSeqNos,
+        ReadOnlySpan<DbType> requestedTypes)
     {
         for (int i = 0; i < values.Length; i++)
             values[i] = DbValue.Null;
 
-        if (src.IsEmpty || requestedSeqNos.IsEmpty)
-            return;
+        if (src.IsEmpty || requestedSeqNos.IsEmpty) return;
 
-        int remaining = requestedSeqNos.Length;
-        int offset = 0;
-        while (offset < src.Length && remaining > 0)
+        ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(src);
+
+        for (int i = 0; i < requestedSeqNos.Length; i++)
         {
-            offset += Varint.ReadUnsigned(src[offset..], out ulong rawSeqNo);
-            int seqNo = (int)rawSeqNo;
-            var typeTag = (DbType)src[offset++];
+            ushort seqNo = requestedSeqNos[i];
+            if (seqNo >= slotCount) continue;
 
-            int colIdx = -1;
-            for (int i = 0; i < requestedSeqNos.Length; i++)
-            {
-                if (requestedSeqNos[i] == seqNo)
-                {
-                    colIdx = i;
-                    break;
-                }
-            }
+            ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(2 + seqNo * 2));
+            if (fieldOffset == 0) continue;
 
-            if (colIdx < 0)
-            {
-                offset += SkipValue(src[offset..], typeTag);
-            }
-            else
-            {
-                offset += DecodeValue(src[offset..], typeTag, out var value);
-                values[colIdx] = value;
-                remaining--;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Returns the raw data length for Text/Blob, or 0 for fixed-width types.
-    /// Used only for pessimistic upper-bound sizing.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int DataLength(DbValue value) => value.Type switch
-    {
-        DbType.Integer => 0, // varint up to 10B, already in MaxPerColumnOverhead
-        DbType.Real => 8,
-        DbType.Text => value.AsText().Length,
-        DbType.Blob => value.AsBlob().Length,
-        _ => 0,
-    };
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int EncodedValueSize(DbValue value)
-    {
-        switch (value.Type)
-        {
-            case DbType.Integer: return Varint.SizeOfSigned(value.AsInteger());
-            case DbType.Real: return 8;
-            case DbType.Text:
-            {
-                int len = value.AsText().Length;
-                return Varint.SizeOfUnsigned((ulong)len) + len;
-            }
-            case DbType.Blob:
-            {
-                int len = value.AsBlob().Length;
-                return Varint.SizeOfUnsigned((ulong)len) + len;
-            }
-            default: throw new ArgumentOutOfRangeException();
+            values[i] = DecodeField(src, fieldOffset, requestedTypes[i]);
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int EncodeValue(Span<byte> dest, DbValue value)
-    {
-        switch (value.Type)
-        {
-            case DbType.Integer:
-                return Varint.WriteSigned(dest, value.AsInteger());
-            case DbType.Real:
-                BinaryPrimitives.WriteInt64LittleEndian(dest, BitConverter.DoubleToInt64Bits(value.AsReal()));
-                return 8;
-            case DbType.Text:
-            {
-                var span = value.AsText().Span;
-                int offset = Varint.WriteUnsigned(dest, (ulong)span.Length);
-                span.CopyTo(dest[offset..]);
-                return offset + span.Length;
-            }
-            case DbType.Blob:
-            {
-                var span = value.AsBlob().Span;
-                int offset = Varint.WriteUnsigned(dest, (ulong)span.Length);
-                span.CopyTo(dest[offset..]);
-                return offset + span.Length;
-            }
-            default:
-                throw new ArgumentOutOfRangeException();
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int DecodeValue(ReadOnlySpan<byte> src, DbType type, out DbValue value)
+    private static void EncodeScalar(Span<byte> dest, DbValue value, DbType type)
     {
         switch (type)
         {
-            case DbType.Integer:
-            {
-                int consumed = Varint.ReadSigned(src, out long v);
-                value = DbValue.Integer(v);
-                return consumed;
-            }
-            case DbType.Real:
-            {
-                double v = BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(src));
-                value = DbValue.Real(v);
-                return 8;
-            }
-            case DbType.Text:
-            {
-                int consumed = Varint.ReadUnsigned(src, out ulong len);
-                value = DbValue.Text(src.Slice(consumed, (int)len).ToArray());
-                return consumed + (int)len;
-            }
-            case DbType.Blob:
-            {
-                int consumed = Varint.ReadUnsigned(src, out ulong len);
-                value = DbValue.Blob(src.Slice(consumed, (int)len).ToArray());
-                return consumed + (int)len;
-            }
+            case DbType.UInt8 or DbType.Int8:
+                dest[0] = (byte)value.AsInteger();
+                break;
+            case DbType.UInt16 or DbType.Int16:
+                BinaryPrimitives.WriteInt16LittleEndian(dest, (short)value.AsInteger());
+                break;
+            case DbType.UInt32 or DbType.Int32:
+                BinaryPrimitives.WriteInt32LittleEndian(dest, (int)value.AsInteger());
+                break;
+            case DbType.UInt64 or DbType.Int64:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, value.AsInteger());
+                break;
+            case DbType.Float64:
+                BinaryPrimitives.WriteInt64LittleEndian(dest, BitConverter.DoubleToInt64Bits(value.AsReal()));
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(type));
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int SkipValue(ReadOnlySpan<byte> src, DbType type)
+    private static DbValue DecodeField(ReadOnlySpan<byte> src, int fieldOffset, DbType type)
     {
-        switch (type)
+        var data = src[fieldOffset..];
+        return type switch
         {
-            case DbType.Integer:
-                return Varint.Skip(src); // only count bytes, no zigzag decode
-            case DbType.Real:
-                return 8;
-            case DbType.Text:
-            case DbType.Blob:
-            {
-                int consumed = Varint.ReadUnsigned(src, out ulong len);
-                return consumed + (int)len;
-            }
-            default:
-                throw new InvalidDataException($"Unknown type tag {type} in row value");
-        }
+            DbType.UInt8 => DbValue.Integer(data[0]),
+            DbType.Int8 => DbValue.Integer((sbyte)data[0]),
+            DbType.UInt16 => DbValue.Integer(BinaryPrimitives.ReadUInt16LittleEndian(data)),
+            DbType.Int16 => DbValue.Integer(BinaryPrimitives.ReadInt16LittleEndian(data)),
+            DbType.UInt32 => DbValue.Integer(BinaryPrimitives.ReadUInt32LittleEndian(data)),
+            DbType.Int32 => DbValue.Integer(BinaryPrimitives.ReadInt32LittleEndian(data)),
+            DbType.UInt64 => DbValue.Integer((long)BinaryPrimitives.ReadUInt64LittleEndian(data)),
+            DbType.Int64 => DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data)),
+            DbType.Float64 => DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data))),
+            DbType.Bytes => DecodeBytes(data),
+            _ => throw new InvalidDataException($"Unknown type {type}"),
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static DbValue DecodeBytes(ReadOnlySpan<byte> data)
+    {
+        uint length = BinaryPrimitives.ReadUInt32LittleEndian(data);
+        return DbValue.Blob(data.Slice(4, (int)length).ToArray());
     }
 }

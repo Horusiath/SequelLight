@@ -117,7 +117,7 @@ public sealed class Database : IAsyncDisposable
         // Collect all committed __schema entries via a prefix scan on Oid=0
         var prefix = RowKeyEncoder.EncodeTablePrefix(new Oid(0));
         var rootTable = Schema.RootTable;
-        var pkTypes = new DbType[] { DbType.Integer };
+        var pkTypes = new DbType[] { DbType.Int64 };
         var entries = new List<(Oid Oid, ObjectType Type, string Definition)>();
 
         using var ro = _store.BeginReadOnly();
@@ -289,15 +289,14 @@ public sealed class Database : IAsyncDisposable
         var affinity = TypeAffinity.Resolve(column.TypeName);
         return (literal.Kind, affinity) switch
         {
-            (LiteralKind.Integer, DbType.Integer) => DbValue.Integer(long.Parse(literal.Value)),
-            (LiteralKind.Integer, DbType.Real) => DbValue.Real(double.Parse(literal.Value)),
-            (LiteralKind.Real, DbType.Real) => DbValue.Real(double.Parse(literal.Value)),
-            (LiteralKind.Real, DbType.Integer) => DbValue.Integer((long)double.Parse(literal.Value)),
-            (LiteralKind.String, DbType.Text) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
-            (LiteralKind.String, DbType.Blob) => DbValue.Blob(Encoding.UTF8.GetBytes(literal.Value)),
-            (LiteralKind.Blob, DbType.Blob) => DbValue.Blob(Convert.FromHexString(literal.Value)),
-            (LiteralKind.True, DbType.Integer) => DbValue.Integer(1),
-            (LiteralKind.False, DbType.Integer) => DbValue.Integer(0),
+            (LiteralKind.Integer, var t) when t.IsInteger() => DbValue.Integer(long.Parse(literal.Value)),
+            (LiteralKind.Integer, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
+            (LiteralKind.Real, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
+            (LiteralKind.Real, var t) when t.IsInteger() => DbValue.Integer((long)double.Parse(literal.Value)),
+            (LiteralKind.String, DbType.Bytes) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
+            (LiteralKind.Blob, DbType.Bytes) => DbValue.Blob(Convert.FromHexString(literal.Value)),
+            (LiteralKind.True, var t) when t.IsInteger() => DbValue.Integer(1),
+            (LiteralKind.False, var t) when t.IsInteger() => DbValue.Integer(0),
             _ => throw new InvalidOperationException(
                 $"Cannot convert {literal.Kind} literal to {affinity} for column '{column.Name}'.")
         };
