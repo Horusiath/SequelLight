@@ -10,24 +10,27 @@ namespace SequelLight.Queries;
 public sealed class Projection
 {
     private readonly string[] _names;
-    private readonly Dictionary<string, int> _nameToIndex;
 
     public Projection(IReadOnlyList<ColumnSchema> columns)
     {
         _names = new string[columns.Count];
-        _nameToIndex = new Dictionary<string, int>(columns.Count, StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < columns.Count; i++)
-        {
             _names[i] = columns[i].Name;
-            _nameToIndex[columns[i].Name] = i;
-        }
     }
 
     public int ColumnCount => _names.Length;
     public string GetName(int index) => _names[index];
 
-    public int GetIndex(string name) =>
-        _nameToIndex.TryGetValue(name, out var idx) ? idx : -1;
+    public int GetIndex(string name)
+    {
+        var names = _names;
+        for (int i = 0; i < names.Length; i++)
+        {
+            if (string.Equals(names[i], name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+        return -1;
+    }
 }
 
 /// <summary>
