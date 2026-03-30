@@ -112,9 +112,7 @@ public static class RowValueEncoder
 
     public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, IReadOnlyList<ColumnSchema> columns)
     {
-        for (int i = 0; i < values.Length; i++)
-            values[i] = DbValue.Null;
-
+        values.Clear();
         if (src.IsEmpty) return;
 
         ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(src);
@@ -127,8 +125,7 @@ public static class RowValueEncoder
             ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(2 + seqNo * 2));
             if (fieldOffset == 0) continue;
 
-            var type = TypeAffinity.Resolve(columns[i].TypeName);
-            values[i] = DecodeField(src, fieldOffset, type);
+            values[i] = DecodeField(src, fieldOffset, columns[i].ResolvedType);
         }
     }
 
@@ -142,9 +139,7 @@ public static class RowValueEncoder
         ReadOnlySpan<ushort> requestedSeqNos,
         ReadOnlySpan<DbType> requestedTypes)
     {
-        for (int i = 0; i < values.Length; i++)
-            values[i] = DbValue.Null;
-
+        values.Clear();
         if (src.IsEmpty || requestedSeqNos.IsEmpty) return;
 
         ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(src);
@@ -186,6 +181,59 @@ public static class RowValueEncoder
         }
     }
 
+    /// <summary>
+    /// Zero-copy decode of all columns using <see cref="ReadOnlyMemory{T}"/>.
+    /// Bytes fields are sliced from <paramref name="src"/> without allocation.
+    /// The caller must ensure <paramref name="src"/> outlives the decoded <see cref="DbValue"/>s.
+    /// </summary>
+    public static void Decode(ReadOnlyMemory<byte> src, Span<DbValue> values, IReadOnlyList<ColumnSchema> columns)
+    {
+        values.Clear();
+        if (src.IsEmpty) return;
+
+        var span = src.Span;
+        ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(span);
+
+        for (int i = 0; i < columns.Count; i++)
+        {
+            ushort seqNo = columns[i].SeqNo;
+            if (seqNo >= slotCount) continue;
+
+            ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2 + seqNo * 2));
+            if (fieldOffset == 0) continue;
+
+            values[i] = DecodeFieldZeroCopy(src, span, fieldOffset, columns[i].ResolvedType);
+        }
+    }
+
+    /// <summary>
+    /// Zero-copy decode of projected columns using <see cref="ReadOnlyMemory{T}"/>.
+    /// Bytes fields are sliced from <paramref name="src"/> without allocation.
+    /// </summary>
+    public static void DecodeColumns(
+        ReadOnlyMemory<byte> src,
+        Span<DbValue> values,
+        ReadOnlySpan<ushort> requestedSeqNos,
+        ReadOnlySpan<DbType> requestedTypes)
+    {
+        values.Clear();
+        if (src.IsEmpty || requestedSeqNos.IsEmpty) return;
+
+        var span = src.Span;
+        ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(span);
+
+        for (int i = 0; i < requestedSeqNos.Length; i++)
+        {
+            ushort seqNo = requestedSeqNos[i];
+            if (seqNo >= slotCount) continue;
+
+            ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2 + seqNo * 2));
+            if (fieldOffset == 0) continue;
+
+            values[i] = DecodeFieldZeroCopy(src, span, fieldOffset, requestedTypes[i]);
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static DbValue DecodeField(ReadOnlySpan<byte> src, int fieldOffset, DbType type)
     {
@@ -201,15 +249,42 @@ public static class RowValueEncoder
             DbType.UInt64 => DbValue.Integer((long)BinaryPrimitives.ReadUInt64LittleEndian(data)),
             DbType.Int64 => DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data)),
             DbType.Float64 => DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data))),
-            DbType.Bytes => DecodeBytes(data),
+            DbType.Bytes => DecodeBytesAlloc(data),
+            _ => throw new InvalidDataException($"Unknown type {type}"),
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static DbValue DecodeFieldZeroCopy(ReadOnlyMemory<byte> src, ReadOnlySpan<byte> span, int fieldOffset, DbType type)
+    {
+        var data = span[fieldOffset..];
+        return type switch
+        {
+            DbType.UInt8 => DbValue.Integer(data[0]),
+            DbType.Int8 => DbValue.Integer((sbyte)data[0]),
+            DbType.UInt16 => DbValue.Integer(BinaryPrimitives.ReadUInt16LittleEndian(data)),
+            DbType.Int16 => DbValue.Integer(BinaryPrimitives.ReadInt16LittleEndian(data)),
+            DbType.UInt32 => DbValue.Integer(BinaryPrimitives.ReadUInt32LittleEndian(data)),
+            DbType.Int32 => DbValue.Integer(BinaryPrimitives.ReadInt32LittleEndian(data)),
+            DbType.UInt64 => DbValue.Integer((long)BinaryPrimitives.ReadUInt64LittleEndian(data)),
+            DbType.Int64 => DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data)),
+            DbType.Float64 => DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data))),
+            DbType.Bytes => DecodeBytesZeroCopy(src, fieldOffset),
             _ => throw new InvalidDataException($"Unknown type {type}"),
         };
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static DbValue DecodeBytes(ReadOnlySpan<byte> data)
+    private static DbValue DecodeBytesAlloc(ReadOnlySpan<byte> data)
     {
         uint length = BinaryPrimitives.ReadUInt32LittleEndian(data);
         return DbValue.Blob(data.Slice(4, (int)length).ToArray());
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static DbValue DecodeBytesZeroCopy(ReadOnlyMemory<byte> src, int fieldOffset)
+    {
+        uint length = BinaryPrimitives.ReadUInt32LittleEndian(src.Span[fieldOffset..]);
+        return DbValue.Blob(src.Slice(fieldOffset + 4, (int)length));
     }
 }

@@ -354,77 +354,137 @@ public class RowValueEncoderBenchmarks
     public byte[] Encode_40()
         => RowValueEncoder.Encode(_row40, _seq40, _types40);
 
-    // ---- Decode ----
+    // ---- Decode (Span — allocating for Bytes) ----
 
     [Benchmark(Description = "Value decode: 2-col")]
     public DbValue Decode_2()
     {
-        RowValueEncoder.Decode(_enc2, _dec2, _cols2);
+        RowValueEncoder.Decode((ReadOnlySpan<byte>)_enc2, _dec2, _cols2);
         return _dec2[0];
     }
 
     [Benchmark(Description = "Value decode: 10-col")]
     public DbValue Decode_10()
     {
-        RowValueEncoder.Decode(_enc10, _dec10, _cols10);
+        RowValueEncoder.Decode((ReadOnlySpan<byte>)_enc10, _dec10, _cols10);
         return _dec10[0];
     }
 
     [Benchmark(Description = "Value decode: 40-col")]
     public DbValue Decode_40()
     {
-        RowValueEncoder.Decode(_enc40, _dec40, _cols40);
+        RowValueEncoder.Decode((ReadOnlySpan<byte>)_enc40, _dec40, _cols40);
         return _dec40[0];
     }
 
-    // ---- DecodeColumns (projection) ----
+    // ---- Decode (Memory — zero-copy for Bytes) ----
+
+    [Benchmark(Description = "Value decode zeroCopy: 2-col")]
+    public DbValue DecodeZeroCopy_2()
+    {
+        RowValueEncoder.Decode((ReadOnlyMemory<byte>)_enc2, _dec2, _cols2);
+        return _dec2[0];
+    }
+
+    [Benchmark(Description = "Value decode zeroCopy: 10-col")]
+    public DbValue DecodeZeroCopy_10()
+    {
+        RowValueEncoder.Decode((ReadOnlyMemory<byte>)_enc10, _dec10, _cols10);
+        return _dec10[0];
+    }
+
+    [Benchmark(Description = "Value decode zeroCopy: 40-col")]
+    public DbValue DecodeZeroCopy_40()
+    {
+        RowValueEncoder.Decode((ReadOnlyMemory<byte>)_enc40, _dec40, _cols40);
+        return _dec40[0];
+    }
+
+    // ---- DecodeColumns (Span — allocating) ----
 
     [Benchmark(Description = "Value decodeColumns: all 10-col")]
     public DbValue DecodeColumns_All_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seq10, _types10);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc10, _dec10, _seq10, _types10);
         return _dec10[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 3 of 10-col")]
     public DbValue DecodeColumns_Subset_3of10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _decSubset3, _seqSubset3, _typesSubset3);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc10, _decSubset3, _seqSubset3, _typesSubset3);
         return _decSubset3[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: all 10-col reversed")]
     public DbValue DecodeColumns_Reversed_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seqReversed10, _typesReversed10);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc10, _dec10, _seqReversed10, _typesReversed10);
         return _dec10[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 5 of 40-col")]
     public DbValue DecodeColumns_Subset_5of40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _decSubset5, _seqSubset5, _typesSubset5);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc40, _decSubset5, _seqSubset5, _typesSubset5);
         return _decSubset5[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 1 mid of 10-col")]
     public DbValue DecodeColumns_SingleMid_10()
     {
-        RowValueEncoder.DecodeColumns(_enc10, _decSingle, _seqMid10, _typesMid10);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc10, _decSingle, _seqMid10, _typesMid10);
         return _decSingle[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: 1 mid of 40-col")]
     public DbValue DecodeColumns_SingleMid_40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _decSingle, _seqMid40, _typesMid40);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc40, _decSingle, _seqMid40, _typesMid40);
         return _decSingle[0];
     }
 
     [Benchmark(Description = "Value decodeColumns: all 40-col")]
     public DbValue DecodeColumns_All_40()
     {
-        RowValueEncoder.DecodeColumns(_enc40, _dec40, _seq40, _types40);
+        RowValueEncoder.DecodeColumns((ReadOnlySpan<byte>)_enc40, _dec40, _seq40, _types40);
+        return _dec40[0];
+    }
+
+    // ---- DecodeColumns (Memory — zero-copy) ----
+
+    [Benchmark(Description = "Value decodeColumns zeroCopy: all 10-col")]
+    public DbValue DecodeColumnsZeroCopy_All_10()
+    {
+        RowValueEncoder.DecodeColumns((ReadOnlyMemory<byte>)_enc10, _dec10, _seq10, _types10);
+        return _dec10[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns zeroCopy: 3 of 10-col")]
+    public DbValue DecodeColumnsZeroCopy_Subset_3of10()
+    {
+        RowValueEncoder.DecodeColumns((ReadOnlyMemory<byte>)_enc10, _decSubset3, _seqSubset3, _typesSubset3);
+        return _decSubset3[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns zeroCopy: 5 of 40-col")]
+    public DbValue DecodeColumnsZeroCopy_Subset_5of40()
+    {
+        RowValueEncoder.DecodeColumns((ReadOnlyMemory<byte>)_enc40, _decSubset5, _seqSubset5, _typesSubset5);
+        return _decSubset5[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns zeroCopy: 1 mid of 40-col")]
+    public DbValue DecodeColumnsZeroCopy_SingleMid_40()
+    {
+        RowValueEncoder.DecodeColumns((ReadOnlyMemory<byte>)_enc40, _decSingle, _seqMid40, _typesMid40);
+        return _decSingle[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns zeroCopy: all 40-col")]
+    public DbValue DecodeColumnsZeroCopy_All_40()
+    {
+        RowValueEncoder.DecodeColumns((ReadOnlyMemory<byte>)_enc40, _dec40, _seq40, _types40);
         return _dec40[0];
     }
 

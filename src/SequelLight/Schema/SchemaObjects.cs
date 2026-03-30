@@ -110,6 +110,7 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
         SeqNo = seqNo;
         Name = name;
         TypeName = typeName;
+        ResolvedType = Data.TypeAffinity.Resolve(typeName);
         Flags = flags;
         PrimaryKeyOrder = primaryKeyOrder;
         Collation = collation;
@@ -122,6 +123,7 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
     public ushort SeqNo { get; }
     public string Name { get; internal set; }
     public string? TypeName { get; }
+    public Data.DbType ResolvedType { get; }
     public ColumnFlags Flags { get; }
     public SortOrder? PrimaryKeyOrder { get; }
     public string? Collation { get; }
@@ -293,14 +295,14 @@ public sealed class TableSchema : IEquatable<TableSchema>
             if (Columns[i].IsPrimaryKey)
             {
                 pkIndices[pk] = i;
-                pkTypes[pk] = TypeAffinity.Resolve(Columns[i].TypeName);
+                pkTypes[pk] = Columns[i].ResolvedType;
                 pk++;
             }
             else
             {
                 valIndices[val] = i;
                 valSeqNos[val] = Columns[i].SeqNo;
-                valTypes[val] = TypeAffinity.Resolve(Columns[i].TypeName);
+                valTypes[val] = Columns[i].ResolvedType;
                 val++;
             }
         }
