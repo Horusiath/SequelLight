@@ -227,6 +227,16 @@ public class RowValueEncoderBenchmarks
     private ColumnSchema[] _cols40 = null!;
     private DbValue[] _dec40 = null!;
 
+    // DecodeColumns projection buffers
+    private DbValue[] _decSubset3 = null!;
+    private int[] _seqSubset3 = null!;
+    private int[] _seqReversed10 = null!;
+    private DbValue[] _decSubset5 = null!;
+    private int[] _seqSubset5 = null!;
+    private DbValue[] _decSingle = null!;
+    private int[] _seqMid10 = null!;
+    private int[] _seqMid40 = null!;
+
     [GlobalSetup]
     public void Setup()
     {
@@ -295,6 +305,16 @@ public class RowValueEncoderBenchmarks
         _dec2 = new DbValue[2];
         _dec10 = new DbValue[10];
         _dec40 = new DbValue[40];
+
+        // DecodeColumns projection buffers
+        _decSubset3 = new DbValue[3];
+        _seqSubset3 = [2, 5, 9];
+        _seqReversed10 = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+        _decSubset5 = new DbValue[5];
+        _seqSubset5 = [3, 10, 20, 30, 38];
+        _decSingle = new DbValue[1];
+        _seqMid10 = [5];   // middle of 10-col row
+        _seqMid40 = [20];  // middle of 40-col row
     }
 
     // ---- Encode (allocating byte[]) ----
@@ -331,6 +351,57 @@ public class RowValueEncoderBenchmarks
     public DbValue Decode_40()
     {
         RowValueEncoder.Decode(_enc40, _dec40, _cols40);
+        return _dec40[0];
+    }
+
+    // ---- DecodeColumns (projection) ----
+
+    [Benchmark(Description = "Value decodeColumns: all 10-col")]
+    public DbValue DecodeColumns_All_10()
+    {
+        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seq10);
+        return _dec10[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: 3 of 10-col")]
+    public DbValue DecodeColumns_Subset_3of10()
+    {
+        RowValueEncoder.DecodeColumns(_enc10, _decSubset3, _seqSubset3);
+        return _decSubset3[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: all 10-col reversed")]
+    public DbValue DecodeColumns_Reversed_10()
+    {
+        RowValueEncoder.DecodeColumns(_enc10, _dec10, _seqReversed10);
+        return _dec10[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: 5 of 40-col")]
+    public DbValue DecodeColumns_Subset_5of40()
+    {
+        RowValueEncoder.DecodeColumns(_enc40, _decSubset5, _seqSubset5);
+        return _decSubset5[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: 1 mid of 10-col")]
+    public DbValue DecodeColumns_SingleMid_10()
+    {
+        RowValueEncoder.DecodeColumns(_enc10, _decSingle, _seqMid10);
+        return _decSingle[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: 1 mid of 40-col")]
+    public DbValue DecodeColumns_SingleMid_40()
+    {
+        RowValueEncoder.DecodeColumns(_enc40, _decSingle, _seqMid40);
+        return _decSingle[0];
+    }
+
+    [Benchmark(Description = "Value decodeColumns: all 40-col")]
+    public DbValue DecodeColumns_All_40()
+    {
+        RowValueEncoder.DecodeColumns(_enc40, _dec40, _seq40);
         return _dec40[0];
     }
 

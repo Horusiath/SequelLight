@@ -121,6 +121,51 @@ public static class RowValueEncoder
     }
 
     /// <summary>
+    /// Decodes only the requested columns from encoded row value bytes.
+    /// <paramref name="values"/>[i] receives the value for <paramref name="requestedSeqNos"/>[i].
+    /// Columns not found in the encoded data are set to <see cref="DbValue.Null"/>.
+    /// The type tag stored inline allows skipping unrequested fields without schema metadata.
+    /// </summary>
+    public static void DecodeColumns(ReadOnlySpan<byte> src, Span<DbValue> values, ReadOnlySpan<int> requestedSeqNos)
+    {
+        for (int i = 0; i < values.Length; i++)
+            values[i] = DbValue.Null;
+
+        if (src.IsEmpty || requestedSeqNos.IsEmpty)
+            return;
+
+        int remaining = requestedSeqNos.Length;
+        int offset = 0;
+        while (offset < src.Length && remaining > 0)
+        {
+            offset += Varint.ReadUnsigned(src[offset..], out ulong rawSeqNo);
+            int seqNo = (int)rawSeqNo;
+            var typeTag = (DbType)src[offset++];
+
+            int colIdx = -1;
+            for (int i = 0; i < requestedSeqNos.Length; i++)
+            {
+                if (requestedSeqNos[i] == seqNo)
+                {
+                    colIdx = i;
+                    break;
+                }
+            }
+
+            if (colIdx < 0)
+            {
+                offset += SkipValue(src[offset..], typeTag);
+            }
+            else
+            {
+                offset += DecodeValue(src[offset..], typeTag, out var value);
+                values[colIdx] = value;
+                remaining--;
+            }
+        }
+    }
+
+    /// <summary>
     /// Returns the raw data length for Text/Blob, or 0 for fixed-width types.
     /// Used only for pessimistic upper-bound sizing.
     /// </summary>

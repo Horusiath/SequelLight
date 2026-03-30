@@ -585,3 +585,262 @@ public class RowValueEncoderTests
             generatedExpression: null)).ToList();
     }
 }
+
+public class RowValueDecodeColumnsTests
+{
+    [Fact]
+    public void MixedTypes_AllColumns()
+    {
+        var text = Encoding.UTF8.GetBytes("hello");
+        var blob = new byte[] { 0xCA, 0xFE };
+        var values = new DbValue[]
+        {
+            DbValue.Integer(42),
+            DbValue.Real(3.14),
+            DbValue.Text(text),
+            DbValue.Blob(blob),
+        };
+        int[] seqNos = [1, 2, 3, 4];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        var decoded = new DbValue[4];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [1, 2, 3, 4]);
+
+        Assert.Equal(42L, decoded[0].AsInteger());
+        Assert.Equal(3.14, decoded[1].AsReal());
+        Assert.True(text.AsSpan().SequenceEqual(decoded[2].AsText().Span));
+        Assert.True(blob.AsSpan().SequenceEqual(decoded[3].AsBlob().Span));
+    }
+
+    [Fact]
+    public void MixedTypes_WithNullableFields()
+    {
+        var values = new DbValue[]
+        {
+            DbValue.Integer(1),
+            DbValue.Null,
+            DbValue.Real(2.5),
+            DbValue.Null,
+            DbValue.Text(Encoding.UTF8.GetBytes("test")),
+        };
+        int[] seqNos = [1, 2, 3, 4, 5];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        var decoded = new DbValue[5];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [1, 2, 3, 4, 5]);
+
+        Assert.Equal(1L, decoded[0].AsInteger());
+        Assert.True(decoded[1].IsNull);
+        Assert.Equal(2.5, decoded[2].AsReal());
+        Assert.True(decoded[3].IsNull);
+        Assert.True(Encoding.UTF8.GetBytes("test").AsSpan().SequenceEqual(decoded[4].AsText().Span));
+    }
+
+    [Fact]
+    public void SubsetOfColumns()
+    {
+        var values = new DbValue[]
+        {
+            DbValue.Integer(10),
+            DbValue.Text(Encoding.UTF8.GetBytes("alice")),
+            DbValue.Real(99.9),
+            DbValue.Blob(new byte[] { 1, 2, 3 }),
+            DbValue.Integer(20),
+        };
+        int[] seqNos = [1, 2, 3, 4, 5];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request only columns 2 and 4
+        var decoded = new DbValue[2];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [2, 4]);
+
+        Assert.True(Encoding.UTF8.GetBytes("alice").AsSpan().SequenceEqual(decoded[0].AsText().Span));
+        Assert.True(new byte[] { 1, 2, 3 }.AsSpan().SequenceEqual(decoded[1].AsBlob().Span));
+    }
+
+    [Fact]
+    public void OutOfOrderSeqNos()
+    {
+        var values = new DbValue[]
+        {
+            DbValue.Integer(10),
+            DbValue.Text(Encoding.UTF8.GetBytes("bob")),
+            DbValue.Real(7.7),
+            DbValue.Integer(40),
+        };
+        int[] seqNos = [1, 2, 3, 4];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request columns in reverse order: 4, 2, 1
+        var decoded = new DbValue[3];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [4, 2, 1]);
+
+        Assert.Equal(40L, decoded[0].AsInteger());
+        Assert.True(Encoding.UTF8.GetBytes("bob").AsSpan().SequenceEqual(decoded[1].AsText().Span));
+        Assert.Equal(10L, decoded[2].AsInteger());
+    }
+
+    [Fact]
+    public void OutOfOrderSeqNos_WithSubset()
+    {
+        var values = new DbValue[]
+        {
+            DbValue.Integer(100),
+            DbValue.Real(1.1),
+            DbValue.Text(Encoding.UTF8.GetBytes("data")),
+            DbValue.Blob(new byte[] { 0xFF }),
+            DbValue.Integer(500),
+            DbValue.Real(6.6),
+        };
+        int[] seqNos = [1, 2, 3, 4, 5, 6];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request columns 5, 3, 1 (reversed subset, skipping 2,4,6)
+        var decoded = new DbValue[3];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [5, 3, 1]);
+
+        Assert.Equal(500L, decoded[0].AsInteger());
+        Assert.True(Encoding.UTF8.GetBytes("data").AsSpan().SequenceEqual(decoded[1].AsText().Span));
+        Assert.Equal(100L, decoded[2].AsInteger());
+    }
+
+    [Fact]
+    public void MissingSeqNo_ReturnsNull()
+    {
+        var values = new DbValue[] { DbValue.Integer(42) };
+        int[] seqNos = [1];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request seqNo 1 (exists) and seqNo 99 (doesn't exist)
+        var decoded = new DbValue[2];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [1, 99]);
+
+        Assert.Equal(42L, decoded[0].AsInteger());
+        Assert.True(decoded[1].IsNull);
+    }
+
+    [Fact]
+    public void AllNullRow_ReturnsAllNulls()
+    {
+        var values = new DbValue[] { DbValue.Null, DbValue.Null, DbValue.Null };
+        int[] seqNos = [1, 2, 3];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        var decoded = new DbValue[3];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [1, 2, 3]);
+
+        Assert.True(decoded[0].IsNull);
+        Assert.True(decoded[1].IsNull);
+        Assert.True(decoded[2].IsNull);
+    }
+
+    [Fact]
+    public void SubsetWithNullColumns()
+    {
+        var values = new DbValue[]
+        {
+            DbValue.Integer(1),
+            DbValue.Null,
+            DbValue.Text(Encoding.UTF8.GetBytes("present")),
+            DbValue.Null,
+            DbValue.Integer(5),
+        };
+        int[] seqNos = [1, 2, 3, 4, 5];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request columns 2 (null), 3 (present), 4 (null)
+        var decoded = new DbValue[3];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [2, 3, 4]);
+
+        Assert.True(decoded[0].IsNull);
+        Assert.True(Encoding.UTF8.GetBytes("present").AsSpan().SequenceEqual(decoded[1].AsText().Span));
+        Assert.True(decoded[2].IsNull);
+    }
+
+    [Fact]
+    public void SingleColumnFromWideRow()
+    {
+        var values = new DbValue[20];
+        var seqNos = new int[20];
+        for (int i = 0; i < 20; i++)
+        {
+            seqNos[i] = i + 1;
+            values[i] = DbValue.Integer(i * 100L);
+        }
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Request only the 15th column (seqNo=15)
+        var decoded = new DbValue[1];
+        RowValueEncoder.DecodeColumns(encoded, decoded, [15]);
+
+        Assert.Equal(1400L, decoded[0].AsInteger());
+    }
+
+    [Fact]
+    public void EmptyRequest_DoesNothing()
+    {
+        var values = new DbValue[] { DbValue.Integer(42) };
+        int[] seqNos = [1];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        var decoded = Span<DbValue>.Empty;
+        RowValueEncoder.DecodeColumns(encoded, decoded, ReadOnlySpan<int>.Empty);
+        // No assertion needed — just ensure no exception
+    }
+
+    [Fact]
+    public void ConsistentWithFullDecode()
+    {
+        var text = Encoding.UTF8.GetBytes("check");
+        var values = new DbValue[]
+        {
+            DbValue.Integer(7),
+            DbValue.Null,
+            DbValue.Real(1.23),
+            DbValue.Text(text),
+            DbValue.Blob(new byte[] { 0xAB }),
+        };
+        int[] seqNos = [10, 20, 30, 40, 50];
+
+        var encoded = RowValueEncoder.Encode(values, seqNos);
+
+        // Full decode via original API
+        var columns = MakeColumns(
+            ("a", "INTEGER", 10), ("b", "INTEGER", 20), ("c", "REAL", 30),
+            ("d", "TEXT", 40), ("e", "BLOB", 50));
+        var fullDecoded = new DbValue[5];
+        RowValueEncoder.Decode(encoded, fullDecoded, columns);
+
+        // Partial decode via new API — all columns, in order
+        var partialDecoded = new DbValue[5];
+        RowValueEncoder.DecodeColumns(encoded, partialDecoded, [10, 20, 30, 40, 50]);
+
+        for (int i = 0; i < 5; i++)
+            Assert.Equal(fullDecoded[i], partialDecoded[i]);
+    }
+
+    private static IReadOnlyList<ColumnSchema> MakeColumns(params (string Name, string TypeName, int SeqNo)[] cols)
+    {
+        return cols.Select(c => new ColumnSchema(
+            seqNo: c.SeqNo,
+            name: c.Name,
+            typeName: c.TypeName,
+            flags: ColumnFlags.None,
+            primaryKeyOrder: null,
+            collation: null,
+            defaultValue: null,
+            checkExpression: null,
+            foreignKey: null,
+            generatedExpression: null)).ToList();
+    }
+}
