@@ -18,6 +18,11 @@ public sealed class Projection
             _names[i] = columns[i].Name;
     }
 
+    public Projection(string[] names)
+    {
+        _names = names;
+    }
+
     public int ColumnCount => _names.Length;
     public string GetName(int index) => _names[index];
 
@@ -71,5 +76,6 @@ public readonly struct DbRow
 /// </summary>
 public interface IDbEnumerator : IAsyncDisposable
 {
+    Projection Projection { get; }
     ValueTask<DbRow?> NextAsync(CancellationToken cancellationToken = default);
 }
