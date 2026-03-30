@@ -355,6 +355,109 @@ public class RowKeyEncoderTests
 
         Assert.True(data.AsSpan().SequenceEqual(decoded[0].AsBlob().Span));
     }
+
+    [Fact]
+    public void Positive_Integer_Keys_Preserve_Lexical_Order()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64];
+        long[] ids = [1, 100, 10_000, 1_000_000];
+
+        var keys = ids.Select(id =>
+            RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types)).ToList();
+
+        for (int i = 1; i < keys.Count; i++)
+        {
+            Assert.True(keys[i - 1].AsSpan().SequenceCompareTo(keys[i]) < 0,
+                $"Expected raw bytes for ID {ids[i - 1]} < ID {ids[i]}");
+        }
+    }
+
+    [Fact]
+    public void Negative_Integer_Keys_Preserve_Lexical_Order()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64];
+        long[] ids = [-1_000_000, -10_000, -100, -1];
+
+        var keys = ids.Select(id =>
+            RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types)).ToList();
+
+        for (int i = 1; i < keys.Count; i++)
+        {
+            Assert.True(keys[i - 1].AsSpan().SequenceCompareTo(keys[i]) < 0,
+                $"Expected raw bytes for ID {ids[i - 1]} < ID {ids[i]}");
+        }
+    }
+
+    [Fact]
+    public void Mixed_Sign_Integer_Keys_Preserve_Lexical_Order()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64];
+        long[] ids = [long.MinValue, -1_000_000, -1, 0, 1, 1_000_000, long.MaxValue];
+
+        var keys = ids.Select(id =>
+            RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types)).ToList();
+
+        for (int i = 1; i < keys.Count; i++)
+        {
+            Assert.True(keys[i - 1].AsSpan().SequenceCompareTo(keys[i]) < 0,
+                $"Expected raw bytes for ID {ids[i - 1]} < ID {ids[i]}");
+        }
+    }
+
+    [Fact]
+    public void Adjacent_Integer_Keys_Preserve_Lexical_Order()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64];
+        // Values that straddle byte boundaries: 255/256, 65535/65536
+        long[] ids = [0, 1, 127, 128, 255, 256, 65535, 65536, int.MaxValue, (long)int.MaxValue + 1];
+
+        var keys = ids.Select(id =>
+            RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types)).ToList();
+
+        for (int i = 1; i < keys.Count; i++)
+        {
+            Assert.True(keys[i - 1].AsSpan().SequenceCompareTo(keys[i]) < 0,
+                $"Expected raw bytes for ID {ids[i - 1]} < ID {ids[i]}");
+        }
+    }
+
+    [Fact]
+    public void Equal_Integer_Keys_Are_Lexically_Equal()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64];
+
+        foreach (var id in new long[] { 0, 42, -42, long.MinValue, long.MaxValue })
+        {
+            var key1 = RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types);
+            var key2 = RowKeyEncoder.Encode(oid, [DbValue.Integer(id)], types);
+
+            Assert.Equal(0, key1.AsSpan().SequenceCompareTo(key2));
+        }
+    }
+
+    [Fact]
+    public void Composite_Integer_Keys_Preserve_Lexical_Order()
+    {
+        var oid = new Oid(1);
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Int64];
+
+        // Sorted tuples: (1,1) < (1,2) < (1,100) < (2,1) < (100,1)
+        (long, long)[] pairs = [(1, 1), (1, 2), (1, 100), (2, 1), (100, 1)];
+
+        var keys = pairs.Select(p =>
+            RowKeyEncoder.Encode(oid, [DbValue.Integer(p.Item1), DbValue.Integer(p.Item2)], types)).ToList();
+
+        for (int i = 1; i < keys.Count; i++)
+        {
+            Assert.True(keys[i - 1].AsSpan().SequenceCompareTo(keys[i]) < 0,
+                $"Expected raw bytes for ({pairs[i - 1].Item1},{pairs[i - 1].Item2}) < ({pairs[i].Item1},{pairs[i].Item2})");
+        }
+    }
 }
 
 public class RowValueEncoderTests
