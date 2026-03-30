@@ -36,7 +36,7 @@ public class DbValueTests
     {
         var bytes = Encoding.UTF8.GetBytes("hello");
         var v = DbValue.Text(bytes);
-        Assert.Equal(Data.DbType.Bytes, v.Type);
+        Assert.Equal(Data.DbType.Text, v.Type);
         Assert.True(bytes.AsSpan().SequenceEqual(v.AsText().Span));
     }
 
@@ -56,6 +56,12 @@ public class DbValueTests
         Assert.Throws<InvalidOperationException>(() => v.AsReal());
         Assert.Throws<InvalidOperationException>(() => v.AsText());
         Assert.Throws<InvalidOperationException>(() => v.AsBlob());
+
+        var text = DbValue.Text(Encoding.UTF8.GetBytes("hello"));
+        Assert.Throws<InvalidOperationException>(() => text.AsBlob());
+
+        var blob = DbValue.Blob(new byte[] { 0x01 });
+        Assert.Throws<InvalidOperationException>(() => blob.AsText());
 
         Assert.Throws<InvalidOperationException>(() => DbValue.Null.AsInteger());
     }
@@ -83,10 +89,10 @@ public class TypeAffinityTests
     [InlineData("INT", Data.DbType.Int64)]
     [InlineData("BIGINT", Data.DbType.Int64)]
     [InlineData("TINYINT", Data.DbType.Int8)]
-    [InlineData("TEXT", Data.DbType.Bytes)]
-    [InlineData("VARCHAR(255)", Data.DbType.Bytes)]
-    [InlineData("CLOB", Data.DbType.Bytes)]
-    [InlineData("CHARACTER(20)", Data.DbType.Bytes)]
+    [InlineData("TEXT", Data.DbType.Text)]
+    [InlineData("VARCHAR(255)", Data.DbType.Text)]
+    [InlineData("CLOB", Data.DbType.Text)]
+    [InlineData("CHARACTER(20)", Data.DbType.Text)]
     [InlineData("BLOB", Data.DbType.Bytes)]
     [InlineData(null, Data.DbType.Bytes)]
     [InlineData("REAL", Data.DbType.Float64)]
@@ -140,7 +146,7 @@ public class RowKeyEncoderTests
     {
         var oid = new Oid(1);
         string[] values = ["", "a", "aa", "ab", "b"];
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
 
         var keys = values.Select(v =>
             RowKeyEncoder.Encode(oid, [DbValue.Text(Encoding.UTF8.GetBytes(v))], types)).ToList();
@@ -154,7 +160,7 @@ public class RowKeyEncoderTests
     public void Text_With_Embedded_Nulls_Sorts_Correctly()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
 
         // "a\0" should sort before "a\0b" and "a\x01"
         var keys = new[]
@@ -174,7 +180,7 @@ public class RowKeyEncoderTests
     public void Composite_PK_Sorts_By_First_Then_Second()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text];
 
         var keys = new[]
         {
@@ -245,7 +251,7 @@ public class RowKeyEncoderTests
     public void Text_Key_Roundtrip()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
         var pk = new DbValue[] { DbValue.Text(Encoding.UTF8.GetBytes("hello world")) };
 
         var encoded = RowKeyEncoder.Encode(oid, pk, types);
@@ -260,7 +266,7 @@ public class RowKeyEncoderTests
     public void Text_With_NullBytes_Key_Roundtrip()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
         var data = new byte[] { (byte)'a', 0x00, (byte)'b', 0x00, 0x00, (byte)'c' };
         var pk = new DbValue[] { DbValue.Text(data) };
 
@@ -276,7 +282,7 @@ public class RowKeyEncoderTests
     public void EmptyText_Key_Roundtrip()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
         var pk = new DbValue[] { DbValue.Text(Array.Empty<byte>()) };
 
         var encoded = RowKeyEncoder.Encode(oid, pk, types);
@@ -290,7 +296,7 @@ public class RowKeyEncoderTests
     public void Composite_Key_Roundtrip()
     {
         var oid = new Oid(99);
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Float64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Float64];
         var pk = new DbValue[]
         {
             DbValue.Integer(-42),
@@ -312,7 +318,7 @@ public class RowKeyEncoderTests
     public void ComputeKeySize_Matches_Actual()
     {
         var oid = new Oid(1);
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text];
         var pk = new DbValue[]
         {
             DbValue.Integer(100),
@@ -498,7 +504,7 @@ public class RowValueEncoderTests
         var text = Encoding.UTF8.GetBytes("hello");
         var values = new DbValue[] { DbValue.Text(text) };
         ushort[] seqNos = [1];
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
         var columns = MakeColumns(("col", "TEXT", 1));
@@ -535,7 +541,7 @@ public class RowValueEncoderTests
             DbValue.Blob(new byte[] { 1, 2, 3 }),
         };
         ushort[] seqNos = [1, 2, 3, 4];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Float64, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Float64, Data.DbType.Bytes];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
         var columns = MakeColumns(
@@ -611,7 +617,7 @@ public class RowValueEncoderTests
         // Encode with columns [1, 2, 3]
         var values = new DbValue[] { DbValue.Integer(10), DbValue.Text("x"u8.ToArray()), DbValue.Integer(30) };
         ushort[] seqNos = [1, 2, 3];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Int64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Int64];
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         // Decode with only columns [1, 3] -- seqNo 2 unknown, should be skipped
@@ -636,7 +642,7 @@ public class RowValueEncoderTests
             DbValue.Real(1.0),
         };
         ushort[] seqNos = [1, 2, 3, 4];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Int64, Data.DbType.Float64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Int64, Data.DbType.Float64];
 
         int computed = RowValueEncoder.ComputeValueSize(values, seqNos, types);
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
@@ -649,7 +655,7 @@ public class RowValueEncoderTests
     {
         var values = new DbValue[] { DbValue.Text(Array.Empty<byte>()) };
         ushort[] seqNos = [1];
-        DbType[] types = [Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Text];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
         var columns = MakeColumns(("col", "TEXT", 1));
@@ -705,13 +711,13 @@ public class RowValueDecodeColumnsTests
             DbValue.Blob(blob),
         };
         ushort[] seqNos = [1, 2, 3, 4];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Bytes];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         var decoded = new DbValue[4];
         ushort[] requestedSeqNos = [1, 2, 3, 4];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Bytes];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.Equal(42L, decoded[0].AsInteger());
@@ -732,13 +738,13 @@ public class RowValueDecodeColumnsTests
             DbValue.Text(Encoding.UTF8.GetBytes("test")),
         };
         ushort[] seqNos = [1, 2, 3, 4, 5];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Text];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         var decoded = new DbValue[5];
         ushort[] requestedSeqNos = [1, 2, 3, 4, 5];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Text];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.Equal(1L, decoded[0].AsInteger());
@@ -760,14 +766,14 @@ public class RowValueDecodeColumnsTests
             DbValue.Integer(20),
         };
         ushort[] seqNos = [1, 2, 3, 4, 5];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Int64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Int64];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         // Request only columns 2 and 4
         var decoded = new DbValue[2];
         ushort[] requestedSeqNos = [2, 4];
-        DbType[] requestedTypes = [Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] requestedTypes = [Data.DbType.Text, Data.DbType.Bytes];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.True(Encoding.UTF8.GetBytes("alice").AsSpan().SequenceEqual(decoded[0].AsText().Span));
@@ -785,14 +791,14 @@ public class RowValueDecodeColumnsTests
             DbValue.Integer(40),
         };
         ushort[] seqNos = [1, 2, 3, 4];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Float64, Data.DbType.Int64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Float64, Data.DbType.Int64];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         // Request columns in reverse order: 4, 2, 1
         var decoded = new DbValue[3];
         ushort[] requestedSeqNos = [4, 2, 1];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Int64];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Int64];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.Equal(40L, decoded[0].AsInteger());
@@ -813,14 +819,14 @@ public class RowValueDecodeColumnsTests
             DbValue.Real(6.6),
         };
         ushort[] seqNos = [1, 2, 3, 4, 5, 6];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes, Data.DbType.Int64, Data.DbType.Float64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Bytes, Data.DbType.Int64, Data.DbType.Float64];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         // Request columns 5, 3, 1 (reversed subset, skipping 2,4,6)
         var decoded = new DbValue[3];
         ushort[] requestedSeqNos = [5, 3, 1];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Int64];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Int64];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.Equal(500L, decoded[0].AsInteger());
@@ -878,14 +884,14 @@ public class RowValueDecodeColumnsTests
             DbValue.Integer(5),
         };
         ushort[] seqNos = [1, 2, 3, 4, 5];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Bytes, Data.DbType.Int64];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Text, Data.DbType.Text, Data.DbType.Int64];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
         // Request columns 2 (null), 3 (present), 4 (null)
         var decoded = new DbValue[3];
         ushort[] requestedSeqNos = [2, 3, 4];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Text, Data.DbType.Text];
         RowValueEncoder.DecodeColumns(encoded, decoded, requestedSeqNos, requestedTypes);
 
         Assert.True(decoded[0].IsNull);
@@ -944,7 +950,7 @@ public class RowValueDecodeColumnsTests
             DbValue.Blob(new byte[] { 0xAB }),
         };
         ushort[] seqNos = [10, 20, 30, 40, 50];
-        DbType[] types = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] types = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Bytes];
 
         var encoded = RowValueEncoder.Encode(values, seqNos, types);
 
@@ -958,7 +964,7 @@ public class RowValueDecodeColumnsTests
         // Partial decode via seqNo+types API -- all columns, in order
         var partialDecoded = new DbValue[5];
         ushort[] requestedSeqNos = [10, 20, 30, 40, 50];
-        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Bytes, Data.DbType.Bytes];
+        DbType[] requestedTypes = [Data.DbType.Int64, Data.DbType.Int64, Data.DbType.Float64, Data.DbType.Text, Data.DbType.Bytes];
         RowValueEncoder.DecodeColumns(encoded, partialDecoded, requestedSeqNos, requestedTypes);
 
         for (int i = 0; i < 5; i++)

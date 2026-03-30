@@ -47,7 +47,7 @@ public static class RowValueEncoder
             if (fs > 0)
                 dataSize += fs;
             else
-                dataSize += 4 + values[i].AsBlob().Length;
+                dataSize += 4 + values[i].AsBytes().Length;
         }
 
         return headerSize + dataSize;
@@ -83,7 +83,7 @@ public static class RowValueEncoder
             }
             else
             {
-                var data = values[i].AsBlob().Span;
+                var data = values[i].AsBytes().Span;
                 BinaryPrimitives.WriteUInt32LittleEndian(dest[dataOffset..], (uint)data.Length);
                 data.CopyTo(dest[(dataOffset + 4)..]);
                 dataOffset += 4 + data.Length;
@@ -250,6 +250,7 @@ public static class RowValueEncoder
             DbType.Int64 => DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data)),
             DbType.Float64 => DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data))),
             DbType.Bytes => DecodeBytesAlloc(data),
+            DbType.Text => DecodeTextAlloc(data),
             _ => throw new InvalidDataException($"Unknown type {type}"),
         };
     }
@@ -270,6 +271,7 @@ public static class RowValueEncoder
             DbType.Int64 => DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data)),
             DbType.Float64 => DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data))),
             DbType.Bytes => DecodeBytesZeroCopy(src, fieldOffset),
+            DbType.Text => DecodeTextZeroCopy(src, fieldOffset),
             _ => throw new InvalidDataException($"Unknown type {type}"),
         };
     }
@@ -282,9 +284,23 @@ public static class RowValueEncoder
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
+    private static DbValue DecodeTextAlloc(ReadOnlySpan<byte> data)
+    {
+        uint length = BinaryPrimitives.ReadUInt32LittleEndian(data);
+        return DbValue.Text(data.Slice(4, (int)length).ToArray());
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private static DbValue DecodeBytesZeroCopy(ReadOnlyMemory<byte> src, int fieldOffset)
     {
         uint length = BinaryPrimitives.ReadUInt32LittleEndian(src.Span[fieldOffset..]);
         return DbValue.Blob(src.Slice(fieldOffset + 4, (int)length));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static DbValue DecodeTextZeroCopy(ReadOnlyMemory<byte> src, int fieldOffset)
+    {
+        uint length = BinaryPrimitives.ReadUInt32LittleEndian(src.Span[fieldOffset..]);
+        return DbValue.Text(src.Slice(fieldOffset + 4, (int)length));
     }
 }

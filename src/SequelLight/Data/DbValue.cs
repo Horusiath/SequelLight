@@ -14,6 +14,7 @@ public enum DbType : byte
     Int64 = 8,
     Float64 = 9,
     Bytes = 10,
+    Text = 11,
 }
 
 public static class DbTypeExtensions
@@ -25,7 +26,7 @@ public static class DbTypeExtensions
     public static bool IsUnsigned(this DbType type) => type >= DbType.UInt8 && type <= DbType.UInt64;
 
     /// <summary>
-    /// Returns the fixed byte size for scalar types, or -1 for variable-length (<see cref="DbType.Bytes"/>).
+    /// Returns the fixed byte size for scalar types, or -1 for variable-length (<see cref="DbType.Bytes"/>, <see cref="DbType.Text"/>).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int FixedSize(this DbType type) => type switch
@@ -36,6 +37,9 @@ public static class DbTypeExtensions
         DbType.UInt64 or DbType.Int64 or DbType.Float64 => 8,
         _ => -1,
     };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsVariableLength(this DbType type) => type == DbType.Bytes || type == DbType.Text;
 }
 
 public static class TypeAffinity
@@ -56,7 +60,7 @@ public static class TypeAffinity
         if (Contains(upper, "INT"))
             return DbType.Int64;
         if (Contains(upper, "CHAR") || Contains(upper, "CLOB") || Contains(upper, "TEXT"))
-            return DbType.Bytes;
+            return DbType.Text;
         if (upper.Length == 4 && upper.Equals("BLOB", StringComparison.OrdinalIgnoreCase))
             return DbType.Bytes;
         if (Contains(upper, "REAL") || Contains(upper, "FLOA") || Contains(upper, "DOUB"))
@@ -95,7 +99,7 @@ public readonly struct DbValue : IEquatable<DbValue>
     public static DbValue Real(double value) => new(DbType.Float64, BitConverter.DoubleToInt64Bits(value), default);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static DbValue Text(ReadOnlyMemory<byte> utf8) => new(DbType.Bytes, 0, utf8);
+    public static DbValue Text(ReadOnlyMemory<byte> utf8) => new(DbType.Text, 0, utf8);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static DbValue Blob(ReadOnlyMemory<byte> data) => new(DbType.Bytes, 0, data);
@@ -114,13 +118,20 @@ public readonly struct DbValue : IEquatable<DbValue>
 
     public ReadOnlyMemory<byte> AsText()
     {
-        if (_type != DbType.Bytes) ThrowTypeMismatch(DbType.Bytes.ToString());
+        if (_type != DbType.Text) ThrowTypeMismatch(DbType.Text.ToString());
         return _bytes;
     }
 
     public ReadOnlyMemory<byte> AsBlob()
     {
         if (_type != DbType.Bytes) ThrowTypeMismatch(DbType.Bytes.ToString());
+        return _bytes;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlyMemory<byte> AsBytes()
+    {
+        if (!_type.IsVariableLength()) ThrowTypeMismatch("Text or Bytes");
         return _bytes;
     }
 
@@ -154,6 +165,7 @@ public readonly struct DbValue : IEquatable<DbValue>
     {
         0 => "NULL",
         DbType.Float64 => BitConverter.Int64BitsToDouble(_bits).ToString(),
+        DbType.Text => $"'{System.Text.Encoding.UTF8.GetString(_bytes.Span)}'",
         DbType.Bytes => $"x'{Convert.ToHexString(_bytes.Span)}'",
         _ when _type.IsInteger() => _bits.ToString(),
         _ => "?",

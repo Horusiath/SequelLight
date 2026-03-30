@@ -72,8 +72,8 @@ public static class RowKeyEncoder
     {
         if (type.IsInteger() || type == DbType.Float64)
             return 8;
-        if (type == DbType.Bytes)
-            return EncodedBytesSize(value.AsBlob().Span);
+        if (type.IsVariableLength())
+            return EncodedBytesSize(value.AsBytes().Span);
         throw new ArgumentOutOfRangeException(nameof(type));
     }
 
@@ -106,8 +106,8 @@ public static class RowKeyEncoder
                 BinaryPrimitives.WriteInt64BigEndian(dest, bits);
                 return 8;
             }
-            case DbType.Bytes:
-                return EncodeBytes(dest, value.AsBlob().Span);
+            case DbType.Bytes or DbType.Text:
+                return EncodeBytes(dest, value.AsBytes().Span);
             default:
                 throw new ArgumentOutOfRangeException(nameof(type));
         }
@@ -164,6 +164,12 @@ public static class RowKeyEncoder
             {
                 int consumed = DecodeBytes(src, out var data);
                 value = DbValue.Blob(data);
+                return consumed;
+            }
+            case DbType.Text:
+            {
+                int consumed = DecodeBytes(src, out var data);
+                value = DbValue.Text(data);
                 return consumed;
             }
             default:

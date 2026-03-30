@@ -293,7 +293,7 @@ public sealed class Database : IAsyncDisposable
             (LiteralKind.Integer, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
             (LiteralKind.Real, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
             (LiteralKind.Real, var t) when t.IsInteger() => DbValue.Integer((long)double.Parse(literal.Value)),
-            (LiteralKind.String, DbType.Bytes) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
+            (LiteralKind.String, DbType.Text) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
             (LiteralKind.Blob, DbType.Bytes) => DbValue.Blob(Convert.FromHexString(literal.Value)),
             (LiteralKind.True, var t) when t.IsInteger() => DbValue.Integer(1),
             (LiteralKind.False, var t) when t.IsInteger() => DbValue.Integer(0),
