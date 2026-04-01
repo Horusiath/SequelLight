@@ -4,7 +4,8 @@
       "Bash(dotnet build)",
       "Bash(dotnet test)",
       "Bash(dotnet build src/SequelLight/SequelLight.csproj 2>&1)",
-      "Bash(dotnet build benchmarks/SequelLight.Benchmarks/SequelLight.Benchmarks.csproj 2>&1)"
+      "Bash(dotnet build benchmarks/SequelLight.Benchmarks/SequelLight.Benchmarks.csproj 2>&1)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

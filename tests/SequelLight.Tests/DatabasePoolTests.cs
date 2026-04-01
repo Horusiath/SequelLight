@@ -249,7 +249,7 @@ public class SequelLightConnectionTests : TempDirTest
     }
 
     [Fact]
-    public async Task ExecuteReaderAsync_Parses_SQL_Via_Database()
+    public async Task ExecuteReaderAsync_NonExistent_Table_Throws()
     {
         var conn = new SequelLightConnection($"Data Source={TempDir}");
         await conn.OpenAsync();
@@ -257,7 +257,8 @@ public class SequelLightConnectionTests : TempDirTest
         var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT * FROM t";
 
-        await Assert.ThrowsAsync<NotImplementedException>(() => cmd.ExecuteReaderAsync());
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => cmd.ExecuteReaderAsync());
+        Assert.Contains("does not exist", ex.Message);
 
         await conn.CloseAsync();
     }

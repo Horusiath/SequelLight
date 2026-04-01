@@ -4,6 +4,7 @@ using System.Text;
 using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
+using SequelLight.Queries;
 using SequelLight.Schema;
 using SequelLight.Storage;
 
@@ -312,8 +313,17 @@ public sealed class Database : IAsyncDisposable
     internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql, ReadOnlyTransaction? transaction)
     {
         var stmt = SqlParser.Parse(sql);
-        // TODO: execute query, populate reader from cursor
-        throw new NotImplementedException();
+        if (stmt is not SelectStmt select)
+            throw new NotSupportedException("Only SELECT is supported for ExecuteReader.");
+
+        // If no explicit transaction, create a read-only one (owned by the reader)
+        var tx = transaction ?? _store.BeginReadOnly();
+        bool ownsTx = transaction is null;
+
+        var planner = new QueryPlanner(Schema);
+        var enumerator = planner.Plan(select, tx);
+
+        return new SequelLightDataReader(enumerator, ownsTx ? tx : null);
     }
 
     public async ValueTask DisposeAsync()
