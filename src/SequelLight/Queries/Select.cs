@@ -19,7 +19,7 @@ public sealed class Select : IDbEnumerator
         _source = source;
         _selectors = selectors;
 
-        var names = new string[selectors.Length];
+        var names = new QualifiedName[selectors.Length];
         for (int i = 0; i < selectors.Length; i++)
             names[i] = selectors[i].Name;
         Projection = new Projection(names);
@@ -95,7 +95,7 @@ public sealed class Select : IDbEnumerator
 
     public static Selector ResolveColumn(Projection source, string name, string? alias = null)
     {
-        var outputName = alias ?? name;
+        var outputName = new QualifiedName(null, alias ?? name);
         if (source.TryGetOrdinal(name, out int ordinal))
             return Selector.ColumnIdentifier(outputName, ordinal);
         throw new ArgumentException($"Column '{name}' not found in source projection.");

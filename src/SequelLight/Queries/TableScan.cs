@@ -39,9 +39,9 @@ public sealed class TableScan : IDbEnumerator
         _columnCount = table.Columns.Count;
 
         // Build projection from column names
-        var names = new string[_columnCount];
+        var names = new QualifiedName[_columnCount];
         for (int i = 0; i < _columnCount; i++)
-            names[i] = table.Columns[i].Name;
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
         Projection = new Projection(names);
 
         // Precompute PK and value column metadata

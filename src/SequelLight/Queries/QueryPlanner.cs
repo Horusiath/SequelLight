@@ -151,11 +151,11 @@ public sealed class QueryPlanner
         SqlExpr? condition = join.Condition;
         if (condition is not null)
         {
-            var combinedNames = new string[left.Projection.ColumnCount + right.Projection.ColumnCount];
+            var combinedNames = new QualifiedName[left.Projection.ColumnCount + right.Projection.ColumnCount];
             for (int i = 0; i < left.Projection.ColumnCount; i++)
-                combinedNames[i] = left.Projection.GetName(i);
+                combinedNames[i] = left.Projection.GetQualifiedName(i);
             for (int i = 0; i < right.Projection.ColumnCount; i++)
-                combinedNames[left.Projection.ColumnCount + i] = right.Projection.GetName(i);
+                combinedNames[left.Projection.ColumnCount + i] = right.Projection.GetQualifiedName(i);
             condition = ResolveColumns(condition, new Projection(combinedNames));
         }
 
@@ -178,9 +178,9 @@ public sealed class QueryPlanner
         var selectors = new Selector[source.ColumnCount];
         for (int i = 0; i < source.ColumnCount; i++)
         {
-            var name = source.GetName(i);
+            var qn = source.GetQualifiedName(i);
             // Don't double-qualify
-            var qualifiedName = name.Contains('.') ? name : $"{alias}.{name}";
+            var qualifiedName = qn.Table is not null ? qn : new QualifiedName(alias, qn.Column);
             selectors[i] = Selector.ColumnIdentifier(qualifiedName, i);
         }
         return selectors;
@@ -192,7 +192,7 @@ public sealed class QueryPlanner
         bool needsWrap = false;
         for (int i = 0; i < selectors.Length; i++)
         {
-            if (!string.Equals(selectors[i].Name, source.Projection.GetName(i), StringComparison.OrdinalIgnoreCase))
+            if (selectors[i].Name != source.Projection.GetQualifiedName(i))
             {
                 needsWrap = true;
                 break;
@@ -240,26 +240,20 @@ public sealed class QueryPlanner
 
     private static ResolvedColumnExpr ResolveColumnRef(ColumnRefExpr col, Projection projection)
     {
-        // Try qualified name first: "table.column"
+        // Try qualified name first
         if (col.Table is not null)
         {
-            var qualified = $"{col.Table}.{col.Column}";
-            if (projection.TryGetOrdinal(qualified, out int idx))
+            if (projection.TryGetOrdinal(new QualifiedName(col.Table, col.Column), out int idx))
                 return new ResolvedColumnExpr(idx);
         }
 
-        // Try unqualified
-        if (projection.TryGetOrdinal(col.Column, out int ordinal))
+        // Try unqualified exact match
+        if (projection.TryGetOrdinal(new QualifiedName(null, col.Column), out int ordinal))
             return new ResolvedColumnExpr(ordinal);
 
-        // Scan for "*.column" pattern (any table qualifier)
-        for (int i = 0; i < projection.ColumnCount; i++)
-        {
-            var name = projection.GetName(i);
-            int dot = name.IndexOf('.');
-            if (dot >= 0 && name.AsSpan(dot + 1).Equals(col.Column, StringComparison.OrdinalIgnoreCase))
-                return new ResolvedColumnExpr(i);
-        }
+        // Column-name-only fallback (matches any table qualifier)
+        if (projection.TryGetOrdinalByColumn(col.Column, out int colOrdinal))
+            return new ResolvedColumnExpr(colOrdinal);
 
         throw new InvalidOperationException($"Column '{(col.Table != null ? col.Table + "." : "")}{col.Column}' not found.");
     }
@@ -274,7 +268,7 @@ public sealed class QueryPlanner
             ref readonly var sel = ref selectors[i];
             if (sel.Kind != SelectorKind.ColumnRef || sel.SourceIndex != i)
                 return false;
-            if (!string.Equals(sel.Name, source.GetName(i), StringComparison.OrdinalIgnoreCase))
+            if (sel.Name != source.GetQualifiedName(i))
                 return false;
         }
 
@@ -305,16 +299,15 @@ public sealed class QueryPlanner
             {
                 case StarResultColumn:
                     for (int i = 0; i < sourceProjection.ColumnCount; i++)
-                        result[pos++] = Selector.ColumnIdentifier(sourceProjection.GetName(i), i);
+                        result[pos++] = Selector.ColumnIdentifier(sourceProjection.GetQualifiedName(i), i);
                     break;
 
                 case TableStarResultColumn tableStar:
                     for (int i = 0; i < sourceProjection.ColumnCount; i++)
                     {
-                        var name = sourceProjection.GetName(i);
-                        int dot = name.IndexOf('.');
-                        if (dot >= 0 && name.AsSpan(0, dot).Equals(tableStar.Table, StringComparison.OrdinalIgnoreCase))
-                            result[pos++] = Selector.ColumnIdentifier(name, i);
+                        var qn = sourceProjection.GetQualifiedName(i);
+                        if (qn.Table is not null && string.Equals(qn.Table, tableStar.Table, StringComparison.OrdinalIgnoreCase))
+                            result[pos++] = Selector.ColumnIdentifier(qn, i);
                     }
                     break;
 
@@ -332,9 +325,8 @@ public sealed class QueryPlanner
         int count = 0;
         for (int i = 0; i < sourceProjection.ColumnCount; i++)
         {
-            var name = sourceProjection.GetName(i);
-            int dot = name.IndexOf('.');
-            if (dot >= 0 && name.AsSpan(0, dot).Equals(table, StringComparison.OrdinalIgnoreCase))
+            var qn = sourceProjection.GetQualifiedName(i);
+            if (qn.Table is not null && string.Equals(qn.Table, table, StringComparison.OrdinalIgnoreCase))
                 count++;
         }
         return count;
@@ -345,34 +337,28 @@ public sealed class QueryPlanner
         // Optimize simple column references
         if (exprCol.Expression is ColumnRefExpr colRef)
         {
-            string outputName = exprCol.Alias ?? colRef.Column;
+            var outputName = new QualifiedName(null, exprCol.Alias ?? colRef.Column);
 
             // Try qualified name first
             if (colRef.Table is not null)
             {
-                var qualified = $"{colRef.Table}.{colRef.Column}";
-                if (sourceProjection.TryGetOrdinal(qualified, out int idx))
+                if (sourceProjection.TryGetOrdinal(new QualifiedName(colRef.Table, colRef.Column), out int idx))
                     return Selector.ColumnIdentifier(outputName, idx);
             }
 
-            // Try unqualified
-            if (sourceProjection.TryGetOrdinal(colRef.Column, out int ordinal))
+            // Try unqualified exact match
+            if (sourceProjection.TryGetOrdinal(new QualifiedName(null, colRef.Column), out int ordinal))
                 return Selector.ColumnIdentifier(outputName, ordinal);
 
-            // Scan for "*.column" pattern
-            for (int i = 0; i < sourceProjection.ColumnCount; i++)
-            {
-                var name = sourceProjection.GetName(i);
-                int dot = name.IndexOf('.');
-                if (dot >= 0 && name.AsSpan(dot + 1).Equals(colRef.Column, StringComparison.OrdinalIgnoreCase))
-                    return Selector.ColumnIdentifier(outputName, i);
-            }
+            // Column-name-only fallback (matches any table qualifier)
+            if (sourceProjection.TryGetOrdinalByColumn(colRef.Column, out int colOrdinal))
+                return Selector.ColumnIdentifier(outputName, colOrdinal);
 
             throw new InvalidOperationException($"Column '{(colRef.Table != null ? colRef.Table + "." : "")}{colRef.Column}' not found.");
         }
 
         // General expression — resolve column refs, then use computed selector
-        string computedName = exprCol.Alias ?? exprCol.Expression.ToString()!;
+        var computedName = new QualifiedName(null, exprCol.Alias ?? exprCol.Expression.ToString()!);
         var resolved = ResolveColumns(exprCol.Expression, sourceProjection);
         var projection = sourceProjection;
         return Selector.Computed(computedName, values =>
@@ -393,7 +379,7 @@ internal sealed class DualEnumerator : IDbEnumerator
 {
     private bool _emitted;
 
-    public Projection Projection { get; } = new(Array.Empty<string>());
+    public Projection Projection { get; } = new(Array.Empty<QualifiedName>());
     public DbValue[] Current { get; } = Array.Empty<DbValue>();
 
     public ValueTask<bool> NextAsync(CancellationToken ct = default)

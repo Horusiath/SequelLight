@@ -599,6 +599,89 @@ public class DbValueComparerTests
     }
 }
 
+public class QualifiedNameTests
+{
+    [Fact]
+    public void Equality_CaseInsensitive()
+    {
+        var a = new QualifiedName("Users", "Name");
+        var b = new QualifiedName("users", "name");
+        Assert.Equal(a, b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void Inequality_Different_Table()
+    {
+        var a = new QualifiedName("users", "id");
+        var b = new QualifiedName("orders", "id");
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Inequality_Null_Vs_NonNull_Table()
+    {
+        var a = new QualifiedName(null, "id");
+        var b = new QualifiedName("users", "id");
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void ToString_Unqualified()
+    {
+        Assert.Equal("name", new QualifiedName(null, "name").ToString());
+    }
+
+    [Fact]
+    public void ToString_Qualified()
+    {
+        Assert.Equal("users.name", new QualifiedName("users", "name").ToString());
+    }
+}
+
+public class ProjectionQualifiedLookupTests
+{
+    [Fact]
+    public void TryGetOrdinal_Exact_QualifiedName()
+    {
+        var projection = new Projection([new QualifiedName("t", "id"), new QualifiedName("t", "name")]);
+        Assert.True(projection.TryGetOrdinal(new QualifiedName("t", "id"), out int idx));
+        Assert.Equal(0, idx);
+    }
+
+    [Fact]
+    public void TryGetOrdinalByColumn_Matches_Any_Table()
+    {
+        var projection = new Projection([new QualifiedName("users", "id"), new QualifiedName("users", "name")]);
+        Assert.True(projection.TryGetOrdinalByColumn("name", out int idx));
+        Assert.Equal(1, idx);
+    }
+
+    [Fact]
+    public void TryGetOrdinalByColumn_FirstMatch_Wins()
+    {
+        var projection = new Projection([new QualifiedName("users", "id"), new QualifiedName("orders", "id")]);
+        Assert.True(projection.TryGetOrdinalByColumn("id", out int idx));
+        Assert.Equal(0, idx);
+    }
+
+    [Fact]
+    public void String_Compat_Parses_Dot()
+    {
+        var projection = new Projection(["users.id", "users.name"]);
+        Assert.True(projection.TryGetOrdinal(new QualifiedName("users", "name"), out int idx));
+        Assert.Equal(1, idx);
+    }
+
+    [Fact]
+    public void String_Compat_GetOrdinal()
+    {
+        var projection = new Projection(["users.id", "users.name"]);
+        Assert.Equal(0, projection.GetOrdinal("users.id"));
+        Assert.Equal(1, projection.GetOrdinal("name")); // column-only fallback
+    }
+}
+
 public class ResolveColumnsTests
 {
     [Fact]
@@ -684,7 +767,7 @@ public class ResolveColumnsTests
     [Fact]
     public void Resolves_Real_Literal()
     {
-        var projection = new Projection([]);
+        var projection = new Projection(Array.Empty<string>());
         var expr = new LiteralExpr(LiteralKind.Real, "3.14");
 
         var resolved = QueryPlanner.ResolveColumns(expr, projection);
@@ -706,15 +789,17 @@ public class ResolveColumnsTests
 
 public class IdentityProjectionTests
 {
+    private static QualifiedName QN(string column) => new(null, column);
+
     [Fact]
     public void Star_Is_Identity()
     {
         var projection = new Projection(["id", "name", "age"]);
         var selectors = new[]
         {
-            Selector.ColumnIdentifier("id", 0),
-            Selector.ColumnIdentifier("name", 1),
-            Selector.ColumnIdentifier("age", 2),
+            Selector.ColumnIdentifier(QN("id"), 0),
+            Selector.ColumnIdentifier(QN("name"), 1),
+            Selector.ColumnIdentifier(QN("age"), 2),
         };
         Assert.True(QueryPlanner.IsIdentityProjection(selectors, projection));
     }
@@ -725,8 +810,8 @@ public class IdentityProjectionTests
         var projection = new Projection(["id", "name", "age"]);
         var selectors = new[]
         {
-            Selector.ColumnIdentifier("id", 0),
-            Selector.ColumnIdentifier("name", 1),
+            Selector.ColumnIdentifier(QN("id"), 0),
+            Selector.ColumnIdentifier(QN("name"), 1),
         };
         Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
     }
@@ -737,8 +822,8 @@ public class IdentityProjectionTests
         var projection = new Projection(["id", "name"]);
         var selectors = new[]
         {
-            Selector.ColumnIdentifier("name", 1),
-            Selector.ColumnIdentifier("id", 0),
+            Selector.ColumnIdentifier(QN("name"), 1),
+            Selector.ColumnIdentifier(QN("id"), 0),
         };
         Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
     }
@@ -749,8 +834,8 @@ public class IdentityProjectionTests
         var projection = new Projection(["id", "name"]);
         var selectors = new[]
         {
-            Selector.ColumnIdentifier("id", 0),
-            Selector.ColumnIdentifier("n", 1),
+            Selector.ColumnIdentifier(QN("id"), 0),
+            Selector.ColumnIdentifier(QN("n"), 1),
         };
         Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
     }
@@ -761,8 +846,8 @@ public class IdentityProjectionTests
         var projection = new Projection(["id", "name"]);
         var selectors = new[]
         {
-            Selector.ColumnIdentifier("id", 0),
-            Selector.Computed("expr", _ => new ValueTask<DbValue>(DbValue.Null)),
+            Selector.ColumnIdentifier(QN("id"), 0),
+            Selector.Computed(QN("expr"), _ => new ValueTask<DbValue>(DbValue.Null)),
         };
         Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
     }
@@ -770,7 +855,7 @@ public class IdentityProjectionTests
     [Fact]
     public void Empty_Is_Identity()
     {
-        var projection = new Projection([]);
+        var projection = new Projection(Array.Empty<string>());
         var selectors = Array.Empty<Selector>();
         Assert.True(QueryPlanner.IsIdentityProjection(selectors, projection));
     }

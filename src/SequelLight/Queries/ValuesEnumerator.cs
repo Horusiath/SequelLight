@@ -39,9 +39,9 @@ internal sealed class ValuesEnumerator : IDbEnumerator
                 _values[offset + c] = ExprEvaluator.Evaluate(row[c], emptyRow, emptyProjection);
         }
 
-        var names = new string[_columnCount];
+        var names = new QualifiedName[_columnCount];
         for (int i = 0; i < _columnCount; i++)
-            names[i] = $"column{i}";
+            names[i] = new QualifiedName(null, $"column{i}");
         Projection = new Projection(names);
         Current = new DbValue[_columnCount];
     }

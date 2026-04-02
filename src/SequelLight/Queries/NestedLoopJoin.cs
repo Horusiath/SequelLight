@@ -39,11 +39,11 @@ public sealed class NestedLoopJoin : IDbEnumerator
         _rightWidth = right.Projection.ColumnCount;
 
         // Build combined projection: left columns + right columns
-        var names = new string[_leftWidth + _rightWidth];
+        var names = new QualifiedName[_leftWidth + _rightWidth];
         for (int i = 0; i < _leftWidth; i++)
-            names[i] = left.Projection.GetName(i);
+            names[i] = left.Projection.GetQualifiedName(i);
         for (int i = 0; i < _rightWidth; i++)
-            names[_leftWidth + i] = right.Projection.GetName(i);
+            names[_leftWidth + i] = right.Projection.GetQualifiedName(i);
         Projection = new Projection(names);
         Current = new DbValue[_leftWidth + _rightWidth];
     }

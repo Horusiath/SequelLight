@@ -66,26 +66,20 @@ public static class ExprEvaluator
 
     private static DbValue EvaluateColumnRef(ColumnRefExpr col, DbValue[] row, Projection projection)
     {
-        // Try qualified name first: "table.column"
+        // Try qualified name first
         if (col.Table is not null)
         {
-            var qualified = $"{col.Table}.{col.Column}";
-            if (projection.TryGetOrdinal(qualified, out int idx))
+            if (projection.TryGetOrdinal(new QualifiedName(col.Table, col.Column), out int idx))
                 return row[idx];
         }
 
-        // Try unqualified
-        if (projection.TryGetOrdinal(col.Column, out int ordinal))
+        // Try unqualified exact match
+        if (projection.TryGetOrdinal(new QualifiedName(null, col.Column), out int ordinal))
             return row[ordinal];
 
-        // Scan for "*.column" pattern (any table qualifier)
-        for (int i = 0; i < projection.ColumnCount; i++)
-        {
-            var name = projection.GetName(i);
-            int dot = name.IndexOf('.');
-            if (dot >= 0 && name.AsSpan(dot + 1).Equals(col.Column, StringComparison.OrdinalIgnoreCase))
-                return row[i];
-        }
+        // Column-name-only fallback (matches any table qualifier)
+        if (projection.TryGetOrdinalByColumn(col.Column, out int colOrdinal))
+            return row[colOrdinal];
 
         throw new InvalidOperationException($"Column '{(col.Table != null ? col.Table + "." : "")}{col.Column}' not found.");
     }
