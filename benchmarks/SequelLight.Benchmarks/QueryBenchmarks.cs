@@ -4,6 +4,7 @@ using BenchmarkDotNet.Columns;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Jobs;
 using BenchmarkDotNet.Reports;
+using Microsoft.Data.Sqlite;
 using SequelLight.Data;
 using SequelLight.Parsing.Ast;
 using SequelLight.Queries;
@@ -267,6 +268,7 @@ public class SelectScanBenchmarks
     private string _tempDir = null!;
     private Database _db = null!;
     private LsmStore _store = null!;
+    private SqliteConnection _sqlite = null!;
 
     [Params(100, 1_000, 10_000)]
     public int RowCount;
@@ -277,6 +279,7 @@ public class SelectScanBenchmarks
         _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_select_bench_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_tempDir);
 
+        // ---- SequelLight setup ----
         _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
         _db = new Database(_store, _tempDir);
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
@@ -297,7 +300,7 @@ public class SelectScanBenchmarks
         wideCols.Append(')');
         _db.ExecuteNonQueryAsync(wideCols.ToString(), null).AsTask().GetAwaiter().GetResult();
 
-        // Insert rows
+        // Insert rows via SequelLight
         {
             var tx = _store.BeginReadWrite();
             var narrowTable = _db.Schema.GetTable("narrow")!;
@@ -328,14 +331,87 @@ public class SelectScanBenchmarks
             tx.CommitAsync().AsTask().GetAwaiter().GetResult();
             tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
+
+        // ---- SQLite setup ----
+        _sqlite = new SqliteConnection($"Data Source={Path.Combine(_tempDir, "sqlite.db")}");
+        _sqlite.Open();
+
+        using (var cmd = _sqlite.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE narrow (id INTEGER PRIMARY KEY, val INTEGER, name TEXT)";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var cmd = _sqlite.CreateCommand())
+        {
+            cmd.CommandText = wideCols.Replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS").ToString();
+            cmd.ExecuteNonQuery();
+        }
+
+        // Bulk insert with a transaction for speed
+        using (var txn = _sqlite.BeginTransaction())
+        {
+            using (var cmd = _sqlite.CreateCommand())
+            {
+                cmd.Transaction = txn;
+                cmd.CommandText = "INSERT INTO narrow (id, val, name) VALUES ($id, $val, $name)";
+                var pId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var pVal = cmd.Parameters.Add("$val", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var pName = cmd.Parameters.Add("$name", Microsoft.Data.Sqlite.SqliteType.Text);
+                for (int i = 0; i < RowCount; i++)
+                {
+                    pId.Value = (long)i;
+                    pVal.Value = (long)(i * 10);
+                    pName.Value = $"name_{i:D6}";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            using (var cmd = _sqlite.CreateCommand())
+            {
+                cmd.Transaction = txn;
+                var sb = new StringBuilder("INSERT INTO wide (id");
+                for (int c = 1; c <= 19; c++) sb.Append($", c{c}");
+                sb.Append(") VALUES ($id");
+                for (int c = 1; c <= 19; c++) sb.Append($", $c{c}");
+                sb.Append(')');
+                cmd.CommandText = sb.ToString();
+
+                var pWideId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var wideParams = new SqliteParameter[19];
+                for (int c = 1; c <= 19; c++)
+                {
+                    wideParams[c - 1] = cmd.Parameters.Add($"$c{c}",
+                        c % 3 == 0 ? Microsoft.Data.Sqlite.SqliteType.Text : Microsoft.Data.Sqlite.SqliteType.Integer);
+                }
+
+                for (int i = 0; i < RowCount; i++)
+                {
+                    pWideId.Value = (long)i;
+                    for (int c = 1; c <= 19; c++)
+                    {
+                        if (c % 3 == 0)
+                            wideParams[c - 1].Value = $"val_{i}_{c}";
+                        else
+                            wideParams[c - 1].Value = (long)(i * 100 + c);
+                    }
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            txn.Commit();
+        }
     }
 
     [IterationCleanup]
     public void IterationCleanup()
     {
+        _sqlite.Dispose();
         _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_tempDir, recursive: true); } catch { }
     }
+
+    // ---- SequelLight benchmarks ----
 
     [Benchmark(Description = "SELECT * FROM narrow (3 cols)")]
     public async Task<int> ScanNarrow_AllColumns()
@@ -386,6 +462,63 @@ public class SelectScanBenchmarks
         await reader.CloseAsync();
         return count;
     }
+
+    // ---- SQLite baseline benchmarks ----
+
+    [Benchmark(Baseline = true, Description = "SQLite: SELECT * FROM narrow (3 cols)")]
+    public int Sqlite_ScanNarrow_AllColumns()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM narrow";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: SELECT id FROM narrow (1 col)")]
+    public int Sqlite_ScanNarrow_OneColumn()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT id FROM narrow";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: SELECT * FROM wide (20 cols)")]
+    public int Sqlite_ScanWide_AllColumns()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM wide";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: SELECT c10 FROM wide (mid col)")]
+    public int Sqlite_ScanWide_MidColumn()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT c10 FROM wide";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: SELECT c1,c10,c19 FROM wide (3 cols spread)")]
+    public int Sqlite_ScanWide_ThreeColumns()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT c1, c10, c19 FROM wide";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +533,7 @@ public class JoinBenchmarks
     private string _tempDir = null!;
     private Database _db = null!;
     private LsmStore _store = null!;
+    private SqliteConnection _sqlite = null!;
 
     [Params(100, 1_000)]
     public int RowCount;
@@ -410,6 +544,7 @@ public class JoinBenchmarks
         _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_join_bench_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_tempDir);
 
+        // ---- SequelLight setup ----
         _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
         _db = new Database(_store, _tempDir);
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
@@ -448,14 +583,71 @@ public class JoinBenchmarks
 
         tx.CommitAsync().AsTask().GetAwaiter().GetResult();
         tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        // ---- SQLite setup ----
+        _sqlite = new SqliteConnection($"Data Source={Path.Combine(_tempDir, "sqlite.db")}");
+        _sqlite.Open();
+
+        using (var cmd = _sqlite.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = _sqlite.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, value INTEGER)";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var txn = _sqlite.BeginTransaction())
+        {
+            using (var cmd = _sqlite.CreateCommand())
+            {
+                cmd.Transaction = txn;
+                cmd.CommandText = "INSERT INTO parent (id, name) VALUES ($id, $name)";
+                var pId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var pName = cmd.Parameters.Add("$name", Microsoft.Data.Sqlite.SqliteType.Text);
+                for (int i = 0; i < RowCount; i++)
+                {
+                    pId.Value = (long)i;
+                    pName.Value = $"parent_{i:D6}";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            using (var cmd = _sqlite.CreateCommand())
+            {
+                cmd.Transaction = txn;
+                cmd.CommandText = "INSERT INTO child (id, parent_id, value) VALUES ($id, $pid, $val)";
+                var pId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var pPid = cmd.Parameters.Add("$pid", Microsoft.Data.Sqlite.SqliteType.Integer);
+                var pVal = cmd.Parameters.Add("$val", Microsoft.Data.Sqlite.SqliteType.Integer);
+                for (int i = 0; i < RowCount; i++)
+                {
+                    for (int c = 0; c < 2; c++)
+                    {
+                        int childId = i * 2 + c;
+                        pId.Value = (long)childId;
+                        pPid.Value = (long)i;
+                        pVal.Value = (long)(childId * 100);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+
+            txn.Commit();
+        }
     }
 
     [IterationCleanup]
     public void IterationCleanup()
     {
+        _sqlite.Dispose();
         _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_tempDir, recursive: true); } catch { }
     }
+
+    // ---- SequelLight benchmarks ----
 
     [Benchmark(Description = "INNER JOIN on PK (1:N)")]
     public async Task<int> InnerJoin_OnPk()
@@ -482,8 +674,6 @@ public class JoinBenchmarks
     [Benchmark(Description = "CROSS JOIN (small)")]
     public async Task<int> CrossJoin()
     {
-        // Use only the first few rows to avoid O(n^2) blowup on larger RowCounts.
-        // Cross join of RowCount * 2*RowCount would be too large, so we filter.
         var reader = await _db.ExecuteReaderAsync(
             "SELECT parent.name, child.value FROM parent CROSS JOIN child", null);
         int count = 0;
@@ -502,6 +692,52 @@ public class JoinBenchmarks
         await reader.CloseAsync();
         return count;
     }
+
+    // ---- SQLite baseline benchmarks ----
+
+    [Benchmark(Baseline = true, Description = "SQLite: INNER JOIN on PK (1:N)")]
+    public int Sqlite_InnerJoin_OnPk()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT parent.name, child.value FROM parent INNER JOIN child ON parent.id = child.parent_id";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: LEFT JOIN on PK (1:N)")]
+    public int Sqlite_LeftJoin_OnPk()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT parent.name, child.value FROM parent LEFT JOIN child ON parent.id = child.parent_id";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: CROSS JOIN (small)")]
+    public int Sqlite_CrossJoin()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT parent.name, child.value FROM parent CROSS JOIN child";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: JOIN + projected columns")]
+    public int Sqlite_Join_WithProjection()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT parent.name FROM parent INNER JOIN child ON parent.id = child.parent_id";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +752,7 @@ public class WhereBenchmarks
     private string _tempDir = null!;
     private Database _db = null!;
     private LsmStore _store = null!;
+    private SqliteConnection _sqlite = null!;
 
     [Params(1_000, 10_000)]
     public int RowCount;
@@ -526,6 +763,7 @@ public class WhereBenchmarks
         _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_where_bench_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_tempDir);
 
+        // ---- SequelLight setup ----
         _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
         _db = new Database(_store, _tempDir);
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
@@ -551,14 +789,49 @@ public class WhereBenchmarks
 
         tx.CommitAsync().AsTask().GetAwaiter().GetResult();
         tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        // ---- SQLite setup ----
+        _sqlite = new SqliteConnection($"Data Source={Path.Combine(_tempDir, "sqlite.db")}");
+        _sqlite.Open();
+
+        using (var cmd = _sqlite.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var txn = _sqlite.BeginTransaction())
+        {
+            using var cmd = _sqlite.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = "INSERT INTO t (id, category, score, name) VALUES ($id, $cat, $score, $name)";
+            var pId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pCat = cmd.Parameters.Add("$cat", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pScore = cmd.Parameters.Add("$score", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pName = cmd.Parameters.Add("$name", Microsoft.Data.Sqlite.SqliteType.Text);
+
+            for (int i = 0; i < RowCount; i++)
+            {
+                pId.Value = (long)i;
+                pCat.Value = (long)(i % 10);
+                pScore.Value = (long)(i * 7 % 1000);
+                pName.Value = $"item_{i:D6}";
+                cmd.ExecuteNonQuery();
+            }
+
+            txn.Commit();
+        }
     }
 
     [IterationCleanup]
     public void IterationCleanup()
     {
+        _sqlite.Dispose();
         _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_tempDir, recursive: true); } catch { }
     }
+
+    // ---- SequelLight benchmarks ----
 
     [Benchmark(Description = "WHERE pk = constant (point)")]
     public async Task<int> Where_PkEquality()
@@ -633,13 +906,106 @@ public class WhereBenchmarks
         return count;
     }
 
-    [Benchmark(Description = "Full scan (no WHERE, baseline)")]
+    [Benchmark(Description = "Full scan (no WHERE)")]
     public async Task<int> FullScan_NoWhere()
     {
         var reader = await _db.ExecuteReaderAsync("SELECT * FROM t", null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
+        return count;
+    }
+
+    // ---- SQLite baseline benchmarks ----
+
+    [Benchmark(Baseline = true, Description = "SQLite: Full scan (no WHERE)")]
+    public int Sqlite_FullScan_NoWhere()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE pk = constant (point)")]
+    public int Sqlite_Where_PkEquality()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE id = 500";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE pk BETWEEN (range, ~10%)")]
+    public int Sqlite_Where_PkRange()
+    {
+        int lo = RowCount / 10;
+        int hi = RowCount / 10 + RowCount / 10;
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = $"SELECT * FROM t WHERE id >= {lo} AND id < {hi}";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE non-pk = constant (~10%)")]
+    public int Sqlite_Where_NonPkEquality()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 3";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE non-pk range (~50%)")]
+    public int Sqlite_Where_NonPkRange()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE score < 500";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE compound (pk AND non-pk)")]
+    public int Sqlite_Where_Compound()
+    {
+        int hi = RowCount / 2;
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = $"SELECT * FROM t WHERE id < {hi} AND category = 5";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE no match (0 rows)")]
+    public int Sqlite_Where_NoMatch()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = $"SELECT * FROM t WHERE id = {RowCount + 999}";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE IS NULL (on non-null col)")]
+    public int Sqlite_Where_IsNull()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE name IS NULL";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
         return count;
     }
 }
