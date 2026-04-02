@@ -24,17 +24,40 @@ public sealed class QueryPlanner
 
         return stmt.First switch
         {
-            SelectCore core => PlanSelectCore(core, tx),
+            SelectCore core => PlanSelectCore(core, stmt.OrderBy, tx),
             ValuesBody values => new ValuesEnumerator(values.Rows),
             _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
         };
     }
 
-    private IDbEnumerator PlanSelectCore(SelectCore core, ReadOnlyTransaction tx)
+    private IDbEnumerator PlanSelectCore(SelectCore core, IReadOnlyList<OrderingTerm>? orderBy, ReadOnlyTransaction tx)
     {
         var logical = BuildLogicalPlan(core);
         logical = HeuristicOptimizer.Optimize(logical);
-        return BuildPhysical(logical, tx);
+
+        // No ORDER BY — use the existing fast path
+        if (orderBy is not { Count: > 0 })
+            return BuildPhysical(logical, tx);
+
+        // Peel off the top-level ProjectPlan (always present from BuildLogicalPlan)
+        if (logical is not ProjectPlan topProject)
+            return BuildPhysical(logical, tx);
+
+        // Build physical plan for the pre-projection source, tracking sort order
+        var (source, providedOrder) = BuildPhysicalWithOrder(topProject.Source, tx);
+
+        // Compute how many ORDER BY terms the physical plan already satisfies
+        int nOBSat = ComputeNOBSat(orderBy, providedOrder, source.Projection);
+
+        // Insert sort if not fully satisfied
+        if (nOBSat < orderBy.Count)
+            source = BuildSortEnumerator(source, orderBy);
+
+        // Apply the final projection
+        var selectors = ResolveSelectors(topProject.Columns, source.Projection);
+        return IsIdentityProjection(selectors, source.Projection)
+            ? source
+            : new Select(source, selectors);
     }
 
     private LogicalPlan BuildLogicalPlan(SelectCore core)
@@ -332,6 +355,151 @@ public sealed class QueryPlanner
         return count;
     }
 
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder) BuildPhysicalWithOrder(LogicalPlan plan, ReadOnlyTransaction tx)
+    {
+        switch (plan)
+        {
+            case DualPlan:
+                return (new DualEnumerator(), Array.Empty<SortKey>());
+
+            case ScanPlan scan:
+            {
+                var tableScan = BuildTableScan(scan, tx);
+                var sortKeys = ExtractPkSortKeys(scan.Table, tableScan.Projection);
+                return (tableScan, sortKeys);
+            }
+
+            case FilterPlan filter:
+            {
+                var (child, childOrder) = BuildPhysicalWithOrder(filter.Source, tx);
+                var resolved = ResolveColumns(filter.Predicate, child.Projection);
+                return (new Filter(child, resolved), childOrder);
+            }
+
+            case ProjectPlan project:
+            {
+                var (child, childOrder) = BuildPhysicalWithOrder(project.Source, tx);
+                var selectors = ResolveSelectors(project.Columns, child.Projection);
+                var remapped = RemapSortKeys(childOrder, selectors);
+                var enumerator = IsIdentityProjection(selectors, child.Projection)
+                    ? child
+                    : new Select(child, selectors);
+                return (enumerator, remapped);
+            }
+
+            case JoinPlan join:
+                return (BuildJoin(join, tx), Array.Empty<SortKey>());
+
+            default:
+                throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
+        }
+    }
+
+    private static SortKey[] ExtractPkSortKeys(TableSchema table, Projection projection)
+    {
+        if (table.PrimaryKey is not { Columns.Count: > 0 } pk)
+            return Array.Empty<SortKey>();
+
+        var keys = new SortKey[pk.Columns.Count];
+        for (int i = 0; i < pk.Columns.Count; i++)
+        {
+            // PK columns are always ColumnRefExpr in IndexedColumn
+            if (pk.Columns[i].Expression is not ColumnRefExpr colRef)
+                return i > 0 ? keys.AsSpan(0, i).ToArray() : Array.Empty<SortKey>();
+
+            if (!projection.TryGetOrdinalByColumn(colRef.Column, out int ordinal))
+                return i > 0 ? keys.AsSpan(0, i).ToArray() : Array.Empty<SortKey>();
+
+            // Forward scan always produces ascending order (RowKeyEncoder is comparison-preserving)
+            keys[i] = new SortKey(ordinal, SortOrder.Asc);
+        }
+        return keys;
+    }
+
+    private static SortKey[] RemapSortKeys(SortKey[] sourceKeys, Selector[] selectors)
+    {
+        if (sourceKeys.Length == 0)
+            return sourceKeys;
+
+        var remapped = new SortKey[sourceKeys.Length];
+        int count = 0;
+
+        for (int i = 0; i < sourceKeys.Length; i++)
+        {
+            bool found = false;
+            for (int j = 0; j < selectors.Length; j++)
+            {
+                if (selectors[j].Kind == SelectorKind.ColumnRef && selectors[j].SourceIndex == sourceKeys[i].Ordinal)
+                {
+                    remapped[count++] = new SortKey(j, sourceKeys[i].Order);
+                    found = true;
+                    break;
+                }
+            }
+            // Prefix semantics: stop at first unmapped key
+            if (!found) break;
+        }
+
+        return count == sourceKeys.Length ? remapped : remapped.AsSpan(0, count).ToArray();
+    }
+
+    private static int ComputeNOBSat(IReadOnlyList<OrderingTerm> orderBy, SortKey[] providedOrder, Projection projection)
+    {
+        int satisfied = 0;
+        for (int i = 0; i < orderBy.Count && i < providedOrder.Length; i++)
+        {
+            var term = orderBy[i];
+
+            // Only simple column references can be matched
+            if (term.Expression is not ColumnRefExpr colRef)
+                break;
+
+            // Resolve the ORDER BY column to an ordinal in the source projection
+            int ordinal;
+            if (colRef.Table is not null)
+            {
+                if (!projection.TryGetOrdinal(new QualifiedName(colRef.Table, colRef.Column), out ordinal))
+                    break;
+            }
+            else if (!projection.TryGetOrdinal(new QualifiedName(null, colRef.Column), out ordinal)
+                     && !projection.TryGetOrdinalByColumn(colRef.Column, out ordinal))
+            {
+                break;
+            }
+
+            // Compare ordinal and direction
+            var requiredOrder = term.Order ?? SortOrder.Asc;
+            if (providedOrder[i].Ordinal != ordinal || providedOrder[i].Order != requiredOrder)
+                break;
+
+            satisfied++;
+        }
+        return satisfied;
+    }
+
+    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, IReadOnlyList<OrderingTerm> orderBy)
+    {
+        var ordinals = new int[orderBy.Count];
+        var orders = new SortOrder[orderBy.Count];
+
+        for (int i = 0; i < orderBy.Count; i++)
+        {
+            var term = orderBy[i];
+            var resolved = ResolveColumns(term.Expression, source.Projection);
+            if (resolved is ResolvedColumnExpr col)
+            {
+                ordinals[i] = col.Ordinal;
+            }
+            else
+            {
+                throw new NotSupportedException($"ORDER BY expression '{term.Expression}' must resolve to a column reference.");
+            }
+            orders[i] = term.Order ?? SortOrder.Asc;
+        }
+
+        return new SortEnumerator(source, ordinals, orders);
+    }
+
     private static Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)
     {
         // Optimize simple column references
@@ -390,4 +558,13 @@ internal sealed class DualEnumerator : IDbEnumerator
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>
+/// Planner-internal sort key descriptor: an output column ordinal + sort direction.
+/// </summary>
+internal readonly struct SortKey(int ordinal, SortOrder order)
+{
+    public readonly int Ordinal = ordinal;
+    public readonly SortOrder Order = order;
 }

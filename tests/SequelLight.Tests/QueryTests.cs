@@ -1083,3 +1083,213 @@ public class IntegrationTests : TempDirTest
         }
     }
 }
+
+public class OrderByTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task OrderBy_Ascending_PK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, name FROM t ORDER BY id ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((1, "a"), rows[0]);
+        Assert.Equal((2, "b"), rows[1]);
+        Assert.Equal((3, "c"), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_Descending_PK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, name FROM t ORDER BY id DESC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((3, "c"), rows[0]);
+        Assert.Equal((2, "b"), rows[1]);
+        Assert.Equal((1, "a"), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_NonPK_Column()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, name FROM t ORDER BY name ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((2, "alice"), rows[0]);
+        Assert.Equal((3, "bob"), rows[1]);
+        Assert.Equal((1, "charlie"), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_Multiple_Columns()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 2, 'b'), (2, 1, 'a'), (3, 2, 'a'), (4, 1, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, group_id, name FROM t ORDER BY group_id ASC, name ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1), reader.GetString(2)));
+
+        Assert.Equal(4, rows.Count);
+        Assert.Equal((2, 1L, "a"), rows[0]);
+        Assert.Equal((4, 1L, "b"), rows[1]);
+        Assert.Equal((3, 2L, "a"), rows[2]);
+        Assert.Equal((1, 2L, "b"), rows[3]);
+    }
+
+    [Fact]
+    public async Task OrderBy_With_Where()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 10), (2, 5), (3, 20), (4, 3), (5, 15)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, val FROM t WHERE val > 5 ORDER BY id ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, long)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((1, 10L), rows[0]);
+        Assert.Equal((3, 20L), rows[1]);
+        Assert.Equal((5, 15L), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_With_Projection_Reorder()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Projection reorders columns but ORDER BY still references 'id'
+        cmd.CommandText = "SELECT name, id FROM t ORDER BY id ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string, long)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetInt64(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal(("a", 1L), rows[0]);
+        Assert.Equal(("b", 2L), rows[1]);
+        Assert.Equal(("c", 3L), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_Column_Not_In_Select()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // ORDER BY id, but id is not in SELECT list
+        cmd.CommandText = "SELECT name FROM t ORDER BY id ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<string>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetString(0));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal("a", rows[0]);
+        Assert.Equal("b", rows[1]);
+        Assert.Equal("c", rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_Desc_NonPK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 10), (2, 30), (3, 20)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, val FROM t ORDER BY val DESC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, long)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((2, 30L), rows[0]);
+        Assert.Equal((3, 20L), rows[1]);
+        Assert.Equal((1, 10L), rows[2]);
+    }
+
+    [Fact]
+    public async Task OrderBy_Empty_Table()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT * FROM t ORDER BY id ASC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.False(await reader.ReadAsync());
+    }
+}
