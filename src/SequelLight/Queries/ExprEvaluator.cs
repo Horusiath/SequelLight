@@ -14,6 +14,9 @@ public static class ExprEvaluator
     {
         switch (expr)
         {
+            case ResolvedLiteralExpr resolved:
+                return resolved.Value;
+
             case LiteralExpr lit:
                 return EvaluateLiteral(lit);
 
@@ -46,7 +49,7 @@ public static class ExprEvaluator
         }
     }
 
-    private static DbValue EvaluateLiteral(LiteralExpr lit)
+    internal static DbValue EvaluateLiteral(LiteralExpr lit)
     {
         return lit.Kind switch
         {

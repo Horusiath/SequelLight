@@ -34,6 +34,9 @@ public sealed record ColumnRefExpr(string? Schema, string? Table, string Column)
 /// <summary>Column reference pre-resolved to an ordinal at plan time. Eliminates per-row dictionary lookups.</summary>
 public sealed record ResolvedColumnExpr(int Ordinal) : SqlExpr;
 
+/// <summary>Literal pre-evaluated to a DbValue at plan time. Eliminates per-row parsing.</summary>
+public sealed record ResolvedLiteralExpr(Data.DbValue Value) : SqlExpr;
+
 public enum UnaryOp { Plus, Minus, BitwiseNot, Not }
 
 public sealed record UnaryExpr(UnaryOp Op, SqlExpr Operand) : SqlExpr;

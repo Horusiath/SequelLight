@@ -196,16 +196,18 @@ public sealed class QueryPlanner
 
     /// <summary>
     /// Walks an expression tree and replaces <see cref="ColumnRefExpr"/> with
-    /// <see cref="ResolvedColumnExpr"/> using ordinals from the source projection.
-    /// Eliminates per-row dictionary lookups and string allocations.
+    /// <see cref="ResolvedColumnExpr"/> (ordinal lookup) and <see cref="LiteralExpr"/> with
+    /// <see cref="ResolvedLiteralExpr"/> (pre-parsed DbValue).
+    /// Eliminates per-row dictionary lookups, string allocations, and numeric parsing.
     /// </summary>
     internal static SqlExpr ResolveColumns(SqlExpr expr, Projection projection)
     {
         return expr switch
         {
             ColumnRefExpr col => ResolveColumnRef(col, projection),
+            LiteralExpr lit => new ResolvedLiteralExpr(ExprEvaluator.EvaluateLiteral(lit)),
             ResolvedColumnExpr => expr,
-            LiteralExpr => expr,
+            ResolvedLiteralExpr => expr,
             UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection) },
             BinaryExpr binary => binary with
             {

@@ -654,14 +654,15 @@ public class ResolveColumnsTests
     }
 
     [Fact]
-    public void Preserves_Literals()
+    public void Resolves_Literals()
     {
         var projection = new Projection(["x"]);
         var expr = new LiteralExpr(LiteralKind.Integer, "42");
 
         var resolved = QueryPlanner.ResolveColumns(expr, projection);
 
-        Assert.Same(expr, resolved);
+        var rl = Assert.IsType<ResolvedLiteralExpr>(resolved);
+        Assert.Equal(42L, rl.Value.AsInteger());
     }
 
     [Fact]
@@ -678,6 +679,18 @@ public class ResolveColumnsTests
 
         var between = Assert.IsType<BetweenExpr>(resolved);
         Assert.Equal(0, Assert.IsType<ResolvedColumnExpr>(between.Operand).Ordinal);
+    }
+
+    [Fact]
+    public void Resolves_Real_Literal()
+    {
+        var projection = new Projection([]);
+        var expr = new LiteralExpr(LiteralKind.Real, "3.14");
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var rl = Assert.IsType<ResolvedLiteralExpr>(resolved);
+        Assert.Equal(3.14, rl.Value.AsReal());
     }
 
     [Fact]
