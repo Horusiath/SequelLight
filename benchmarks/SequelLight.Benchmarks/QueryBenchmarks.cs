@@ -1,0 +1,645 @@
+using System.Text;
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Columns;
+using BenchmarkDotNet.Configs;
+using BenchmarkDotNet.Jobs;
+using BenchmarkDotNet.Reports;
+using SequelLight.Data;
+using SequelLight.Parsing.Ast;
+using SequelLight.Queries;
+using SequelLight.Schema;
+using SequelLight.Storage;
+using DbType = SequelLight.Data.DbType;
+
+namespace SequelLight.Benchmarks;
+
+// ---------------------------------------------------------------------------
+//  ExprEvaluator benchmarks
+//  Pure in-memory expression evaluation — no I/O.
+// ---------------------------------------------------------------------------
+
+[MemoryDiagnoser]
+public class ExprEvaluatorBenchmarks
+{
+    // Shared row and projection for column-referencing expressions
+    private DbValue[] _row = null!;
+    private Projection _projection = null!;
+
+    // Pre-built AST nodes (avoid measuring AST allocation)
+    private SqlExpr _intLiteral = null!;
+    private SqlExpr _realLiteral = null!;
+    private SqlExpr _stringLiteral = null!;
+    private SqlExpr _columnRef = null!;
+    private SqlExpr _qualifiedColumnRef = null!;
+    private SqlExpr _intAdd = null!;
+    private SqlExpr _realMultiply = null!;
+    private SqlExpr _intCompare = null!;
+    private SqlExpr _unaryMinus = null!;
+    private SqlExpr _unaryNot = null!;
+    private SqlExpr _andExpr = null!;
+    private SqlExpr _orExpr = null!;
+    private SqlExpr _betweenExpr = null!;
+    private SqlExpr _isNullExpr = null!;
+    private SqlExpr _nullTestExpr = null!;
+    private SqlExpr _castIntToReal = null!;
+    private SqlExpr _castRealToInt = null!;
+    private SqlExpr _castIntToText = null!;
+    private SqlExpr _deepArithmetic = null!;
+    private SqlExpr _complexPredicate = null!;
+    private SqlExpr _mixedTypeArithmetic = null!;
+    private SqlExpr _stringConcat = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _row =
+        [
+            DbValue.Integer(42),                                   // x (index 0)
+            DbValue.Real(3.14),                                    // y (index 1)
+            DbValue.Text("hello"u8.ToArray()),                     // name (index 2)
+            DbValue.Integer(100),                                  // t.a (index 3)
+            DbValue.Integer(0),                                    // flag (index 4)
+            DbValue.Null,                                          // nullable (index 5)
+        ];
+        _projection = new Projection(["x", "y", "name", "t.a", "flag", "nullable"]);
+
+        // ---- Simple expressions ----
+        _intLiteral = new LiteralExpr(LiteralKind.Integer, "12345");
+        _realLiteral = new LiteralExpr(LiteralKind.Real, "2.718");
+        _stringLiteral = new LiteralExpr(LiteralKind.String, "benchmark");
+        _columnRef = new ColumnRefExpr(null, null, "x");
+        _qualifiedColumnRef = new ColumnRefExpr(null, "t", "a");
+
+        // ---- Arithmetic ----
+        _intAdd = new BinaryExpr(
+            new ColumnRefExpr(null, null, "x"), BinaryOp.Add,
+            new LiteralExpr(LiteralKind.Integer, "10"));
+        _realMultiply = new BinaryExpr(
+            new ColumnRefExpr(null, null, "y"), BinaryOp.Multiply,
+            new LiteralExpr(LiteralKind.Real, "2.0"));
+        _mixedTypeArithmetic = new BinaryExpr(
+            new ColumnRefExpr(null, null, "x"), BinaryOp.Add,
+            new ColumnRefExpr(null, null, "y")); // int + real → promotion
+
+        // ---- Comparison ----
+        _intCompare = new BinaryExpr(
+            new ColumnRefExpr(null, null, "x"), BinaryOp.GreaterThan,
+            new LiteralExpr(LiteralKind.Integer, "10"));
+
+        // ---- Unary ----
+        _unaryMinus = new UnaryExpr(UnaryOp.Minus, new ColumnRefExpr(null, null, "x"));
+        _unaryNot = new UnaryExpr(UnaryOp.Not, new ColumnRefExpr(null, null, "flag"));
+
+        // ---- Logical ----
+        _andExpr = new BinaryExpr(
+            new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.GreaterThan, new LiteralExpr(LiteralKind.Integer, "10")),
+            BinaryOp.And,
+            new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.LessThan, new LiteralExpr(LiteralKind.Integer, "100")));
+        _orExpr = new BinaryExpr(
+            new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.Equal, new LiteralExpr(LiteralKind.Integer, "42")),
+            BinaryOp.Or,
+            new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.Equal, new LiteralExpr(LiteralKind.Integer, "0")));
+
+        // ---- Between / Is / NullTest ----
+        _betweenExpr = new BetweenExpr(
+            new ColumnRefExpr(null, null, "x"), false,
+            new LiteralExpr(LiteralKind.Integer, "1"),
+            new LiteralExpr(LiteralKind.Integer, "100"));
+        _isNullExpr = new IsExpr(
+            new ColumnRefExpr(null, null, "nullable"), false, false,
+            new LiteralExpr(LiteralKind.Null, "NULL"));
+        _nullTestExpr = new NullTestExpr(new ColumnRefExpr(null, null, "x"), true);
+
+        // ---- Cast (type conversions) ----
+        _castIntToReal = new CastExpr(
+            new ColumnRefExpr(null, null, "x"), new TypeName("REAL", null));
+        _castRealToInt = new CastExpr(
+            new ColumnRefExpr(null, null, "y"), new TypeName("INTEGER", null));
+        _castIntToText = new CastExpr(
+            new ColumnRefExpr(null, null, "x"), new TypeName("TEXT", null));
+
+        // ---- Complex: deep arithmetic tree (x * 2 + y * 3 - 10) / 4 ----
+        _deepArithmetic = new BinaryExpr(
+            new BinaryExpr(
+                new BinaryExpr(
+                    new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.Multiply, new LiteralExpr(LiteralKind.Integer, "2")),
+                    BinaryOp.Add,
+                    new BinaryExpr(new ColumnRefExpr(null, null, "y"), BinaryOp.Multiply, new LiteralExpr(LiteralKind.Real, "3.0"))),
+                BinaryOp.Subtract,
+                new LiteralExpr(LiteralKind.Integer, "10")),
+            BinaryOp.Divide,
+            new LiteralExpr(LiteralKind.Integer, "4"));
+
+        // ---- Complex: compound predicate (x > 10 AND x < 100 AND flag = 0 AND name IS NOT NULL) ----
+        _complexPredicate = new BinaryExpr(
+            new BinaryExpr(
+                new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.GreaterThan, new LiteralExpr(LiteralKind.Integer, "10")),
+                BinaryOp.And,
+                new BinaryExpr(new ColumnRefExpr(null, null, "x"), BinaryOp.LessThan, new LiteralExpr(LiteralKind.Integer, "100"))),
+            BinaryOp.And,
+            new BinaryExpr(
+                new BinaryExpr(new ColumnRefExpr(null, null, "flag"), BinaryOp.Equal, new LiteralExpr(LiteralKind.Integer, "0")),
+                BinaryOp.And,
+                new NullTestExpr(new ColumnRefExpr(null, null, "name"), true)));
+
+        // ---- String concat ----
+        _stringConcat = new BinaryExpr(
+            new ColumnRefExpr(null, null, "name"), BinaryOp.Concat,
+            new LiteralExpr(LiteralKind.String, " world"));
+    }
+
+    // ---- Literals ----
+
+    [Benchmark(Description = "Expr: integer literal")]
+    public DbValue IntegerLiteral() => ExprEvaluator.Evaluate(_intLiteral, _row, _projection);
+
+    [Benchmark(Description = "Expr: real literal")]
+    public DbValue RealLiteral() => ExprEvaluator.Evaluate(_realLiteral, _row, _projection);
+
+    [Benchmark(Description = "Expr: string literal")]
+    public DbValue StringLiteral() => ExprEvaluator.Evaluate(_stringLiteral, _row, _projection);
+
+    // ---- Column references ----
+
+    [Benchmark(Description = "Expr: column ref (unqualified)")]
+    public DbValue ColumnRef() => ExprEvaluator.Evaluate(_columnRef, _row, _projection);
+
+    [Benchmark(Description = "Expr: column ref (qualified)")]
+    public DbValue QualifiedColumnRef() => ExprEvaluator.Evaluate(_qualifiedColumnRef, _row, _projection);
+
+    // ---- Arithmetic ----
+
+    [Benchmark(Description = "Expr: int + int")]
+    public DbValue IntAdd() => ExprEvaluator.Evaluate(_intAdd, _row, _projection);
+
+    [Benchmark(Description = "Expr: real * real")]
+    public DbValue RealMultiply() => ExprEvaluator.Evaluate(_realMultiply, _row, _projection);
+
+    [Benchmark(Description = "Expr: int + real (promotion)")]
+    public DbValue MixedTypeArithmetic() => ExprEvaluator.Evaluate(_mixedTypeArithmetic, _row, _projection);
+
+    // ---- Comparison ----
+
+    [Benchmark(Description = "Expr: int > int")]
+    public DbValue IntCompare() => ExprEvaluator.Evaluate(_intCompare, _row, _projection);
+
+    // ---- Unary ----
+
+    [Benchmark(Description = "Expr: unary minus")]
+    public DbValue UnaryMinus() => ExprEvaluator.Evaluate(_unaryMinus, _row, _projection);
+
+    [Benchmark(Description = "Expr: NOT")]
+    public DbValue UnaryNot() => ExprEvaluator.Evaluate(_unaryNot, _row, _projection);
+
+    // ---- Logical ----
+
+    [Benchmark(Description = "Expr: AND (2 comparisons)")]
+    public DbValue And() => ExprEvaluator.Evaluate(_andExpr, _row, _projection);
+
+    [Benchmark(Description = "Expr: OR (2 comparisons)")]
+    public DbValue Or() => ExprEvaluator.Evaluate(_orExpr, _row, _projection);
+
+    // ---- Range / Null ----
+
+    [Benchmark(Description = "Expr: BETWEEN")]
+    public DbValue Between() => ExprEvaluator.Evaluate(_betweenExpr, _row, _projection);
+
+    [Benchmark(Description = "Expr: IS NULL")]
+    public DbValue IsNull() => ExprEvaluator.Evaluate(_isNullExpr, _row, _projection);
+
+    [Benchmark(Description = "Expr: NOTNULL")]
+    public DbValue NullTest() => ExprEvaluator.Evaluate(_nullTestExpr, _row, _projection);
+
+    // ---- Type conversions ----
+
+    [Benchmark(Description = "Expr: CAST int→real")]
+    public DbValue CastIntToReal() => ExprEvaluator.Evaluate(_castIntToReal, _row, _projection);
+
+    [Benchmark(Description = "Expr: CAST real→int")]
+    public DbValue CastRealToInt() => ExprEvaluator.Evaluate(_castRealToInt, _row, _projection);
+
+    [Benchmark(Description = "Expr: CAST int→text")]
+    public DbValue CastIntToText() => ExprEvaluator.Evaluate(_castIntToText, _row, _projection);
+
+    // ---- String ----
+
+    [Benchmark(Description = "Expr: string concat")]
+    public DbValue StringConcat() => ExprEvaluator.Evaluate(_stringConcat, _row, _projection);
+
+    // ---- Complex expressions ----
+
+    [Benchmark(Description = "Expr: deep arithmetic (5 ops)")]
+    public DbValue DeepArithmetic() => ExprEvaluator.Evaluate(_deepArithmetic, _row, _projection);
+
+    [Benchmark(Description = "Expr: compound predicate (4 AND)")]
+    public DbValue CompoundPredicate() => ExprEvaluator.Evaluate(_complexPredicate, _row, _projection);
+}
+
+// ---------------------------------------------------------------------------
+//  Query execution config for I/O-bound query benchmarks.
+// ---------------------------------------------------------------------------
+
+public class QueryBenchmarkConfig : ManualConfig
+{
+    public QueryBenchmarkConfig()
+    {
+        AddJob(Job.MediumRun
+            .WithLaunchCount(1)
+            .WithWarmupCount(3)
+            .WithIterationCount(10)
+            .WithInvocationCount(1)
+            .WithUnrollFactor(1));
+
+        AddColumn(StatisticColumn.Min, StatisticColumn.Max, StatisticColumn.Median);
+        WithSummaryStyle(SummaryStyle.Default.WithTimeUnit(Perfolizer.Horology.TimeUnit.Millisecond));
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  SELECT .. FROM .. benchmarks
+//  Full pipeline: cursor → TableScan → Select → drain rows.
+// ---------------------------------------------------------------------------
+
+[Config(typeof(QueryBenchmarkConfig))]
+[MemoryDiagnoser]
+public class SelectScanBenchmarks
+{
+    private string _tempDir = null!;
+    private Database _db = null!;
+    private LsmStore _store = null!;
+
+    [Params(100, 1_000, 10_000)]
+    public int RowCount;
+
+    [IterationSetup]
+    public void IterationSetup()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_select_bench_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_tempDir);
+
+        _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
+        _db = new Database(_store, _tempDir);
+        _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+
+        // Create narrow table (3 columns)
+        _db.ExecuteNonQueryAsync("CREATE TABLE narrow (id INTEGER PRIMARY KEY, val INTEGER, name TEXT)", null)
+            .AsTask().GetAwaiter().GetResult();
+
+        // Create wide table (20 columns)
+        var wideCols = new StringBuilder("CREATE TABLE wide (id INTEGER PRIMARY KEY");
+        for (int i = 1; i <= 19; i++)
+        {
+            if (i % 3 == 0)
+                wideCols.Append($", c{i} TEXT");
+            else
+                wideCols.Append($", c{i} INTEGER");
+        }
+        wideCols.Append(')');
+        _db.ExecuteNonQueryAsync(wideCols.ToString(), null).AsTask().GetAwaiter().GetResult();
+
+        // Insert rows
+        {
+            var tx = _store.BeginReadWrite();
+            var narrowTable = _db.Schema.GetTable("narrow")!;
+            var wideTable = _db.Schema.GetTable("wide")!;
+
+            for (int i = 0; i < RowCount; i++)
+            {
+                var narrowRow = new DbValue[]
+                {
+                    DbValue.Integer(i),
+                    DbValue.Integer(i * 10),
+                    DbValue.Text(Encoding.UTF8.GetBytes($"name_{i:D6}")),
+                };
+                tx.Put(narrowTable.EncodeRowKey(narrowRow), narrowTable.EncodeRowValue(narrowRow));
+
+                var wideRow = new DbValue[20];
+                wideRow[0] = DbValue.Integer(i);
+                for (int c = 1; c < 20; c++)
+                {
+                    if (c % 3 == 0)
+                        wideRow[c] = DbValue.Text(Encoding.UTF8.GetBytes($"val_{i}_{c}"));
+                    else
+                        wideRow[c] = DbValue.Integer(i * 100 + c);
+                }
+                tx.Put(wideTable.EncodeRowKey(wideRow), wideTable.EncodeRowValue(wideRow));
+            }
+
+            tx.CommitAsync().AsTask().GetAwaiter().GetResult();
+            tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    [IterationCleanup]
+    public void IterationCleanup()
+    {
+        _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+    }
+
+    [Benchmark(Description = "SELECT * FROM narrow (3 cols)")]
+    public async Task<int> ScanNarrow_AllColumns()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM narrow", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "SELECT id FROM narrow (1 col)")]
+    public async Task<int> ScanNarrow_OneColumn()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT id FROM narrow", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "SELECT * FROM wide (20 cols)")]
+    public async Task<int> ScanWide_AllColumns()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM wide", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "SELECT c10 FROM wide (mid col)")]
+    public async Task<int> ScanWide_MidColumn()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT c10 FROM wide", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "SELECT c1,c10,c19 FROM wide (3 cols spread)")]
+    public async Task<int> ScanWide_ThreeColumns()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT c1, c10, c19 FROM wide", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  SELECT .. FROM .. JOIN .. ON pk benchmarks
+//  Two tables joined on primary key columns via nested loop.
+// ---------------------------------------------------------------------------
+
+[Config(typeof(QueryBenchmarkConfig))]
+[MemoryDiagnoser]
+public class JoinBenchmarks
+{
+    private string _tempDir = null!;
+    private Database _db = null!;
+    private LsmStore _store = null!;
+
+    [Params(100, 1_000)]
+    public int RowCount;
+
+    [IterationSetup]
+    public void IterationSetup()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_join_bench_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_tempDir);
+
+        _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
+        _db = new Database(_store, _tempDir);
+        _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+
+        _db.ExecuteNonQueryAsync("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)", null)
+            .AsTask().GetAwaiter().GetResult();
+        _db.ExecuteNonQueryAsync("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, value INTEGER)", null)
+            .AsTask().GetAwaiter().GetResult();
+
+        var tx = _store.BeginReadWrite();
+        var parentTable = _db.Schema.GetTable("parent")!;
+        var childTable = _db.Schema.GetTable("child")!;
+
+        for (int i = 0; i < RowCount; i++)
+        {
+            var parentRow = new DbValue[]
+            {
+                DbValue.Integer(i),
+                DbValue.Text(Encoding.UTF8.GetBytes($"parent_{i:D6}")),
+            };
+            tx.Put(parentTable.EncodeRowKey(parentRow), parentTable.EncodeRowValue(parentRow));
+
+            // Each parent has 2 children
+            for (int c = 0; c < 2; c++)
+            {
+                int childId = i * 2 + c;
+                var childRow = new DbValue[]
+                {
+                    DbValue.Integer(childId),
+                    DbValue.Integer(i),
+                    DbValue.Integer(childId * 100),
+                };
+                tx.Put(childTable.EncodeRowKey(childRow), childTable.EncodeRowValue(childRow));
+            }
+        }
+
+        tx.CommitAsync().AsTask().GetAwaiter().GetResult();
+        tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    [IterationCleanup]
+    public void IterationCleanup()
+    {
+        _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+    }
+
+    [Benchmark(Description = "INNER JOIN on PK (1:N)")]
+    public async Task<int> InnerJoin_OnPk()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT parent.name, child.value FROM parent INNER JOIN child ON parent.id = child.parent_id", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "LEFT JOIN on PK (1:N)")]
+    public async Task<int> LeftJoin_OnPk()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT parent.name, child.value FROM parent LEFT JOIN child ON parent.id = child.parent_id", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "CROSS JOIN (small)")]
+    public async Task<int> CrossJoin()
+    {
+        // Use only the first few rows to avoid O(n^2) blowup on larger RowCounts.
+        // Cross join of RowCount * 2*RowCount would be too large, so we filter.
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT parent.name, child.value FROM parent CROSS JOIN child", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "JOIN + projected columns")]
+    public async Task<int> Join_WithProjection()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT parent.name FROM parent INNER JOIN child ON parent.id = child.parent_id", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  SELECT .. FROM .. WHERE .. benchmarks
+//  Tests filter on PK columns vs non-PK columns.
+// ---------------------------------------------------------------------------
+
+[Config(typeof(QueryBenchmarkConfig))]
+[MemoryDiagnoser]
+public class WhereBenchmarks
+{
+    private string _tempDir = null!;
+    private Database _db = null!;
+    private LsmStore _store = null!;
+
+    [Params(1_000, 10_000)]
+    public int RowCount;
+
+    [IterationSetup]
+    public void IterationSetup()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_where_bench_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_tempDir);
+
+        _store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = _tempDir }).AsTask().GetAwaiter().GetResult();
+        _db = new Database(_store, _tempDir);
+        _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+
+        _db.ExecuteNonQueryAsync(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null)
+            .AsTask().GetAwaiter().GetResult();
+
+        var tx = _store.BeginReadWrite();
+        var table = _db.Schema.GetTable("t")!;
+
+        for (int i = 0; i < RowCount; i++)
+        {
+            var row = new DbValue[]
+            {
+                DbValue.Integer(i),
+                DbValue.Integer(i % 10),       // category: 0-9
+                DbValue.Integer(i * 7 % 1000), // score: 0-999
+                DbValue.Text(Encoding.UTF8.GetBytes($"item_{i:D6}")),
+            };
+            tx.Put(table.EncodeRowKey(row), table.EncodeRowValue(row));
+        }
+
+        tx.CommitAsync().AsTask().GetAwaiter().GetResult();
+        tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    [IterationCleanup]
+    public void IterationCleanup()
+    {
+        _db.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+    }
+
+    [Benchmark(Description = "WHERE pk = constant (point)")]
+    public async Task<int> Where_PkEquality()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE id = 500", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE pk BETWEEN (range, ~10%)")]
+    public async Task<int> Where_PkRange()
+    {
+        int lo = RowCount / 10;
+        int hi = RowCount / 10 + RowCount / 10;
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id >= {lo} AND id < {hi}", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE non-pk = constant (~10%)")]
+    public async Task<int> Where_NonPkEquality()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE category = 3", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE non-pk range (~50%)")]
+    public async Task<int> Where_NonPkRange()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE score < 500", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE compound (pk AND non-pk)")]
+    public async Task<int> Where_Compound()
+    {
+        int hi = RowCount / 2;
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id < {hi} AND category = 5", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE no match (0 rows)")]
+    public async Task<int> Where_NoMatch()
+    {
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id = {RowCount + 999}", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE IS NULL (on non-null col)")]
+    public async Task<int> Where_IsNull()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE name IS NULL", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "Full scan (no WHERE, baseline)")]
+    public async Task<int> FullScan_NoWhere()
+    {
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t", null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+}

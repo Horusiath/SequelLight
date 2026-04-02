@@ -507,6 +507,55 @@ public class ExprEvaluatorTests
         var result = ExprEvaluator.Evaluate(expr, row, projection);
         Assert.Equal(-7L, result.AsInteger());
     }
+
+    [Fact]
+    public void Evaluate_Real_Literal_With_Decimal_Point()
+    {
+        var result = ExprEvaluator.Evaluate(
+            new LiteralExpr(LiteralKind.Real, "3.14"),
+            Array.Empty<DbValue>(),
+            new Projection(Array.Empty<string>()));
+        Assert.Equal(3.14, result.AsReal());
+    }
+
+    [Fact]
+    public void Evaluate_Real_Arithmetic()
+    {
+        var projection = new Projection(["x"]);
+        var row = new DbValue[] { DbValue.Real(2.5) };
+        var expr = new BinaryExpr(
+            new ColumnRefExpr(null, null, "x"),
+            BinaryOp.Multiply,
+            new LiteralExpr(LiteralKind.Real, "1.5"));
+        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        Assert.Equal(3.75, result.AsReal());
+    }
+
+    [Fact]
+    public void Evaluate_Cast_Text_To_Real_With_Decimal_Point()
+    {
+        var projection = new Projection(["s"]);
+        var row = new DbValue[] { DbValue.Text(System.Text.Encoding.UTF8.GetBytes("9.99")) };
+        var expr = new CastExpr(
+            new ColumnRefExpr(null, null, "s"),
+            new TypeName("REAL", null));
+        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        Assert.Equal(9.99, result.AsReal());
+    }
+
+    [Fact]
+    public void Evaluate_Cast_Real_To_Text_Preserves_Decimal_Point()
+    {
+        var projection = new Projection(Array.Empty<string>());
+        var row = Array.Empty<DbValue>();
+        var expr = new CastExpr(
+            new LiteralExpr(LiteralKind.Real, "3.14"),
+            new TypeName("TEXT", null));
+        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var text = System.Text.Encoding.UTF8.GetString(result.AsText().Span);
+        Assert.Contains(".", text);
+        Assert.Equal(3.14, double.Parse(text, System.Globalization.CultureInfo.InvariantCulture));
+    }
 }
 
 public class DbValueComparerTests
@@ -721,6 +770,32 @@ public class IntegrationTests : TempDirTest
         Assert.True(await reader.ReadAsync());
         Assert.Equal(3L, reader.GetInt64(0));
         Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Full_Pipeline_Insert_And_Select_Real_Values()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.50), (3, 'Doohickey', 4.25)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT name, price FROM products WHERE price > 5.0";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Name, double Price)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetDouble(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal("Widget", rows[0].Name);
+        Assert.Equal(9.99, rows[0].Price);
+        Assert.Equal("Gadget", rows[1].Name);
+        Assert.Equal(19.50, rows[1].Price);
     }
 
     [Fact]

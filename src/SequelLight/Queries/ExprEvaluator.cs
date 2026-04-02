@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using SequelLight.Data;
 using SequelLight.Parsing.Ast;
@@ -50,7 +51,7 @@ public static class ExprEvaluator
             LiteralKind.True => DbValue.Integer(1),
             LiteralKind.False => DbValue.Integer(0),
             LiteralKind.Integer => DbValue.Integer(long.Parse(lit.Value)),
-            LiteralKind.Real => DbValue.Real(double.Parse(lit.Value)),
+            LiteralKind.Real => DbValue.Real(double.Parse(lit.Value, CultureInfo.InvariantCulture)),
             LiteralKind.String => DbValue.Text(Encoding.UTF8.GetBytes(lit.Value)),
             LiteralKind.Blob => DbValue.Blob(Convert.FromHexString(lit.Value)),
             _ => throw new NotSupportedException($"Literal kind '{lit.Kind}' is not supported.")
@@ -243,14 +244,14 @@ public static class ExprEvaluator
             if (operand.Type == DbType.Text)
             {
                 var text = Encoding.UTF8.GetString(operand.AsText().Span);
-                return DbValue.Real(double.Parse(text));
+                return DbValue.Real(double.Parse(text, CultureInfo.InvariantCulture));
             }
         }
         else if (targetType == DbType.Text)
         {
             if (operand.Type == DbType.Text) return operand;
             if (operand.Type.IsInteger()) return DbValue.Text(Encoding.UTF8.GetBytes(operand.AsInteger().ToString()));
-            if (operand.Type == DbType.Float64) return DbValue.Text(Encoding.UTF8.GetBytes(operand.AsReal().ToString()));
+            if (operand.Type == DbType.Float64) return DbValue.Text(Encoding.UTF8.GetBytes(operand.AsReal().ToString(CultureInfo.InvariantCulture)));
         }
 
         throw new InvalidOperationException($"Cannot cast {operand.Type} to {cast.Type.Name}.");

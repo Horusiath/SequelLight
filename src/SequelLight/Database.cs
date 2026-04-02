@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text;
 using SequelLight.Data;
 using SequelLight.Parsing;
@@ -291,9 +292,9 @@ public sealed class Database : IAsyncDisposable
         return (literal.Kind, affinity) switch
         {
             (LiteralKind.Integer, var t) when t.IsInteger() => DbValue.Integer(long.Parse(literal.Value)),
-            (LiteralKind.Integer, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
-            (LiteralKind.Real, DbType.Float64) => DbValue.Real(double.Parse(literal.Value)),
-            (LiteralKind.Real, var t) when t.IsInteger() => DbValue.Integer((long)double.Parse(literal.Value)),
+            (LiteralKind.Integer, DbType.Float64) => DbValue.Real(double.Parse(literal.Value, CultureInfo.InvariantCulture)),
+            (LiteralKind.Real, DbType.Float64) => DbValue.Real(double.Parse(literal.Value, CultureInfo.InvariantCulture)),
+            (LiteralKind.Real, var t) when t.IsInteger() => DbValue.Integer((long)double.Parse(literal.Value, CultureInfo.InvariantCulture)),
             (LiteralKind.String, DbType.Text) => DbValue.Text(Encoding.UTF8.GetBytes(literal.Value)),
             (LiteralKind.Blob, DbType.Bytes) => DbValue.Blob(Convert.FromHexString(literal.Value)),
             (LiteralKind.True, var t) when t.IsInteger() => DbValue.Integer(1),
