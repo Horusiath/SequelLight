@@ -5,6 +5,7 @@ namespace SequelLight.Queries;
 
 /// <summary>
 /// Merge join for inputs sorted on the join key. Single-pass O(n+m).
+/// Reuses a single output buffer for combined rows.
 /// </summary>
 public sealed class MergeJoin : IDbEnumerator
 {
@@ -17,8 +18,8 @@ public sealed class MergeJoin : IDbEnumerator
     private readonly int _rightWidth;
 
     // State
-    private DbRow? _leftRow;
-    private DbRow? _rightRow;
+    private DbValue[]? _leftSnapshot;
+    private DbValue[]? _rightSnapshot;
     private bool _started;
     private bool _leftExhausted;
     private bool _rightExhausted;
@@ -29,6 +30,7 @@ public sealed class MergeJoin : IDbEnumerator
     private DbValue[]? _bufferedLeftValues;
 
     public Projection Projection { get; }
+    public DbValue[] Current { get; }
 
     public MergeJoin(IDbEnumerator left, IDbEnumerator right,
         int[] leftKeyIndices, int[] rightKeyIndices, JoinKind kind)
@@ -47,17 +49,16 @@ public sealed class MergeJoin : IDbEnumerator
         for (int i = 0; i < _rightWidth; i++)
             names[_leftWidth + i] = right.Projection.GetName(i);
         Projection = new Projection(names);
+        Current = new DbValue[_leftWidth + _rightWidth];
     }
 
-    public async ValueTask<DbRow?> NextAsync(CancellationToken ct = default)
+    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
         if (!_started)
         {
             _started = true;
-            _leftRow = await _left.NextAsync(ct).ConfigureAwait(false);
-            _rightRow = await _right.NextAsync(ct).ConfigureAwait(false);
-            _leftExhausted = _leftRow is null;
-            _rightExhausted = _rightRow is null;
+            _leftExhausted = !await AdvanceLeft(ct);
+            _rightExhausted = !await AdvanceRight(ct);
         }
 
         while (true)
@@ -65,9 +66,9 @@ public sealed class MergeJoin : IDbEnumerator
             // Emit buffered cross-product entries first
             if (_rightBuffer is not null && _rightBufferIdx < _rightBuffer.Count)
             {
-                var combined = CombineRows(_bufferedLeftValues!, _rightBuffer[_rightBufferIdx]);
+                WriteCombined(_bufferedLeftValues!, _rightBuffer[_rightBufferIdx]);
                 _rightBufferIdx++;
-                return new DbRow(combined, Projection);
+                return true;
             }
 
             // Clear buffer state
@@ -75,70 +76,91 @@ public sealed class MergeJoin : IDbEnumerator
             _bufferedLeftValues = null;
 
             if (_leftExhausted)
-                return null;
+                return false;
 
             if (_rightExhausted)
             {
                 // LEFT JOIN: emit remaining left rows with nulls
                 if (IsLeftJoin())
                 {
-                    var row = CombineRowsWithNullRight(_leftRow!.Value.Values);
-                    _leftRow = await _left.NextAsync(ct).ConfigureAwait(false);
-                    _leftExhausted = _leftRow is null;
-                    return new DbRow(row, Projection);
+                    WriteCombinedWithNullRight(_leftSnapshot!);
+                    _leftExhausted = !await AdvanceLeft(ct);
+                    return true;
                 }
-                return null;
+                return false;
             }
 
-            int cmp = CompareKeys(_leftRow!.Value.Values, _rightRow!.Value.Values);
+            int cmp = CompareKeys(_leftSnapshot!, _rightSnapshot!);
 
             if (cmp < 0)
             {
                 // Left < right: advance left
                 if (IsLeftJoin())
                 {
-                    var row = CombineRowsWithNullRight(_leftRow.Value.Values);
-                    _leftRow = await _left.NextAsync(ct).ConfigureAwait(false);
-                    _leftExhausted = _leftRow is null;
-                    return new DbRow(row, Projection);
+                    WriteCombinedWithNullRight(_leftSnapshot!);
+                    _leftExhausted = !await AdvanceLeft(ct);
+                    return true;
                 }
-                _leftRow = await _left.NextAsync(ct).ConfigureAwait(false);
-                _leftExhausted = _leftRow is null;
+                _leftExhausted = !await AdvanceLeft(ct);
             }
             else if (cmp > 0)
             {
                 // Left > right: advance right
-                _rightRow = await _right.NextAsync(ct).ConfigureAwait(false);
-                _rightExhausted = _rightRow is null;
+                _rightExhausted = !await AdvanceRight(ct);
             }
             else
             {
                 // Equal: buffer all right rows with same key, then emit cross product
-                _bufferedLeftValues = _leftRow.Value.Values;
-                _rightBuffer = new List<DbValue[]> { _rightRow.Value.Values };
+                _bufferedLeftValues = _leftSnapshot;
+                _rightBuffer = new List<DbValue[]> { _rightSnapshot! };
 
                 while (true)
                 {
-                    _rightRow = await _right.NextAsync(ct).ConfigureAwait(false);
-                    if (_rightRow is null) { _rightExhausted = true; break; }
-                    if (CompareKeysRight(_bufferedLeftValues, _rightRow.Value.Values) != 0)
+                    if (!await AdvanceRight(ct))
+                    {
+                        _rightExhausted = true;
                         break;
-                    _rightBuffer.Add(_rightRow.Value.Values);
+                    }
+                    if (CompareKeysRight(_bufferedLeftValues!, _rightSnapshot!) != 0)
+                        break;
+                    // Snapshot since we need to keep multiple right rows
+                    var copy = new DbValue[_rightWidth];
+                    Array.Copy(_rightSnapshot!, 0, copy, 0, _rightWidth);
+                    _rightBuffer.Add(copy);
                 }
 
                 _rightBufferIdx = 0;
-                _leftRow = await _left.NextAsync(ct).ConfigureAwait(false);
-                _leftExhausted = _leftRow is null;
+                _leftExhausted = !await AdvanceLeft(ct);
 
                 // Emit first result from buffer
                 if (_rightBuffer.Count > 0)
                 {
-                    var combined = CombineRows(_bufferedLeftValues, _rightBuffer[_rightBufferIdx]);
+                    WriteCombined(_bufferedLeftValues!, _rightBuffer[_rightBufferIdx]);
                     _rightBufferIdx++;
-                    return new DbRow(combined, Projection);
+                    return true;
                 }
             }
         }
+    }
+
+    /// <summary>Advance left source and snapshot its current buffer.</summary>
+    private async ValueTask<bool> AdvanceLeft(CancellationToken ct)
+    {
+        if (!await _left.NextAsync(ct).ConfigureAwait(false))
+            return false;
+        _leftSnapshot ??= new DbValue[_leftWidth];
+        Array.Copy(_left.Current, 0, _leftSnapshot, 0, _leftWidth);
+        return true;
+    }
+
+    /// <summary>Advance right source and snapshot its current buffer.</summary>
+    private async ValueTask<bool> AdvanceRight(CancellationToken ct)
+    {
+        if (!await _right.NextAsync(ct).ConfigureAwait(false))
+            return false;
+        _rightSnapshot ??= new DbValue[_rightWidth];
+        Array.Copy(_right.Current, 0, _rightSnapshot, 0, _rightWidth);
+        return true;
     }
 
     private int CompareKeys(DbValue[] leftValues, DbValue[] rightValues)
@@ -153,7 +175,6 @@ public sealed class MergeJoin : IDbEnumerator
 
     private int CompareKeysRight(DbValue[] leftValues, DbValue[] rightValues)
     {
-        // Compare using left key values against right key values
         for (int i = 0; i < _leftKeyIndices.Length; i++)
         {
             int cmp = DbValueComparer.Compare(leftValues[_leftKeyIndices[i]], rightValues[_rightKeyIndices[i]]);
@@ -162,19 +183,16 @@ public sealed class MergeJoin : IDbEnumerator
         return 0;
     }
 
-    private DbValue[] CombineRows(DbValue[] left, DbValue[] right)
+    private void WriteCombined(DbValue[] left, DbValue[] right)
     {
-        var combined = new DbValue[_leftWidth + _rightWidth];
-        Array.Copy(left, 0, combined, 0, _leftWidth);
-        Array.Copy(right, 0, combined, _leftWidth, _rightWidth);
-        return combined;
+        Array.Copy(left, 0, Current, 0, _leftWidth);
+        Array.Copy(right, 0, Current, _leftWidth, _rightWidth);
     }
 
-    private DbValue[] CombineRowsWithNullRight(DbValue[] left)
+    private void WriteCombinedWithNullRight(DbValue[] left)
     {
-        var combined = new DbValue[_leftWidth + _rightWidth];
-        Array.Copy(left, 0, combined, 0, _leftWidth);
-        return combined;
+        Array.Copy(left, 0, Current, 0, _leftWidth);
+        Array.Clear(Current, _leftWidth, _rightWidth);
     }
 
     private bool IsLeftJoin() => _kind is JoinKind.Left or JoinKind.LeftOuter;

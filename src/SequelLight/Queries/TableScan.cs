@@ -7,7 +7,8 @@ namespace SequelLight.Queries;
 
 /// <summary>
 /// Reads rows from a single table via Cursor. Seeks to the table's Oid prefix,
-/// iterates forward, decodes key+value into DbRow. Stops when the Oid prefix changes.
+/// iterates forward, decodes key+value into the reusable row buffer.
+/// Stops when the Oid prefix changes.
 /// </summary>
 public sealed class TableScan : IDbEnumerator
 {
@@ -26,9 +27,9 @@ public sealed class TableScan : IDbEnumerator
     // Reusable decode buffers
     private readonly DbValue[] _pkBuf;
     private readonly DbValue[] _valueBuf;
-    private readonly DbValue[] _rowBuf;
 
     public Projection Projection { get; }
+    public DbValue[] Current { get; }
 
     public TableScan(Cursor cursor, TableSchema table)
     {
@@ -76,21 +77,21 @@ public sealed class TableScan : IDbEnumerator
 
         _pkBuf = new DbValue[pkCount];
         _valueBuf = new DbValue[valCount];
-        _rowBuf = new DbValue[_columnCount];
+        Current = new DbValue[_columnCount];
     }
 
-    public async ValueTask<DbRow?> NextAsync(CancellationToken ct = default)
+    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
         if (!_seeked)
         {
             _seeked = true;
             if (!await _cursor.SeekAsync(_prefix).ConfigureAwait(false))
-                return null;
+                return false;
         }
         else
         {
             if (!await _cursor.MoveNextAsync().ConfigureAwait(false))
-                return null;
+                return false;
         }
 
         while (_cursor.IsValid)
@@ -99,13 +100,13 @@ public sealed class TableScan : IDbEnumerator
 
             // Check Oid prefix still matches
             if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != _table.Oid.Value)
-                return null;
+                return false;
 
             // Skip tombstones
             if (_cursor.IsTombstone)
             {
                 if (!await _cursor.MoveNextAsync().ConfigureAwait(false))
-                    return null;
+                    return false;
                 continue;
             }
 
@@ -115,17 +116,16 @@ public sealed class TableScan : IDbEnumerator
             // Decode value columns
             RowValueEncoder.Decode(_cursor.CurrentValue.Span, _valueBuf, _valueColumns);
 
-            // Assemble full row in column order
-            var row = new DbValue[_columnCount];
+            // Assemble full row in column order — reuse Current buffer
             for (int i = 0; i < _pkColumnIndices.Length; i++)
-                row[_pkColumnIndices[i]] = _pkBuf[i];
+                Current[_pkColumnIndices[i]] = _pkBuf[i];
             for (int i = 0; i < _valueColumnOutputIndices.Length; i++)
-                row[_valueColumnOutputIndices[i]] = _valueBuf[i];
+                Current[_valueColumnOutputIndices[i]] = _valueBuf[i];
 
-            return new DbRow(row, Projection);
+            return true;
         }
 
-        return null;
+        return false;
     }
 
     public ValueTask DisposeAsync() => _cursor.DisposeAsync();

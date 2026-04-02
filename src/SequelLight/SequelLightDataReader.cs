@@ -14,7 +14,6 @@ public sealed class SequelLightDataReader : DbDataReader
 {
     private readonly IDbEnumerator _enumerator;
     private readonly ReadOnlyTransaction? _ownedTransaction;
-    private DbRow? _currentRow;
     private bool _hasRow;
     private bool _closed;
 
@@ -40,16 +39,8 @@ public sealed class SequelLightDataReader : DbDataReader
 
     public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        var row = await _enumerator.NextAsync(cancellationToken).ConfigureAwait(false);
-        if (row is not null)
-        {
-            _currentRow = row;
-            _hasRow = true;
-            return true;
-        }
-
-        _currentRow = null;
-        return false;
+        _hasRow = await _enumerator.NextAsync(cancellationToken).ConfigureAwait(false);
+        return _hasRow;
     }
 
     public override string GetName(int ordinal) => _enumerator.Projection.GetName(ordinal);
@@ -109,15 +100,15 @@ public sealed class SequelLightDataReader : DbDataReader
 
     public override string GetDataTypeName(int ordinal)
     {
-        if (_currentRow is null) return "NULL";
-        var value = _currentRow.Value[ordinal];
+        if (!_hasRow) return "NULL";
+        var value = _enumerator.Current[ordinal];
         return value.IsNull ? "NULL" : value.Type.ToString();
     }
 
     public override Type GetFieldType(int ordinal)
     {
-        if (_currentRow is null) return typeof(object);
-        var value = _currentRow.Value[ordinal];
+        if (!_hasRow) return typeof(object);
+        var value = _enumerator.Current[ordinal];
         if (value.IsNull) return typeof(object);
         var t = value.Type;
         if (t.IsInteger()) return typeof(long);
@@ -147,8 +138,8 @@ public sealed class SequelLightDataReader : DbDataReader
 
     private DbValue GetDbValue(int ordinal)
     {
-        if (_currentRow is null)
+        if (!_hasRow)
             throw new InvalidOperationException("No current row. Call Read() first.");
-        return _currentRow.Value[ordinal];
+        return _enumerator.Current[ordinal];
     }
 }

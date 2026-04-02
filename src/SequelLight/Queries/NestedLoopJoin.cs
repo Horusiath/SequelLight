@@ -17,16 +17,17 @@ public sealed class NestedLoopJoin : IDbEnumerator
     private readonly int _leftWidth;
     private readonly int _rightWidth;
 
-    // Materialized right side
+    // Materialized right side — must snapshot because source buffer is reused
     private List<DbValue[]>? _rightRows;
     private bool _rightMaterialized;
 
     // State machine
-    private DbRow? _currentLeft;
+    private DbValue[]? _currentLeftSnapshot;
     private int _rightIdx;
     private bool _leftMatched;
 
     public Projection Projection { get; }
+    public DbValue[] Current { get; }
 
     public NestedLoopJoin(IDbEnumerator left, IDbEnumerator right, SqlExpr? condition, JoinKind kind)
     {
@@ -44,37 +45,37 @@ public sealed class NestedLoopJoin : IDbEnumerator
         for (int i = 0; i < _rightWidth; i++)
             names[_leftWidth + i] = right.Projection.GetName(i);
         Projection = new Projection(names);
+        Current = new DbValue[_leftWidth + _rightWidth];
     }
 
-    public async ValueTask<DbRow?> NextAsync(CancellationToken ct = default)
+    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        // Materialize right side on first call
+        // Materialize right side on first call — snapshot each row since source reuses buffer
         if (!_rightMaterialized)
         {
             _rightMaterialized = true;
             _rightRows = new List<DbValue[]>();
-            while (true)
+            while (await _right.NextAsync(ct).ConfigureAwait(false))
             {
-                var r = await _right.NextAsync(ct).ConfigureAwait(false);
-                if (r is null) break;
-                _rightRows.Add(r.Value.Values);
+                var snapshot = new DbValue[_rightWidth];
+                Array.Copy(_right.Current, 0, snapshot, 0, _rightWidth);
+                _rightRows.Add(snapshot);
             }
         }
 
         while (true)
         {
             // Need a new left row?
-            if (_currentLeft is null)
+            if (_currentLeftSnapshot is null)
             {
-                var left = await _left.NextAsync(ct).ConfigureAwait(false);
-                if (left is null)
-                    return null;
-                _currentLeft = left;
+                if (!await _left.NextAsync(ct).ConfigureAwait(false))
+                    return false;
+                // Snapshot left row since source reuses buffer
+                _currentLeftSnapshot = new DbValue[_leftWidth];
+                Array.Copy(_left.Current, 0, _currentLeftSnapshot, 0, _leftWidth);
                 _rightIdx = 0;
                 _leftMatched = false;
             }
-
-            var leftValues = _currentLeft.Value.Values;
 
             // Iterate through right rows
             while (_rightIdx < _rightRows!.Count)
@@ -82,47 +83,43 @@ public sealed class NestedLoopJoin : IDbEnumerator
                 var rightValues = _rightRows[_rightIdx];
                 _rightIdx++;
 
-                var combined = CombineRows(leftValues, rightValues);
+                WriteCombined(_currentLeftSnapshot, rightValues);
 
                 // Evaluate ON condition (CROSS join has no condition)
                 if (_condition is not null)
                 {
-                    var result = ExprEvaluator.Evaluate(_condition, combined, Projection);
+                    var result = ExprEvaluator.Evaluate(_condition, Current, Projection);
                     if (!DbValueComparer.IsTrue(result))
                         continue;
                 }
 
                 _leftMatched = true;
-                return new DbRow(combined, Projection);
+                return true;
             }
 
             // All right rows exhausted for this left row
             // For LEFT JOIN: emit left + nulls if no match
             if (!_leftMatched && IsLeftJoin())
             {
-                var combined = CombineRowsWithNullRight(leftValues);
-                _currentLeft = null;
-                return new DbRow(combined, Projection);
+                WriteCombinedWithNullRight(_currentLeftSnapshot);
+                _currentLeftSnapshot = null;
+                return true;
             }
 
-            _currentLeft = null;
+            _currentLeftSnapshot = null;
         }
     }
 
-    private DbValue[] CombineRows(DbValue[] left, DbValue[] right)
+    private void WriteCombined(DbValue[] left, DbValue[] right)
     {
-        var combined = new DbValue[_leftWidth + _rightWidth];
-        Array.Copy(left, 0, combined, 0, _leftWidth);
-        Array.Copy(right, 0, combined, _leftWidth, _rightWidth);
-        return combined;
+        Array.Copy(left, 0, Current, 0, _leftWidth);
+        Array.Copy(right, 0, Current, _leftWidth, _rightWidth);
     }
 
-    private DbValue[] CombineRowsWithNullRight(DbValue[] left)
+    private void WriteCombinedWithNullRight(DbValue[] left)
     {
-        var combined = new DbValue[_leftWidth + _rightWidth];
-        Array.Copy(left, 0, combined, 0, _leftWidth);
-        // Right side stays DbValue.Null (default)
-        return combined;
+        Array.Copy(left, 0, Current, 0, _leftWidth);
+        Array.Clear(Current, _leftWidth, _rightWidth);
     }
 
     private bool IsLeftJoin() => _kind is JoinKind.Left or JoinKind.LeftOuter;

@@ -4,7 +4,7 @@ namespace SequelLight.Queries;
 
 /// <summary>
 /// Projection/column-mapping operator. Transforms source rows by selecting,
-/// reordering, aliasing, or computing columns.
+/// reordering, aliasing, or computing columns. Reuses a single output buffer.
 /// </summary>
 public sealed class Select : IDbEnumerator
 {
@@ -12,6 +12,7 @@ public sealed class Select : IDbEnumerator
     private readonly Selector[] _selectors;
 
     public Projection Projection { get; }
+    public DbValue[] Current { get; }
 
     public Select(IDbEnumerator source, Selector[] selectors)
     {
@@ -22,21 +23,20 @@ public sealed class Select : IDbEnumerator
         for (int i = 0; i < selectors.Length; i++)
             names[i] = selectors[i].Name;
         Projection = new Projection(names);
+        Current = new DbValue[selectors.Length];
     }
 
-    public async ValueTask<DbRow?> NextAsync(CancellationToken ct = default)
+    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        var sourceRow = await _source.NextAsync(ct).ConfigureAwait(false);
-        if (sourceRow is null)
-            return null;
+        if (!await _source.NextAsync(ct).ConfigureAwait(false))
+            return false;
 
-        var values = sourceRow.Value.Values;
-        var output = new DbValue[_selectors.Length];
+        var values = _source.Current;
 
         for (int i = 0; i < _selectors.Length; i++)
         {
             ref readonly var sel = ref _selectors[i];
-            output[i] = sel.Kind switch
+            Current[i] = sel.Kind switch
             {
                 SelectorKind.ColumnRef => values[sel.SourceIndex],
                 SelectorKind.Constant => sel.ConstantValue,
@@ -45,7 +45,7 @@ public sealed class Select : IDbEnumerator
             };
         }
 
-        return new DbRow(output, Projection);
+        return true;
     }
 
     public static Selector ResolveColumn(Projection source, string name, string? alias = null)

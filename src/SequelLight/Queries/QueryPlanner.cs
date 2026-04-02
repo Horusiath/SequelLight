@@ -266,12 +266,13 @@ internal sealed class DualEnumerator : IDbEnumerator
     private bool _emitted;
 
     public Projection Projection { get; } = new(Array.Empty<string>());
+    public DbValue[] Current { get; } = Array.Empty<DbValue>();
 
-    public ValueTask<DbRow?> NextAsync(CancellationToken ct = default)
+    public ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        if (_emitted) return new ValueTask<DbRow?>((DbRow?)null);
+        if (_emitted) return new ValueTask<bool>(false);
         _emitted = true;
-        return new ValueTask<DbRow?>(new DbRow(Array.Empty<DbValue>(), Projection));
+        return new ValueTask<bool>(true);
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
