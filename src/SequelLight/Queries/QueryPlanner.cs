@@ -107,7 +107,9 @@ public sealed class QueryPlanner
             {
                 var child = BuildPhysical(project.Source, tx);
                 var selectors = ResolveSelectors(project.Columns, child.Projection);
-                return new Select(child, selectors);
+                return IsIdentityProjection(selectors, child.Projection)
+                    ? child
+                    : new Select(child, selectors);
             }
 
             case JoinPlan join:
@@ -178,6 +180,23 @@ public sealed class QueryPlanner
             }
         }
         return needsWrap ? new Select(source, selectors) : source;
+    }
+
+    internal static bool IsIdentityProjection(Selector[] selectors, Projection source)
+    {
+        if (selectors.Length != source.ColumnCount)
+            return false;
+
+        for (int i = 0; i < selectors.Length; i++)
+        {
+            ref readonly var sel = ref selectors[i];
+            if (sel.Kind != SelectorKind.ColumnRef || sel.SourceIndex != i)
+                return false;
+            if (!string.Equals(sel.Name, source.GetName(i), StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
     }
 
     private static Selector[] ResolveSelectors(IReadOnlyList<ResultColumn> columns, Projection sourceProjection)

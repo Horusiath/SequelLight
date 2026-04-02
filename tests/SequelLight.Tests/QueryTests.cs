@@ -599,6 +599,78 @@ public class DbValueComparerTests
     }
 }
 
+public class IdentityProjectionTests
+{
+    [Fact]
+    public void Star_Is_Identity()
+    {
+        var projection = new Projection(["id", "name", "age"]);
+        var selectors = new[]
+        {
+            Selector.ColumnIdentifier("id", 0),
+            Selector.ColumnIdentifier("name", 1),
+            Selector.ColumnIdentifier("age", 2),
+        };
+        Assert.True(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+
+    [Fact]
+    public void Subset_Is_Not_Identity()
+    {
+        var projection = new Projection(["id", "name", "age"]);
+        var selectors = new[]
+        {
+            Selector.ColumnIdentifier("id", 0),
+            Selector.ColumnIdentifier("name", 1),
+        };
+        Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+
+    [Fact]
+    public void Reorder_Is_Not_Identity()
+    {
+        var projection = new Projection(["id", "name"]);
+        var selectors = new[]
+        {
+            Selector.ColumnIdentifier("name", 1),
+            Selector.ColumnIdentifier("id", 0),
+        };
+        Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+
+    [Fact]
+    public void Alias_Is_Not_Identity()
+    {
+        var projection = new Projection(["id", "name"]);
+        var selectors = new[]
+        {
+            Selector.ColumnIdentifier("id", 0),
+            Selector.ColumnIdentifier("n", 1),
+        };
+        Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+
+    [Fact]
+    public void Computed_Is_Not_Identity()
+    {
+        var projection = new Projection(["id", "name"]);
+        var selectors = new[]
+        {
+            Selector.ColumnIdentifier("id", 0),
+            Selector.Computed("expr", _ => new ValueTask<DbValue>(DbValue.Null)),
+        };
+        Assert.False(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+
+    [Fact]
+    public void Empty_Is_Identity()
+    {
+        var projection = new Projection([]);
+        var selectors = Array.Empty<Selector>();
+        Assert.True(QueryPlanner.IsIdentityProjection(selectors, projection));
+    }
+}
+
 public class HeuristicOptimizerTests
 {
     [Fact]
