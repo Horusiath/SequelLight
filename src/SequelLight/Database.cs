@@ -176,8 +176,8 @@ public sealed class Database : IAsyncDisposable
         var table = Schema.GetTable(stmt.Table)
             ?? throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
 
-        if (stmt.Source is not SelectInsertSource { Query.First: ValuesBody values })
-            throw new NotSupportedException("Only INSERT ... VALUES is currently supported.");
+        if (stmt.Source is not SelectInsertSource selectSource)
+            throw new NotSupportedException("Only INSERT ... VALUES / INSERT ... SELECT is supported.");
 
         // Resolve column mapping: which table column index each INSERT column maps to
         var insertColumns = stmt.Columns;
@@ -214,23 +214,27 @@ public sealed class Database : IAsyncDisposable
 
         async ValueTask InsertRows(ReadWriteTransaction rw)
         {
+            var planner = new QueryPlanner(Schema);
+            await using var source = planner.Plan(selectSource.Query, rw);
+
+            // Validate column count up front
+            if (source.Projection.ColumnCount != columnMap.Length)
+                throw new InvalidOperationException(
+                    $"INSERT has {columnMap.Length} target column(s) but {source.Projection.ColumnCount} value(s) were supplied.");
+
             var row = new DbValue[table.Columns.Count];
 
-            foreach (var valueRow in values.Rows)
+            while (await source.NextAsync().ConfigureAwait(false))
             {
-                if (valueRow.Count != columnMap.Length)
-                    throw new InvalidOperationException(
-                        $"INSERT has {columnMap.Length} target column(s) but {valueRow.Count} value(s) were supplied.");
-
-                // Initialize row with defaults/nulls
+                // Initialize row with nulls
                 for (int i = 0; i < row.Length; i++)
                     row[i] = DbValue.Null;
 
-                // Fill in explicitly provided values
-                for (int i = 0; i < valueRow.Count; i++)
+                // Map source values to target columns with type coercion
+                for (int i = 0; i < columnMap.Length; i++)
                 {
                     var colIdx = columnMap[i];
-                    row[colIdx] = EvaluateLiteral(valueRow[i], table.Columns[colIdx]);
+                    row[colIdx] = CoerceToColumnType(source.Current[i], table.Columns[colIdx]);
                 }
 
                 // Fill defaults and validate NOT NULL for columns not in the INSERT column list
@@ -249,7 +253,7 @@ public sealed class Database : IAsyncDisposable
 
                     if (col.DefaultValue is not null)
                     {
-                        row[i] = EvaluateLiteral(col.DefaultValue, col);
+                        row[i] = EvaluateDefault(col.DefaultValue, col);
                         continue;
                     }
 
@@ -277,13 +281,51 @@ public sealed class Database : IAsyncDisposable
     }
 
     /// <summary>
-    /// Evaluates a SQL expression (currently only literals) into a <see cref="DbValue"/>
+    /// Coerces a <see cref="DbValue"/> to the target column's type affinity.
+    /// Throws if the conversion is not supported (e.g. Text → Integer).
+    /// </summary>
+    private static DbValue CoerceToColumnType(DbValue value, ColumnSchema column)
+    {
+        if (value.IsNull)
+            return DbValue.Null;
+
+        var affinity = TypeAffinity.Resolve(column.TypeName);
+
+        if (affinity.IsInteger())
+        {
+            if (value.Type.IsInteger()) return value;
+            if (value.Type == DbType.Float64) return DbValue.Integer((long)value.AsReal());
+        }
+        else if (affinity == DbType.Float64)
+        {
+            if (value.Type == DbType.Float64) return value;
+            if (value.Type.IsInteger()) return DbValue.Real(value.AsInteger());
+        }
+        else if (affinity == DbType.Text)
+        {
+            if (value.Type == DbType.Text) return value;
+        }
+        else if (affinity == DbType.Bytes)
+        {
+            if (value.Type == DbType.Bytes) return value;
+        }
+        else
+        {
+            return value;
+        }
+
+        throw new InvalidOperationException(
+            $"Cannot convert {value.Type} value to {affinity} for column '{column.Name}'.");
+    }
+
+    /// <summary>
+    /// Evaluates a column default expression into a <see cref="DbValue"/>
     /// compatible with the target column's type affinity.
     /// </summary>
-    private static DbValue EvaluateLiteral(SqlExpr expr, ColumnSchema column)
+    private static DbValue EvaluateDefault(SqlExpr expr, ColumnSchema column)
     {
         if (expr is not LiteralExpr literal)
-            throw new NotSupportedException($"Only literal expressions are currently supported in INSERT values, got {expr.GetType().Name}.");
+            throw new NotSupportedException($"Only literal default expressions are supported, got {expr.GetType().Name}.");
 
         if (literal.Kind == LiteralKind.Null)
             return DbValue.Null;

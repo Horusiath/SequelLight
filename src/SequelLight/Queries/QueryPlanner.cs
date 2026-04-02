@@ -19,12 +19,19 @@ public sealed class QueryPlanner
 
     public IDbEnumerator Plan(SelectStmt stmt, ReadOnlyTransaction tx)
     {
-        if (stmt.First is not SelectCore core)
-            throw new NotSupportedException("Only SELECT (not VALUES) is supported.");
-
         if (stmt.Compounds.Count > 0)
             throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
 
+        return stmt.First switch
+        {
+            SelectCore core => PlanSelectCore(core, tx),
+            ValuesBody values => new ValuesEnumerator(values.Rows),
+            _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
+        };
+    }
+
+    private IDbEnumerator PlanSelectCore(SelectCore core, ReadOnlyTransaction tx)
+    {
         var logical = BuildLogicalPlan(core);
         logical = HeuristicOptimizer.Optimize(logical);
         return BuildPhysical(logical, tx);

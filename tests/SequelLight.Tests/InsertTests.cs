@@ -208,4 +208,109 @@ public class InsertTests : TempDirTest
         var result = await cmd.ExecuteNonQueryAsync();
         Assert.Equal(1, result);
     }
+
+    [Fact]
+    public async Task Insert_Select_All_Columns()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO src VALUES (1, 'alice'), (2, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO dst SELECT * FROM src";
+        var result = await cmd.ExecuteNonQueryAsync();
+        Assert.Equal(2, result);
+
+        cmd.CommandText = "SELECT id, name FROM dst";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<(long Id, string Name)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal((1, "alice"), rows[0]);
+        Assert.Equal((2, "bob"), rows[1]);
+    }
+
+    [Fact]
+    public async Task Insert_Select_With_Column_List()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO src VALUES (1, 100), (2, 200)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "CREATE TABLE dst (id INTEGER PRIMARY KEY, val INTEGER, extra TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO dst (id, val) SELECT id, val FROM src";
+        var result = await cmd.ExecuteNonQueryAsync();
+        Assert.Equal(2, result);
+
+        cmd.CommandText = "SELECT id, val FROM dst";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<(long Id, long Val)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal((1, 100), rows[0]);
+        Assert.Equal((2, 200), rows[1]);
+    }
+
+    [Fact]
+    public async Task Insert_Select_With_Where()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "CREATE TABLE dst (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO dst SELECT * FROM src WHERE val > 15";
+        var result = await cmd.ExecuteNonQueryAsync();
+        Assert.Equal(2, result);
+
+        cmd.CommandText = "SELECT id FROM dst";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync())
+            ids.Add(reader.GetInt64(0));
+
+        Assert.Equal(new long[] { 2, 3 }, ids);
+    }
+
+    [Fact]
+    public async Task Insert_Select_Column_Count_Mismatch_Rejected()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE src (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO src VALUES (1, 10, 20)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "CREATE TABLE dst (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // SELECT provides 3 columns but dst INSERT expects 2
+        cmd.CommandText = "INSERT INTO dst SELECT * FROM src";
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => cmd.ExecuteNonQueryAsync());
+        Assert.Contains("2 target column(s) but 3 value(s)", ex.Message);
+    }
 }
