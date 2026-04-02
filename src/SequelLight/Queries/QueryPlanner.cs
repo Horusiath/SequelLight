@@ -144,7 +144,7 @@ public sealed class QueryPlanner
             }
 
             case JoinPlan join:
-                return BuildJoin(join, tx);
+                return BuildJoinWithOrder(join, tx).Enumerator;
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
@@ -157,10 +157,10 @@ public sealed class QueryPlanner
         return new TableScan(cursor, scan.Table);
     }
 
-    private IDbEnumerator BuildJoin(JoinPlan join, ReadOnlyTransaction tx)
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder) BuildJoinWithOrder(JoinPlan join, ReadOnlyTransaction tx)
     {
-        var left = BuildPhysical(join.Left, tx);
-        var right = BuildPhysical(join.Right, tx);
+        var (left, leftOrder) = BuildPhysicalWithOrder(join.Left, tx);
+        var (right, rightOrder) = BuildPhysicalWithOrder(join.Right, tx);
 
         // Build combined qualified projection
         string leftAlias = GetPlanAlias(join.Left);
@@ -170,19 +170,134 @@ public sealed class QueryPlanner
         left = WrapWithQualifiedProjection(left, qualifiedLeft);
         right = WrapWithQualifiedProjection(right, qualifiedRight);
 
+        int leftWidth = left.Projection.ColumnCount;
+
         // Resolve column references in ON condition against combined projection
         SqlExpr? condition = join.Condition;
         if (condition is not null)
         {
-            var combinedNames = new QualifiedName[left.Projection.ColumnCount + right.Projection.ColumnCount];
-            for (int i = 0; i < left.Projection.ColumnCount; i++)
+            var combinedNames = new QualifiedName[leftWidth + right.Projection.ColumnCount];
+            for (int i = 0; i < leftWidth; i++)
                 combinedNames[i] = left.Projection.GetQualifiedName(i);
             for (int i = 0; i < right.Projection.ColumnCount; i++)
-                combinedNames[left.Projection.ColumnCount + i] = right.Projection.GetQualifiedName(i);
+                combinedNames[leftWidth + i] = right.Projection.GetQualifiedName(i);
             condition = ResolveColumns(condition, new Projection(combinedNames));
         }
 
-        return new NestedLoopJoin(left, right, condition, join.Kind);
+        // Try MergeJoin for equi-joins on supported join kinds
+        if (condition is not null
+            && join.Kind is not JoinKind.Cross and not JoinKind.Comma
+            && TryExtractEquiJoinKeys(condition, leftWidth,
+                out var leftKeyIndices, out var rightKeyIndices, out var residual))
+        {
+            bool leftSorted = JoinKeysMatchSortOrder(leftKeyIndices, leftOrder);
+            bool rightSorted = JoinKeysMatchSortOrder(rightKeyIndices, rightOrder);
+
+            if (!leftSorted)
+            {
+                var orders = new SortOrder[leftKeyIndices.Length];
+                Array.Fill(orders, SortOrder.Asc);
+                left = new SortEnumerator(left, leftKeyIndices, orders);
+            }
+
+            if (!rightSorted)
+            {
+                var orders = new SortOrder[rightKeyIndices.Length];
+                Array.Fill(orders, SortOrder.Asc);
+                right = new SortEnumerator(right, rightKeyIndices, orders);
+            }
+
+            IDbEnumerator result = new MergeJoin(left, right, leftKeyIndices, rightKeyIndices, join.Kind);
+
+            if (residual is not null)
+                result = new Filter(result, residual);
+
+            // MergeJoin preserves the left side's sort order.
+            // Left ordinals map directly to combined output ordinals.
+            SortKey[] outputOrder = leftSorted
+                ? leftOrder
+                : BuildAscSortKeys(leftKeyIndices);
+
+            return (result, outputOrder);
+        }
+
+        // Fallback to NestedLoopJoin
+        return (new NestedLoopJoin(left, right, condition, join.Kind), Array.Empty<SortKey>());
+    }
+
+    private static bool TryExtractEquiJoinKeys(
+        SqlExpr condition, int leftWidth,
+        out int[] leftKeyIndices, out int[] rightKeyIndices,
+        out SqlExpr? residual)
+    {
+        leftKeyIndices = Array.Empty<int>();
+        rightKeyIndices = Array.Empty<int>();
+        residual = null;
+
+        var conjuncts = HeuristicOptimizer.SplitAnd(condition);
+        var leftKeys = new List<int>();
+        var rightKeys = new List<int>();
+        List<SqlExpr>? residuals = null;
+
+        foreach (var conjunct in conjuncts)
+        {
+            if (conjunct is BinaryExpr { Op: BinaryOp.Equal } eq
+                && eq.Left is ResolvedColumnExpr leftCol
+                && eq.Right is ResolvedColumnExpr rightCol)
+            {
+                int lOrd = leftCol.Ordinal;
+                int rOrd = rightCol.Ordinal;
+
+                if (lOrd < leftWidth && rOrd >= leftWidth)
+                {
+                    leftKeys.Add(lOrd);
+                    rightKeys.Add(rOrd - leftWidth);
+                }
+                else if (rOrd < leftWidth && lOrd >= leftWidth)
+                {
+                    leftKeys.Add(rOrd);
+                    rightKeys.Add(lOrd - leftWidth);
+                }
+                else
+                {
+                    (residuals ??= new List<SqlExpr>()).Add(conjunct);
+                }
+            }
+            else
+            {
+                (residuals ??= new List<SqlExpr>()).Add(conjunct);
+            }
+        }
+
+        if (leftKeys.Count == 0)
+            return false;
+
+        leftKeyIndices = leftKeys.ToArray();
+        rightKeyIndices = rightKeys.ToArray();
+        if (residuals is { Count: > 0 })
+            residual = HeuristicOptimizer.CombineAnd(residuals);
+        return true;
+    }
+
+    private static bool JoinKeysMatchSortOrder(int[] keyIndices, SortKey[] providedOrder)
+    {
+        if (keyIndices.Length == 0 || providedOrder.Length < keyIndices.Length)
+            return false;
+
+        for (int i = 0; i < keyIndices.Length; i++)
+        {
+            if (providedOrder[i].Ordinal != keyIndices[i] || providedOrder[i].Order != SortOrder.Asc)
+                return false;
+        }
+        return true;
+    }
+
+    private static SortKey[] BuildAscSortKeys(int[] ordinals)
+    {
+        var keys = new SortKey[ordinals.Length];
+        for (int i = 0; i < ordinals.Length; i++)
+            keys[i] = new SortKey(ordinals[i], SortOrder.Asc);
+        return keys;
     }
 
     private static string GetPlanAlias(LogicalPlan plan)
@@ -388,7 +503,7 @@ public sealed class QueryPlanner
             }
 
             case JoinPlan join:
-                return (BuildJoin(join, tx), Array.Empty<SortKey>());
+                return BuildJoinWithOrder(join, tx);
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");

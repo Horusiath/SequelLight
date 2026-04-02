@@ -335,6 +335,133 @@ public class JoinTests : TempDirTest
 
         Assert.Equal(6, count); // 2 x 3
     }
+
+    [Fact]
+    public async Task MergeJoin_On_PK_EquiJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 'p'), (2, 'q'), (4, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT a.val, b.info FROM a INNER JOIN b ON a.id = b.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("x", "p"), rows);
+        Assert.Contains(("y", "q"), rows);
+    }
+
+    [Fact]
+    public async Task MergeJoin_LeftJoin_Includes_Unmatched()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 'p'), (2, 'q')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT a.val, b.info FROM a LEFT JOIN b ON a.id = b.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, object Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetValue(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("x", (object)"p"), rows);
+        Assert.Contains(("y", (object)"q"), rows);
+        var unmatched = rows.Where(r => r.Val == "z").ToList();
+        Assert.Single(unmatched);
+        Assert.Equal(DBNull.Value, unmatched[0].Info);
+    }
+
+    [Fact]
+    public async Task MergeJoin_With_OrderBy_Eliminates_Sort()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO a VALUES (3, 'z'), (1, 'x'), (2, 'y')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (2, 'q'), (1, 'p'), (3, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT a.id, b.info FROM a INNER JOIN b ON a.id = b.id ORDER BY a.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long Id, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal((1, "p"), rows[0]);
+        Assert.Equal((2, "q"), rows[1]);
+        Assert.Equal((3, "r"), rows[2]);
+    }
+
+    [Fact]
+    public async Task CrossJoin_Falls_Back_To_NestedLoopJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO a VALUES (1), (2)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (10), (20)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT * FROM a CROSS JOIN b";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        int count = 0;
+        while (await reader.ReadAsync())
+            count++;
+
+        Assert.Equal(4, count);
+    }
+
+    [Fact]
+    public async Task MergeJoin_With_Unsorted_Side_Inserts_Sort()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTables(conn); // users(id PK, name) + orders(id PK, user_id, product)
+
+        // Join key is orders.user_id which is NOT the PK — requires SortEnumerator on right
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT users.name, orders.product FROM users INNER JOIN orders ON users.id = orders.user_id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Name, string Product)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("alice", "widget"), rows);
+        Assert.Contains(("alice", "gadget"), rows);
+        Assert.Contains(("bob", "thing"), rows);
+    }
 }
 
 public class ExprEvaluatorTests

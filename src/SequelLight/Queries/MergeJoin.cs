@@ -71,9 +71,20 @@ public sealed class MergeJoin : IDbEnumerator
                 return true;
             }
 
-            // Clear buffer state
-            _rightBuffer = null;
-            _bufferedLeftValues = null;
+            // Right buffer exhausted for current left row — check if next left has same key
+            if (_rightBuffer is not null)
+            {
+                if (!_leftExhausted && SameLeftKey(_leftSnapshot!, _bufferedLeftValues!))
+                {
+                    // Next left row has the same join key: reuse buffer with new left values
+                    Array.Copy(_leftSnapshot!, 0, _bufferedLeftValues!, 0, _leftWidth);
+                    _leftExhausted = !await AdvanceLeft(ct);
+                    _rightBufferIdx = 0;
+                    continue;
+                }
+                _rightBuffer = null;
+                _bufferedLeftValues = null;
+            }
 
             if (_leftExhausted)
                 return false;
@@ -111,8 +122,12 @@ public sealed class MergeJoin : IDbEnumerator
             else
             {
                 // Equal: buffer all right rows with same key, then emit cross product
-                _bufferedLeftValues = _leftSnapshot;
-                _rightBuffer = new List<DbValue[]> { _rightSnapshot! };
+                // Snapshot both sides — AdvanceLeft/AdvanceRight reuse the same arrays
+                _bufferedLeftValues = new DbValue[_leftWidth];
+                Array.Copy(_leftSnapshot!, 0, _bufferedLeftValues, 0, _leftWidth);
+                var firstRight = new DbValue[_rightWidth];
+                Array.Copy(_rightSnapshot!, 0, firstRight, 0, _rightWidth);
+                _rightBuffer = new List<DbValue[]> { firstRight };
 
                 while (true)
                 {
@@ -123,7 +138,6 @@ public sealed class MergeJoin : IDbEnumerator
                     }
                     if (CompareKeysRight(_bufferedLeftValues!, _rightSnapshot!) != 0)
                         break;
-                    // Snapshot since we need to keep multiple right rows
                     var copy = new DbValue[_rightWidth];
                     Array.Copy(_rightSnapshot!, 0, copy, 0, _rightWidth);
                     _rightBuffer.Add(copy);
@@ -131,16 +145,19 @@ public sealed class MergeJoin : IDbEnumerator
 
                 _rightBufferIdx = 0;
                 _leftExhausted = !await AdvanceLeft(ct);
-
-                // Emit first result from buffer
-                if (_rightBuffer.Count > 0)
-                {
-                    WriteCombined(_bufferedLeftValues!, _rightBuffer[_rightBufferIdx]);
-                    _rightBufferIdx++;
-                    return true;
-                }
+                // Will emit from buffer on next loop iteration
             }
         }
+    }
+
+    private bool SameLeftKey(DbValue[] a, DbValue[] b)
+    {
+        for (int i = 0; i < _leftKeyIndices.Length; i++)
+        {
+            if (DbValueComparer.Compare(a[_leftKeyIndices[i]], b[_leftKeyIndices[i]]) != 0)
+                return false;
+        }
+        return true;
     }
 
     /// <summary>Advance left source and snapshot its current buffer.</summary>

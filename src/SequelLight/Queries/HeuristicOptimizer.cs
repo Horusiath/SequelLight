@@ -79,7 +79,7 @@ public static class HeuristicOptimizer
         return result;
     }
 
-    private static List<SqlExpr> SplitAnd(SqlExpr expr)
+    internal static List<SqlExpr> SplitAnd(SqlExpr expr)
     {
         var result = new List<SqlExpr>();
         SplitAndRecursive(expr, result);
@@ -99,7 +99,7 @@ public static class HeuristicOptimizer
         }
     }
 
-    private static SqlExpr CombineAnd(List<SqlExpr> exprs)
+    internal static SqlExpr CombineAnd(List<SqlExpr> exprs)
     {
         var result = exprs[0];
         for (int i = 1; i < exprs.Count; i++)
