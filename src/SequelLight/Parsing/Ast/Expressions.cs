@@ -31,6 +31,9 @@ public sealed record BindParameterExpr(string Name) : SqlExpr;
 
 public sealed record ColumnRefExpr(string? Schema, string? Table, string Column) : SqlExpr;
 
+/// <summary>Column reference pre-resolved to an ordinal at plan time. Eliminates per-row dictionary lookups.</summary>
+public sealed record ResolvedColumnExpr(int Ordinal) : SqlExpr;
+
 public enum UnaryOp { Plus, Minus, BitwiseNot, Not }
 
 public sealed record UnaryExpr(UnaryOp Op, SqlExpr Operand) : SqlExpr;

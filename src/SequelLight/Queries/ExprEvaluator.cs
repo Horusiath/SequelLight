@@ -17,6 +17,9 @@ public static class ExprEvaluator
             case LiteralExpr lit:
                 return EvaluateLiteral(lit);
 
+            case ResolvedColumnExpr resolved:
+                return row[resolved.Ordinal];
+
             case ColumnRefExpr col:
                 return EvaluateColumnRef(col, row, projection);
 

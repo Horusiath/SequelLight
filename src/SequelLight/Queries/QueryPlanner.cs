@@ -100,7 +100,8 @@ public sealed class QueryPlanner
             case FilterPlan filter:
             {
                 var child = BuildPhysical(filter.Source, tx);
-                return new Filter(child, filter.Predicate);
+                var resolved = ResolveColumns(filter.Predicate, child.Projection);
+                return new Filter(child, resolved);
             }
 
             case ProjectPlan project:
@@ -139,8 +140,19 @@ public sealed class QueryPlanner
         left = WrapWithQualifiedProjection(left, qualifiedLeft);
         right = WrapWithQualifiedProjection(right, qualifiedRight);
 
-        // Always use NestedLoopJoin as the general-purpose fallback
-        return new NestedLoopJoin(left, right, join.Condition, join.Kind);
+        // Resolve column references in ON condition against combined projection
+        SqlExpr? condition = join.Condition;
+        if (condition is not null)
+        {
+            var combinedNames = new string[left.Projection.ColumnCount + right.Projection.ColumnCount];
+            for (int i = 0; i < left.Projection.ColumnCount; i++)
+                combinedNames[i] = left.Projection.GetName(i);
+            for (int i = 0; i < right.Projection.ColumnCount; i++)
+                combinedNames[left.Projection.ColumnCount + i] = right.Projection.GetName(i);
+            condition = ResolveColumns(condition, new Projection(combinedNames));
+        }
+
+        return new NestedLoopJoin(left, right, condition, join.Kind);
     }
 
     private static string GetPlanAlias(LogicalPlan plan)
@@ -180,6 +192,67 @@ public sealed class QueryPlanner
             }
         }
         return needsWrap ? new Select(source, selectors) : source;
+    }
+
+    /// <summary>
+    /// Walks an expression tree and replaces <see cref="ColumnRefExpr"/> with
+    /// <see cref="ResolvedColumnExpr"/> using ordinals from the source projection.
+    /// Eliminates per-row dictionary lookups and string allocations.
+    /// </summary>
+    internal static SqlExpr ResolveColumns(SqlExpr expr, Projection projection)
+    {
+        return expr switch
+        {
+            ColumnRefExpr col => ResolveColumnRef(col, projection),
+            ResolvedColumnExpr => expr,
+            LiteralExpr => expr,
+            UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection) },
+            BinaryExpr binary => binary with
+            {
+                Left = ResolveColumns(binary.Left, projection),
+                Right = ResolveColumns(binary.Right, projection),
+            },
+            IsExpr isExpr => isExpr with
+            {
+                Left = ResolveColumns(isExpr.Left, projection),
+                Right = ResolveColumns(isExpr.Right, projection),
+            },
+            NullTestExpr nullTest => nullTest with { Operand = ResolveColumns(nullTest.Operand, projection) },
+            BetweenExpr between => between with
+            {
+                Operand = ResolveColumns(between.Operand, projection),
+                Low = ResolveColumns(between.Low, projection),
+                High = ResolveColumns(between.High, projection),
+            },
+            CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
+            _ => expr,
+        };
+    }
+
+    private static ResolvedColumnExpr ResolveColumnRef(ColumnRefExpr col, Projection projection)
+    {
+        // Try qualified name first: "table.column"
+        if (col.Table is not null)
+        {
+            var qualified = $"{col.Table}.{col.Column}";
+            if (projection.TryGetOrdinal(qualified, out int idx))
+                return new ResolvedColumnExpr(idx);
+        }
+
+        // Try unqualified
+        if (projection.TryGetOrdinal(col.Column, out int ordinal))
+            return new ResolvedColumnExpr(ordinal);
+
+        // Scan for "*.column" pattern (any table qualifier)
+        for (int i = 0; i < projection.ColumnCount; i++)
+        {
+            var name = projection.GetName(i);
+            int dot = name.IndexOf('.');
+            if (dot >= 0 && name.AsSpan(dot + 1).Equals(col.Column, StringComparison.OrdinalIgnoreCase))
+                return new ResolvedColumnExpr(i);
+        }
+
+        throw new InvalidOperationException($"Column '{(col.Table != null ? col.Table + "." : "")}{col.Column}' not found.");
     }
 
     internal static bool IsIdentityProjection(Selector[] selectors, Projection source)
@@ -262,12 +335,12 @@ public sealed class QueryPlanner
             throw new InvalidOperationException($"Column '{(colRef.Table != null ? colRef.Table + "." : "")}{colRef.Column}' not found.");
         }
 
-        // General expression — use computed selector
+        // General expression — resolve column refs, then use computed selector
         string computedName = exprCol.Alias ?? exprCol.Expression.ToString()!;
-        var expr = exprCol.Expression;
+        var resolved = ResolveColumns(exprCol.Expression, sourceProjection);
         var projection = sourceProjection;
         return Selector.Computed(computedName, values =>
-            new ValueTask<DbValue>(ExprEvaluator.Evaluate(expr, values, projection)));
+            new ValueTask<DbValue>(ExprEvaluator.Evaluate(resolved, values, projection)));
     }
 }
 

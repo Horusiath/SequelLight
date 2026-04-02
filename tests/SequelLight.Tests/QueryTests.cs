@@ -599,6 +599,98 @@ public class DbValueComparerTests
     }
 }
 
+public class ResolveColumnsTests
+{
+    [Fact]
+    public void Resolves_Unqualified_ColumnRef()
+    {
+        var projection = new Projection(["id", "name"]);
+        var expr = new ColumnRefExpr(null, null, "name");
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
+        Assert.Equal(1, rc.Ordinal);
+    }
+
+    [Fact]
+    public void Resolves_Qualified_ColumnRef()
+    {
+        var projection = new Projection(["t.id", "t.name"]);
+        var expr = new ColumnRefExpr(null, "t", "name");
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
+        Assert.Equal(1, rc.Ordinal);
+    }
+
+    [Fact]
+    public void Resolves_Wildcard_Table_Match()
+    {
+        var projection = new Projection(["users.id", "users.name"]);
+        var expr = new ColumnRefExpr(null, null, "name");
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
+        Assert.Equal(1, rc.Ordinal);
+    }
+
+    [Fact]
+    public void Resolves_Nested_In_BinaryExpr()
+    {
+        var projection = new Projection(["x", "y"]);
+        var expr = new BinaryExpr(
+            new ColumnRefExpr(null, null, "x"),
+            BinaryOp.Add,
+            new ColumnRefExpr(null, null, "y"));
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var binary = Assert.IsType<BinaryExpr>(resolved);
+        Assert.Equal(0, Assert.IsType<ResolvedColumnExpr>(binary.Left).Ordinal);
+        Assert.Equal(1, Assert.IsType<ResolvedColumnExpr>(binary.Right).Ordinal);
+    }
+
+    [Fact]
+    public void Preserves_Literals()
+    {
+        var projection = new Projection(["x"]);
+        var expr = new LiteralExpr(LiteralKind.Integer, "42");
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        Assert.Same(expr, resolved);
+    }
+
+    [Fact]
+    public void Resolves_Nested_In_BetweenExpr()
+    {
+        var projection = new Projection(["val"]);
+        var expr = new BetweenExpr(
+            new ColumnRefExpr(null, null, "val"),
+            false,
+            new LiteralExpr(LiteralKind.Integer, "1"),
+            new LiteralExpr(LiteralKind.Integer, "10"));
+
+        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+
+        var between = Assert.IsType<BetweenExpr>(resolved);
+        Assert.Equal(0, Assert.IsType<ResolvedColumnExpr>(between.Operand).Ordinal);
+    }
+
+    [Fact]
+    public void Throws_For_Unknown_Column()
+    {
+        var projection = new Projection(["x"]);
+        var expr = new ColumnRefExpr(null, null, "missing");
+
+        Assert.Throws<InvalidOperationException>(() =>
+            QueryPlanner.ResolveColumns(expr, projection));
+    }
+}
+
 public class IdentityProjectionTests
 {
     [Fact]
