@@ -48,66 +48,118 @@ public sealed class NestedLoopJoin : IDbEnumerator
         Current = new DbValue[_leftWidth + _rightWidth];
     }
 
-    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
+    public ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        // Materialize right side on first call — snapshot each row since source reuses buffer
+        // Materialize right side on first call
         if (!_rightMaterialized)
-        {
-            _rightMaterialized = true;
-            _rightRows = new List<DbValue[]>();
-            while (await _right.NextAsync(ct).ConfigureAwait(false))
-            {
-                var snapshot = new DbValue[_rightWidth];
-                Array.Copy(_right.Current, 0, snapshot, 0, _rightWidth);
-                _rightRows.Add(snapshot);
-            }
-        }
+            return MaterializeAndScan(ct);
 
+        return ScanLoop(ct);
+    }
+
+    private ValueTask<bool> ScanLoop(CancellationToken ct)
+    {
         while (true)
         {
             // Need a new left row?
             if (_currentLeftSnapshot is null)
             {
-                if (!await _left.NextAsync(ct).ConfigureAwait(false))
-                    return false;
-                // Snapshot left row since source reuses buffer
-                _currentLeftSnapshot = new DbValue[_leftWidth];
-                Array.Copy(_left.Current, 0, _currentLeftSnapshot, 0, _leftWidth);
-                _rightIdx = 0;
-                _leftMatched = false;
+                var leftTask = _left.NextAsync(ct);
+                if (!leftTask.IsCompletedSuccessfully)
+                    return ScanLoopSlow(leftTask, ct);
+                if (!leftTask.Result)
+                    return new ValueTask<bool>(false);
+                SnapshotLeft();
             }
 
-            // Iterate through right rows
-            while (_rightIdx < _rightRows!.Count)
-            {
-                var rightValues = _rightRows[_rightIdx];
-                _rightIdx++;
-
-                WriteCombined(_currentLeftSnapshot, rightValues);
-
-                // Evaluate ON condition (CROSS join has no condition)
-                if (_condition is not null)
-                {
-                    var result = ExprEvaluator.Evaluate(_condition, Current, Projection);
-                    if (!DbValueComparer.IsTrue(result))
-                        continue;
-                }
-
-                _leftMatched = true;
-                return true;
-            }
+            // Iterate through right rows (entirely synchronous)
+            if (TryMatchRight())
+                return new ValueTask<bool>(true);
 
             // All right rows exhausted for this left row
-            // For LEFT JOIN: emit left + nulls if no match
             if (!_leftMatched && IsLeftJoin())
             {
-                WriteCombinedWithNullRight(_currentLeftSnapshot);
+                WriteCombinedWithNullRight(_currentLeftSnapshot!);
+                _currentLeftSnapshot = null;
+                return new ValueTask<bool>(true);
+            }
+
+            _currentLeftSnapshot = null;
+        }
+    }
+
+    private async ValueTask<bool> ScanLoopSlow(ValueTask<bool> pending, CancellationToken ct)
+    {
+        // First pending left fetch
+        if (!await pending.ConfigureAwait(false))
+            return false;
+        SnapshotLeft();
+
+        while (true)
+        {
+            if (TryMatchRight())
+                return true;
+
+            if (!_leftMatched && IsLeftJoin())
+            {
+                WriteCombinedWithNullRight(_currentLeftSnapshot!);
                 _currentLeftSnapshot = null;
                 return true;
             }
 
             _currentLeftSnapshot = null;
+
+            if (!await _left.NextAsync(ct).ConfigureAwait(false))
+                return false;
+            SnapshotLeft();
         }
+    }
+
+    private async ValueTask<bool> MaterializeAndScan(CancellationToken ct)
+    {
+        _rightMaterialized = true;
+        _rightRows = new List<DbValue[]>();
+        while (await _right.NextAsync(ct).ConfigureAwait(false))
+        {
+            var snapshot = new DbValue[_rightWidth];
+            Array.Copy(_right.Current, 0, snapshot, 0, _rightWidth);
+            _rightRows.Add(snapshot);
+        }
+
+        var scanTask = ScanLoop(ct);
+        if (scanTask.IsCompletedSuccessfully)
+            return scanTask.Result;
+        return await scanTask.ConfigureAwait(false);
+    }
+
+    private void SnapshotLeft()
+    {
+        _currentLeftSnapshot = new DbValue[_leftWidth];
+        Array.Copy(_left.Current, 0, _currentLeftSnapshot, 0, _leftWidth);
+        _rightIdx = 0;
+        _leftMatched = false;
+    }
+
+    private bool TryMatchRight()
+    {
+        while (_rightIdx < _rightRows!.Count)
+        {
+            var rightValues = _rightRows[_rightIdx];
+            _rightIdx++;
+
+            WriteCombined(_currentLeftSnapshot!, rightValues);
+
+            if (_condition is not null)
+            {
+                var result = ExprEvaluator.Evaluate(_condition, Current, Projection);
+                if (!DbValueComparer.IsTrue(result))
+                    continue;
+            }
+
+            _leftMatched = true;
+            return true;
+        }
+        return false;
     }
 
     private void WriteCombined(DbValue[] left, DbValue[] right)

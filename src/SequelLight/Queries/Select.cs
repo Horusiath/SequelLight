@@ -26,14 +26,50 @@ public sealed class Select : IDbEnumerator
         Current = new DbValue[selectors.Length];
     }
 
-    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
+    public ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        if (!await _source.NextAsync(ct).ConfigureAwait(false))
-            return false;
+        var task = _source.NextAsync(ct);
+        if (task.IsCompletedSuccessfully)
+        {
+            if (!task.Result)
+                return new ValueTask<bool>(false);
+            return ApplySelectors(_source.Current);
+        }
+        return NextAsyncSlow(task);
+    }
 
-        var values = _source.Current;
-
+    private ValueTask<bool> ApplySelectors(DbValue[] values)
+    {
         for (int i = 0; i < _selectors.Length; i++)
+        {
+            ref readonly var sel = ref _selectors[i];
+            switch (sel.Kind)
+            {
+                case SelectorKind.ColumnRef:
+                    Current[i] = values[sel.SourceIndex];
+                    break;
+                case SelectorKind.Constant:
+                    Current[i] = sel.ConstantValue;
+                    break;
+                case SelectorKind.Computed:
+                    var computeTask = sel.ComputeFunc!(values);
+                    if (computeTask.IsCompletedSuccessfully)
+                    {
+                        Current[i] = computeTask.Result;
+                        break;
+                    }
+                    return ApplySelectorsSlow(values, i, computeTask);
+                default:
+                    throw new InvalidOperationException($"Unknown selector kind: {sel.Kind}");
+            }
+        }
+        return new ValueTask<bool>(true);
+    }
+
+    private async ValueTask<bool> ApplySelectorsSlow(DbValue[] values, int startIdx, ValueTask<DbValue> pending)
+    {
+        Current[startIdx] = await pending.ConfigureAwait(false);
+        for (int i = startIdx + 1; i < _selectors.Length; i++)
         {
             ref readonly var sel = ref _selectors[i];
             Current[i] = sel.Kind switch
@@ -44,8 +80,17 @@ public sealed class Select : IDbEnumerator
                 _ => throw new InvalidOperationException($"Unknown selector kind: {sel.Kind}")
             };
         }
-
         return true;
+    }
+
+    private async ValueTask<bool> NextAsyncSlow(ValueTask<bool> pending)
+    {
+        if (!await pending.ConfigureAwait(false))
+            return false;
+        var applyTask = ApplySelectors(_source.Current);
+        if (applyTask.IsCompletedSuccessfully)
+            return applyTask.Result;
+        return await applyTask.ConfigureAwait(false);
     }
 
     public static Selector ResolveColumn(Projection source, string name, string? alias = null)

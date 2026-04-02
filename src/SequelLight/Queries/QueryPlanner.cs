@@ -276,7 +276,21 @@ public sealed class QueryPlanner
 
     private static Selector[] ResolveSelectors(IReadOnlyList<ResultColumn> columns, Projection sourceProjection)
     {
-        var result = new List<Selector>();
+        // Pre-count output columns to allocate exact array
+        int count = 0;
+        foreach (var col in columns)
+        {
+            count += col switch
+            {
+                StarResultColumn => sourceProjection.ColumnCount,
+                TableStarResultColumn ts => CountTableStarColumns(ts.Table, sourceProjection),
+                ExprResultColumn => 1,
+                _ => 0,
+            };
+        }
+
+        var result = new Selector[count];
+        int pos = 0;
 
         foreach (var col in columns)
         {
@@ -284,7 +298,7 @@ public sealed class QueryPlanner
             {
                 case StarResultColumn:
                     for (int i = 0; i < sourceProjection.ColumnCount; i++)
-                        result.Add(Selector.ColumnIdentifier(sourceProjection.GetName(i), i));
+                        result[pos++] = Selector.ColumnIdentifier(sourceProjection.GetName(i), i);
                     break;
 
                 case TableStarResultColumn tableStar:
@@ -293,17 +307,30 @@ public sealed class QueryPlanner
                         var name = sourceProjection.GetName(i);
                         int dot = name.IndexOf('.');
                         if (dot >= 0 && name.AsSpan(0, dot).Equals(tableStar.Table, StringComparison.OrdinalIgnoreCase))
-                            result.Add(Selector.ColumnIdentifier(name, i));
+                            result[pos++] = Selector.ColumnIdentifier(name, i);
                     }
                     break;
 
                 case ExprResultColumn exprCol:
-                    result.Add(ResolveExprSelector(exprCol, sourceProjection));
+                    result[pos++] = ResolveExprSelector(exprCol, sourceProjection);
                     break;
             }
         }
 
-        return result.ToArray();
+        return result;
+    }
+
+    private static int CountTableStarColumns(string table, Projection sourceProjection)
+    {
+        int count = 0;
+        for (int i = 0; i < sourceProjection.ColumnCount; i++)
+        {
+            var name = sourceProjection.GetName(i);
+            int dot = name.IndexOf('.');
+            if (dot >= 0 && name.AsSpan(0, dot).Equals(table, StringComparison.OrdinalIgnoreCase))
+                count++;
+        }
+        return count;
     }
 
     private static Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)

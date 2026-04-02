@@ -145,15 +145,42 @@ public static class ExprEvaluator
             };
         }
 
+        // Arithmetic — inlined to avoid delegate dispatch overhead
+        if (binary.Op is BinaryOp.Add or BinaryOp.Subtract or BinaryOp.Multiply
+            or BinaryOp.Divide or BinaryOp.Modulo)
+        {
+            bool bothInt = l.Type.IsInteger() && r.Type.IsInteger();
+            if (bothInt)
+            {
+                long li = l.AsInteger(), ri = r.AsInteger();
+                return binary.Op switch
+                {
+                    BinaryOp.Add => DbValue.Integer(li + ri),
+                    BinaryOp.Subtract => DbValue.Integer(li - ri),
+                    BinaryOp.Multiply => DbValue.Integer(li * ri),
+                    BinaryOp.Divide => ri != 0 ? DbValue.Integer(li / ri) : throw new DivideByZeroException(),
+                    BinaryOp.Modulo => ri != 0 ? DbValue.Integer(li % ri) : throw new DivideByZeroException(),
+                    _ => default, // unreachable
+                };
+            }
+            else
+            {
+                double ld = l.Type.IsInteger() ? l.AsInteger() : l.AsReal();
+                double rd = r.Type.IsInteger() ? r.AsInteger() : r.AsReal();
+                return binary.Op switch
+                {
+                    BinaryOp.Add => DbValue.Real(ld + rd),
+                    BinaryOp.Subtract => DbValue.Real(ld - rd),
+                    BinaryOp.Multiply => DbValue.Real(ld * rd),
+                    BinaryOp.Divide => DbValue.Real(ld / rd),
+                    BinaryOp.Modulo => DbValue.Real(ld % rd),
+                    _ => default, // unreachable
+                };
+            }
+        }
+
         return binary.Op switch
         {
-            // Arithmetic
-            BinaryOp.Add => ArithmeticOp(l, r, static (a, b) => a + b, static (a, b) => a + b),
-            BinaryOp.Subtract => ArithmeticOp(l, r, static (a, b) => a - b, static (a, b) => a - b),
-            BinaryOp.Multiply => ArithmeticOp(l, r, static (a, b) => a * b, static (a, b) => a * b),
-            BinaryOp.Divide => ArithmeticOp(l, r, static (a, b) => b != 0 ? a / b : throw new DivideByZeroException(), static (a, b) => a / b),
-            BinaryOp.Modulo => ArithmeticOp(l, r, static (a, b) => b != 0 ? a % b : throw new DivideByZeroException(), static (a, b) => a % b),
-
             // Comparison
             BinaryOp.Equal => DbValue.Integer(DbValueComparer.Compare(l, r) == 0 ? 1 : 0),
             BinaryOp.NotEqual => DbValue.Integer(DbValueComparer.Compare(l, r) != 0 ? 1 : 0),
@@ -167,16 +194,6 @@ public static class ExprEvaluator
 
             _ => throw new NotSupportedException($"Binary operator '{binary.Op}' is not supported.")
         };
-    }
-
-    private static DbValue ArithmeticOp(DbValue l, DbValue r, Func<long, long, long> intOp, Func<double, double, double> realOp)
-    {
-        if (l.Type.IsInteger() && r.Type.IsInteger())
-            return DbValue.Integer(intOp(l.AsInteger(), r.AsInteger()));
-        // Promote to real
-        double ld = l.Type.IsInteger() ? l.AsInteger() : l.AsReal();
-        double rd = r.Type.IsInteger() ? r.AsInteger() : r.AsReal();
-        return DbValue.Real(realOp(ld, rd));
     }
 
     private static DbValue ConcatValues(DbValue l, DbValue r)

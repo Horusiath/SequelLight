@@ -21,16 +21,36 @@ public sealed class Filter : IDbEnumerator
         _predicate = predicate;
     }
 
-    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
+    public ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        while (await _source.NextAsync(ct).ConfigureAwait(false))
+        // Sync fast path — avoids async state machine when source completes synchronously
+        while (true)
         {
+            var task = _source.NextAsync(ct);
+            if (!task.IsCompletedSuccessfully)
+                return NextAsyncSlow(task, ct);
+            if (!task.Result)
+                return new ValueTask<bool>(false);
+
+            var result = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
+            if (DbValueComparer.IsTrue(result))
+                return new ValueTask<bool>(true);
+        }
+    }
+
+    private async ValueTask<bool> NextAsyncSlow(ValueTask<bool> pending, CancellationToken ct)
+    {
+        do
+        {
+            if (!await pending.ConfigureAwait(false))
+                return false;
+
             var result = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
             if (DbValueComparer.IsTrue(result))
                 return true;
-        }
 
-        return false;
+            pending = _source.NextAsync(ct);
+        } while (true);
     }
 
     public ValueTask DisposeAsync() => _source.DisposeAsync();
