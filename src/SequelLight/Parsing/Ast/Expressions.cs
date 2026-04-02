@@ -80,10 +80,10 @@ public sealed record BetweenExpr(SqlExpr Operand, bool Negated, SqlExpr Low, Sql
 
 // IN expression targets
 public abstract record InTarget;
-public sealed record InExprList(IReadOnlyList<SqlExpr> Expressions) : InTarget;
+public sealed record InExprList(SqlExpr[] Expressions) : InTarget;
 public sealed record InSelect(SelectStmt Query) : InTarget;
 public sealed record InTable(string? Schema, string Table) : InTarget;
-public sealed record InTableFunction(string? Schema, string FunctionName, IReadOnlyList<SqlExpr> Arguments) : InTarget;
+public sealed record InTableFunction(string? Schema, string FunctionName, SqlExpr[] Arguments) : InTarget;
 
 public sealed record InExpr(SqlExpr Operand, bool Negated, InTarget Target) : SqlExpr;
 
@@ -101,14 +101,14 @@ public sealed record CastExpr(SqlExpr Operand, TypeName Type) : SqlExpr;
 
 public sealed record WhenClause(SqlExpr Condition, SqlExpr Result);
 
-public sealed record CaseExpr(SqlExpr? Operand, IReadOnlyList<WhenClause> WhenClauses, SqlExpr? ElseExpr) : SqlExpr;
+public sealed record CaseExpr(SqlExpr? Operand, WhenClause[] WhenClauses, SqlExpr? ElseExpr) : SqlExpr;
 
 public sealed record FunctionCallExpr(
     string Name,
-    IReadOnlyList<SqlExpr> Arguments,
+    SqlExpr[] Arguments,
     bool Distinct,
     bool IsStar,
-    IReadOnlyList<OrderingTerm>? OrderBy,
+    OrderingTerm[]? OrderBy,
     SqlExpr? PercentileOrderBy,
     SqlExpr? FilterWhere,
     OverClause? Over) : SqlExpr;
@@ -117,7 +117,7 @@ public enum SubqueryKind { Scalar, Exists, NotExists }
 
 public sealed record SubqueryExpr(SelectStmt Query, SubqueryKind Kind) : SqlExpr;
 
-public sealed record ExprListExpr(IReadOnlyList<SqlExpr> Expressions) : SqlExpr;
+public sealed record ExprListExpr(SqlExpr[] Expressions) : SqlExpr;
 
 public enum RaiseKind { Ignore, Rollback, Abort, Fail }
 

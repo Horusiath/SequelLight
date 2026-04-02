@@ -2,7 +2,7 @@ namespace SequelLight.Parsing.Ast;
 
 // ---- Type name ----
 
-public sealed record TypeName(string Name, IReadOnlyList<string>? Arguments);
+public sealed record TypeName(string Name, string[]? Arguments);
 
 // ---- Conflict / sort / nulls ----
 
@@ -18,7 +18,7 @@ public sealed record IndexedColumn(SqlExpr Expression, string? Collation, SortOr
 
 // ---- Column definitions ----
 
-public sealed record ColumnDef(string Name, TypeName? Type, IReadOnlyList<ColumnConstraint> Constraints);
+public sealed record ColumnDef(string Name, TypeName? Type, ColumnConstraint[] Constraints);
 
 public abstract record ColumnConstraint;
 
@@ -45,15 +45,15 @@ public sealed record GeneratedColumnConstraint(string? Name, SqlExpr Expression,
 
 public abstract record TableConstraint;
 
-public sealed record PrimaryKeyTableConstraint(string? Name, IReadOnlyList<IndexedColumn> Columns, ConflictAction? OnConflict)
+public sealed record PrimaryKeyTableConstraint(string? Name, IndexedColumn[] Columns, ConflictAction? OnConflict)
     : TableConstraint;
 
-public sealed record UniqueTableConstraint(string? Name, IReadOnlyList<IndexedColumn> Columns, ConflictAction? OnConflict)
+public sealed record UniqueTableConstraint(string? Name, IndexedColumn[] Columns, ConflictAction? OnConflict)
     : TableConstraint;
 
 public sealed record CheckTableConstraint(string? Name, SqlExpr Expression) : TableConstraint;
 
-public sealed record ForeignKeyTableConstraint(string? Name, IReadOnlyList<string> Columns, ForeignKeyClause ForeignKey)
+public sealed record ForeignKeyTableConstraint(string? Name, string[] Columns, ForeignKeyClause ForeignKey)
     : TableConstraint;
 
 // ---- Foreign key ----
@@ -62,7 +62,7 @@ public enum ForeignKeyAction { SetNull, SetDefault, Cascade, Restrict, NoAction 
 
 public sealed record ForeignKeyClause(
     string Table,
-    IReadOnlyList<string>? Columns,
+    string[]? Columns,
     ForeignKeyAction? OnDelete,
     ForeignKeyAction? OnUpdate,
     string? Match,
@@ -71,17 +71,17 @@ public sealed record ForeignKeyClause(
 
 // ---- WITH clause / CTE ----
 
-public sealed record WithClause(bool Recursive, IReadOnlyList<CommonTableExpression> Tables);
+public sealed record WithClause(bool Recursive, CommonTableExpression[] Tables);
 
 public sealed record CommonTableExpression(
     string Name,
-    IReadOnlyList<string>? ColumnNames,
+    string[]? ColumnNames,
     bool? Materialized,
     SelectStmt Query);
 
 // ---- JOIN clause ----
 
-public sealed record JoinClause(TableOrSubquery Left, IReadOnlyList<JoinItem> Joins);
+public sealed record JoinClause(TableOrSubquery Left, JoinItem[] Joins);
 
 public sealed record JoinItem(JoinOperator Operator, TableOrSubquery Right, JoinConstraint? Constraint);
 
@@ -91,7 +91,7 @@ public enum JoinKind { Comma, Inner, Left, LeftOuter, Right, RightOuter, Full, F
 
 public abstract record JoinConstraint;
 public sealed record OnJoinConstraint(SqlExpr Condition) : JoinConstraint;
-public sealed record UsingJoinConstraint(IReadOnlyList<string> Columns) : JoinConstraint;
+public sealed record UsingJoinConstraint(string[] Columns) : JoinConstraint;
 
 // ---- Table or subquery ----
 
@@ -99,7 +99,7 @@ public abstract record TableOrSubquery;
 
 public sealed record TableRef(string? Schema, string Table, string? Alias, IndexHint? IndexHint) : TableOrSubquery;
 
-public sealed record TableFunctionRef(string? Schema, string FunctionName, IReadOnlyList<SqlExpr> Arguments, string? Alias)
+public sealed record TableFunctionRef(string? Schema, string FunctionName, SqlExpr[] Arguments, string? Alias)
     : TableOrSubquery;
 
 public sealed record SubqueryRef(SelectStmt Query, string? Alias) : TableOrSubquery;
@@ -127,14 +127,14 @@ public abstract record SelectBody;
 
 public sealed record SelectCore(
     bool Distinct,
-    IReadOnlyList<ResultColumn> Columns,
+    ResultColumn[] Columns,
     JoinClause? From,
     SqlExpr? Where,
-    IReadOnlyList<SqlExpr>? GroupBy,
+    SqlExpr[]? GroupBy,
     SqlExpr? Having,
-    IReadOnlyList<NamedWindowDef>? Windows) : SelectBody;
+    NamedWindowDef[]? Windows) : SelectBody;
 
-public sealed record ValuesBody(IReadOnlyList<IReadOnlyList<SqlExpr>> Rows) : SelectBody;
+public sealed record ValuesBody(SqlExpr[][] Rows) : SelectBody;
 
 public sealed record CompoundSelectClause(CompoundOp Op, SelectBody Body);
 
@@ -144,8 +144,8 @@ public sealed record NamedWindowDef(string Name, WindowDef Definition);
 
 public sealed record WindowDef(
     string? BaseWindowName,
-    IReadOnlyList<SqlExpr>? PartitionBy,
-    IReadOnlyList<OrderingTerm>? OrderBy,
+    SqlExpr[]? PartitionBy,
+    OrderingTerm[]? OrderBy,
     FrameSpec? Frame);
 
 public abstract record OverClause;
@@ -174,15 +174,15 @@ public sealed record QualifiedTableName(string? Schema, string Table, string? Al
 // ---- Upsert clause ----
 
 public sealed record UpsertClause(
-    IReadOnlyList<IndexedColumn>? ConflictColumns,
+    IndexedColumn[]? ConflictColumns,
     SqlExpr? ConflictWhere,
     UpsertAction Action);
 
 public abstract record UpsertAction;
 public sealed record DoNothingAction : UpsertAction { public static readonly DoNothingAction Instance = new(); }
-public sealed record DoUpdateAction(IReadOnlyList<UpdateSetter> Setters, SqlExpr? Where) : UpsertAction;
+public sealed record DoUpdateAction(UpdateSetter[] Setters, SqlExpr? Where) : UpsertAction;
 
-public sealed record UpdateSetter(IReadOnlyList<string> Columns, SqlExpr Value);
+public sealed record UpdateSetter(string[] Columns, SqlExpr Value);
 
 // ---- Returning clause ----
 
@@ -213,7 +213,7 @@ public enum TriggerTiming { Before, After, InsteadOf }
 public abstract record TriggerEvent;
 public sealed record DeleteTriggerEvent : TriggerEvent { public static readonly DeleteTriggerEvent Instance = new(); }
 public sealed record InsertTriggerEvent : TriggerEvent { public static readonly InsertTriggerEvent Instance = new(); }
-public sealed record UpdateTriggerEvent(IReadOnlyList<string>? Columns) : TriggerEvent;
+public sealed record UpdateTriggerEvent(string[]? Columns) : TriggerEvent;
 
 // ---- Insert ----
 

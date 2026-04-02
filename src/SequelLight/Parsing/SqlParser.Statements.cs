@@ -58,7 +58,7 @@ public sealed partial class SqlParser
             compounds.Add(new CompoundSelectClause(op, body));
         }
 
-        IReadOnlyList<OrderingTerm>? orderBy = null;
+        OrderingTerm[]? orderBy = null;
         if (Check(TokenKind.Order))
             orderBy = ParseOrderByClause();
 
@@ -105,7 +105,7 @@ public sealed partial class SqlParser
         if (Match(TokenKind.Where))
             where = ParseExpr();
 
-        IReadOnlyList<SqlExpr>? groupBy = null;
+        SqlExpr[]? groupBy = null;
         SqlExpr? having = null;
         if (Match(TokenKind.Group))
         {
@@ -119,7 +119,7 @@ public sealed partial class SqlParser
                 having = ParseExpr();
         }
 
-        IReadOnlyList<NamedWindowDef>? windows = null;
+        NamedWindowDef[]? windows = null;
         if (Match(TokenKind.Window))
         {
             var defs = new ValueListBuilder<NamedWindowDef>();
@@ -139,7 +139,7 @@ public sealed partial class SqlParser
     private ValuesBody ParseValuesBody()
     {
         Expect(TokenKind.Values);
-        var rows = new ValueListBuilder<IReadOnlyList<SqlExpr>>();
+        var rows = new ValueListBuilder<SqlExpr[]>();
         do
         {
             Expect(TokenKind.OpenParen);
@@ -397,7 +397,7 @@ public sealed partial class SqlParser
     private CommonTableExpression ParseCte()
     {
         var name = ParseName();
-        IReadOnlyList<string>? cols = null;
+        string[]? cols = null;
         if (Match(TokenKind.OpenParen))
         {
             var list = new ValueListBuilder<string>();
@@ -467,7 +467,7 @@ public sealed partial class SqlParser
         if (Match(TokenKind.As))
             alias = ParseName();
 
-        IReadOnlyList<string>? columns = null;
+        string[]? columns = null;
         if (Check(TokenKind.OpenParen) && !Check(TokenKind.Select) && !Check(TokenKind.With))
         {
             Advance(); // (
@@ -487,7 +487,7 @@ public sealed partial class SqlParser
         }
 
         InsertSource source;
-        IReadOnlyList<UpsertClause>? upserts = null;
+        UpsertClause[]? upserts = null;
 
         if (Match(TokenKind.Default))
         {
@@ -519,7 +519,7 @@ public sealed partial class SqlParser
         Expect(TokenKind.On);
         Expect(TokenKind.Conflict);
 
-        IReadOnlyList<IndexedColumn>? conflictCols = null;
+        IndexedColumn[]? conflictCols = null;
         SqlExpr? conflictWhere = null;
 
         if (Match(TokenKind.OpenParen))
@@ -577,7 +577,7 @@ public sealed partial class SqlParser
         return new UpdateSetter(columns.ToArray(), value);
     }
 
-    private IReadOnlyList<ReturningColumn> ParseReturningClause()
+    private ReturningColumn[] ParseReturningClause()
     {
         Expect(TokenKind.Returning);
         var cols = new ValueListBuilder<ReturningColumn>();
@@ -646,7 +646,7 @@ public sealed partial class SqlParser
 
         var returning = Check(TokenKind.Returning) ? ParseReturningClause() : null;
 
-        IReadOnlyList<OrderingTerm>? orderBy = null;
+        OrderingTerm[]? orderBy = null;
         if (Check(TokenKind.Order))
             orderBy = ParseOrderByClause();
 
@@ -678,7 +678,7 @@ public sealed partial class SqlParser
 
         var returning = Check(TokenKind.Returning) ? ParseReturningClause() : null;
 
-        IReadOnlyList<OrderingTerm>? orderBy = null;
+        OrderingTerm[]? orderBy = null;
         if (Check(TokenKind.Order))
             orderBy = ParseOrderByClause();
 
@@ -1020,7 +1020,7 @@ public sealed partial class SqlParser
         Expect(TokenKind.References);
         var table = ParseName();
 
-        IReadOnlyList<string>? columns = null;
+        string[]? columns = null;
         if (Match(TokenKind.OpenParen))
         {
             var cols = new ValueListBuilder<string>();
@@ -1132,7 +1132,7 @@ public sealed partial class SqlParser
             name = ParseName();
         }
 
-        IReadOnlyList<string>? columns = null;
+        string[]? columns = null;
         if (Match(TokenKind.OpenParen))
         {
             var cols = new ValueListBuilder<string>();
@@ -1183,7 +1183,7 @@ public sealed partial class SqlParser
         else
         {
             Expect(TokenKind.Update);
-            IReadOnlyList<string>? cols = null;
+            string[]? cols = null;
             if (Match(TokenKind.Of))
             {
                 var list = new ValueListBuilder<string>();
@@ -1238,7 +1238,7 @@ public sealed partial class SqlParser
         Expect(TokenKind.Using);
         var module = ParseName();
 
-        IReadOnlyList<string>? args = null;
+        string[]? args = null;
         if (Match(TokenKind.OpenParen))
         {
             var list = new ValueListBuilder<string>();

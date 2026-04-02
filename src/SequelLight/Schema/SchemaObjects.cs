@@ -168,7 +168,7 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
 /// </summary>
 public sealed record PrimaryKeySchema(
     string? ConstraintName,
-    IReadOnlyList<IndexedColumn> Columns,
+    IndexedColumn[] Columns,
     ConflictAction? OnConflict);
 
 /// <summary>
@@ -176,7 +176,7 @@ public sealed record PrimaryKeySchema(
 /// </summary>
 public sealed record UniqueConstraintSchema(
     string? ConstraintName,
-    IReadOnlyList<IndexedColumn> Columns,
+    IndexedColumn[] Columns,
     ConflictAction? OnConflict);
 
 /// <summary>
@@ -191,7 +191,7 @@ public sealed record CheckConstraintSchema(
 /// </summary>
 public sealed record ForeignKeyConstraintSchema(
     string? ConstraintName,
-    IReadOnlyList<string> Columns,
+    string[] Columns,
     ForeignKeyClause ForeignKey);
 
 /// <summary>
@@ -231,12 +231,12 @@ public sealed class TableSchema : IEquatable<TableSchema>
         bool isTemporary,
         bool withoutRowId,
         bool isStrict,
-        IReadOnlyList<ColumnSchema> columns,
+        ColumnSchema[] columns,
         ushort nextColumnSeqNo,
         PrimaryKeySchema? primaryKey,
-        IReadOnlyList<UniqueConstraintSchema> uniqueConstraints,
-        IReadOnlyList<CheckConstraintSchema> checkConstraints,
-        IReadOnlyList<ForeignKeyConstraintSchema> foreignKeys)
+        UniqueConstraintSchema[] uniqueConstraints,
+        CheckConstraintSchema[] checkConstraints,
+        ForeignKeyConstraintSchema[] foreignKeys)
     {
         Oid = oid;
         Name = name;
@@ -256,15 +256,15 @@ public sealed class TableSchema : IEquatable<TableSchema>
     public bool IsTemporary { get; }
     public bool WithoutRowId { get; }
     public bool IsStrict { get; }
-    public IReadOnlyList<ColumnSchema> Columns { get; internal set; }
+    public ColumnSchema[] Columns { get; internal set; }
     public ushort NextColumnSeqNo { get; internal set; }
     public PrimaryKeySchema? PrimaryKey { get; }
-    public IReadOnlyList<UniqueConstraintSchema> UniqueConstraints { get; }
-    public IReadOnlyList<CheckConstraintSchema> CheckConstraints { get; }
-    public IReadOnlyList<ForeignKeyConstraintSchema> ForeignKeys { get; }
+    public UniqueConstraintSchema[] UniqueConstraints { get; }
+    public CheckConstraintSchema[] CheckConstraints { get; }
+    public ForeignKeyConstraintSchema[] ForeignKeys { get; }
 
     // Encoding metadata — lazily initialized, invalidated when Columns reference changes.
-    private IReadOnlyList<ColumnSchema>? _encodingColumns;
+    private ColumnSchema[]? _encodingColumns;
     private int[]? _pkColumnIndices;
     private DbType[]? _pkColumnTypes;
     private int[]? _valueColumnIndices;
@@ -277,7 +277,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
             return;
 
         int pkCount = 0, valCount = 0;
-        for (int i = 0; i < Columns.Count; i++)
+        for (int i = 0; i < Columns.Length; i++)
         {
             if (Columns[i].IsPrimaryKey) pkCount++;
             else valCount++;
@@ -290,7 +290,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
         var valTypes = new DbType[valCount];
         int pk = 0, val = 0;
 
-        for (int i = 0; i < Columns.Count; i++)
+        for (int i = 0; i < Columns.Length; i++)
         {
             if (Columns[i].IsPrimaryKey)
             {
@@ -363,7 +363,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
             if (col.IsAutoincrement) { hasAutoincrement = true; break; }
         }
 
-        for (int i = 0; i < Columns.Count; i++)
+        for (int i = 0; i < Columns.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             var col = Columns[i];
@@ -374,7 +374,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
             if (col.IsPrimaryKey && hasAutoincrement)
             {
                 sb.Append(" PRIMARY KEY");
-                if (PrimaryKey?.Columns.Count == 1)
+                if (PrimaryKey?.Columns.Length == 1)
                 {
                     var pkOrder = PrimaryKey.Columns[0].Order;
                     if (pkOrder == SortOrder.Asc) sb.Append(" ASC");
@@ -482,7 +482,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
                 sb.Append(' ');
             }
             sb.Append("FOREIGN KEY (");
-            for (int i = 0; i < fk.Columns.Count; i++)
+            for (int i = 0; i < fk.Columns.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
                 SqlWriter.AppendQuotedName(sb, fk.Columns[i]);
@@ -508,7 +508,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
 /// </summary>
 public sealed class IndexSchema : IEquatable<IndexSchema>
 {
-    public IndexSchema(Oid oid, string name, Oid tableOid, string tableName, bool isUnique, IReadOnlyList<IndexedColumn> columns, SqlExpr? where)
+    public IndexSchema(Oid oid, string name, Oid tableOid, string tableName, bool isUnique, IndexedColumn[] columns, SqlExpr? where)
     {
         Oid = oid;
         Name = name;
@@ -524,7 +524,7 @@ public sealed class IndexSchema : IEquatable<IndexSchema>
     public Oid TableOid { get; }
     public string TableName { get; internal set; }
     public bool IsUnique { get; }
-    public IReadOnlyList<IndexedColumn> Columns { get; }
+    public IndexedColumn[] Columns { get; }
     public SqlExpr? Where { get; }
 
     public bool Equals(IndexSchema? other) => other is not null && Oid == other.Oid;
@@ -558,7 +558,7 @@ public sealed class IndexSchema : IEquatable<IndexSchema>
 /// </summary>
 public sealed class ViewSchema : IEquatable<ViewSchema>
 {
-    public ViewSchema(Oid oid, string name, bool isTemporary, IReadOnlyList<string>? columns, SelectStmt query)
+    public ViewSchema(Oid oid, string name, bool isTemporary, string[]? columns, SelectStmt query)
     {
         Oid = oid;
         Name = name;
@@ -570,7 +570,7 @@ public sealed class ViewSchema : IEquatable<ViewSchema>
     public Oid Oid { get; }
     public string Name { get; }
     public bool IsTemporary { get; }
-    public IReadOnlyList<string>? Columns { get; }
+    public string[]? Columns { get; }
     public SelectStmt Query { get; }
 
     public bool Equals(ViewSchema? other) => other is not null && Oid == other.Oid;
@@ -584,10 +584,10 @@ public sealed class ViewSchema : IEquatable<ViewSchema>
         if (IsTemporary) sb.Append("TEMP ");
         sb.Append("VIEW ");
         SqlWriter.AppendQuotedName(sb, Name);
-        if (Columns is { Count: > 0 })
+        if (Columns is { Length: > 0 })
         {
             sb.Append(" (");
-            for (int i = 0; i < Columns.Count; i++)
+            for (int i = 0; i < Columns.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
                 SqlWriter.AppendQuotedName(sb, Columns[i]);
@@ -617,7 +617,7 @@ public sealed class TriggerSchema : IEquatable<TriggerSchema>
         TriggerEvent @event,
         bool forEachRow,
         SqlExpr? when,
-        IReadOnlyList<SqlStmt> body)
+        SqlStmt[] body)
     {
         Oid = oid;
         Name = name;
@@ -640,7 +640,7 @@ public sealed class TriggerSchema : IEquatable<TriggerSchema>
     public TriggerEvent Event { get; }
     public bool ForEachRow { get; }
     public SqlExpr? When { get; }
-    public IReadOnlyList<SqlStmt> Body { get; }
+    public SqlStmt[] Body { get; }
 
     public bool Equals(TriggerSchema? other) => other is not null && Oid == other.Oid;
     public override bool Equals(object? obj) => Equals(obj as TriggerSchema);
@@ -673,10 +673,10 @@ public sealed class TriggerSchema : IEquatable<TriggerSchema>
                 break;
             case UpdateTriggerEvent upd:
                 sb.Append(" UPDATE");
-                if (upd.Columns is { Count: > 0 })
+                if (upd.Columns is { Length: > 0 })
                 {
                     sb.Append(" OF ");
-                    for (int i = 0; i < upd.Columns.Count; i++)
+                    for (int i = 0; i < upd.Columns.Length; i++)
                     {
                         if (i > 0) sb.Append(", ");
                         SqlWriter.AppendQuotedName(sb, upd.Columns[i]);

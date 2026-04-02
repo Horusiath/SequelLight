@@ -18,21 +18,21 @@ internal sealed class ValuesEnumerator : IDbEnumerator
     public Projection Projection { get; }
     public DbValue[] Current { get; }
 
-    public ValuesEnumerator(IReadOnlyList<IReadOnlyList<SqlExpr>> rows)
+    public ValuesEnumerator(SqlExpr[][] rows)
     {
         var emptyProjection = new Projection(Array.Empty<string>());
         var emptyRow = Array.Empty<DbValue>();
 
-        _rowCount = rows.Count;
-        _columnCount = _rowCount > 0 ? rows[0].Count : 0;
+        _rowCount = rows.Length;
+        _columnCount = _rowCount > 0 ? rows[0].Length : 0;
 
         _values = new DbValue[_rowCount * _columnCount];
         for (int r = 0; r < _rowCount; r++)
         {
             var row = rows[r];
-            if (row.Count != _columnCount)
+            if (row.Length != _columnCount)
                 throw new InvalidOperationException(
-                    $"All VALUES rows must have the same number of columns. Row {r + 1} has {row.Count} value(s), expected {_columnCount}.");
+                    $"All VALUES rows must have the same number of columns. Row {r + 1} has {row.Length} value(s), expected {_columnCount}.");
 
             int offset = r * _columnCount;
             for (int c = 0; c < _columnCount; c++)

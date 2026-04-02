@@ -21,7 +21,7 @@ public sealed class TableScan : IDbEnumerator
     private readonly int _columnCount;
     private readonly int[] _pkColumnIndices;
     private readonly DbType[] _pkColumnTypes;
-    private readonly IReadOnlyList<ColumnSchema> _valueColumns;
+    private readonly ColumnSchema[] _valueColumns;
     private readonly int[] _valueColumnOutputIndices;
 
     // Reusable decode buffers
@@ -36,7 +36,7 @@ public sealed class TableScan : IDbEnumerator
         _cursor = cursor;
         _table = table;
         _prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
-        _columnCount = table.Columns.Count;
+        _columnCount = table.Columns.Length;
 
         // Build projection from column names
         var names = new QualifiedName[_columnCount];
@@ -56,7 +56,6 @@ public sealed class TableScan : IDbEnumerator
         _pkColumnTypes = new DbType[pkCount];
         _valueColumns = new ColumnSchema[valCount];
         _valueColumnOutputIndices = new int[valCount];
-        var valueColumns = (ColumnSchema[])_valueColumns;
 
         int pk = 0, val = 0;
         for (int i = 0; i < _columnCount; i++)
@@ -69,7 +68,7 @@ public sealed class TableScan : IDbEnumerator
             }
             else
             {
-                valueColumns[val] = table.Columns[i];
+                _valueColumns[val] = table.Columns[i];
                 _valueColumnOutputIndices[val] = i;
                 val++;
             }

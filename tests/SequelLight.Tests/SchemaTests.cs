@@ -29,7 +29,7 @@ public class SchemaTests
         Assert.False(table.IsTemporary);
         Assert.False(table.WithoutRowId);
         Assert.False(table.IsStrict);
-        Assert.Equal(3, table.Columns.Count);
+        Assert.Equal(3, table.Columns.Length);
 
         Assert.Equal("id", table.Columns[0].Name);
         Assert.Equal("INTEGER", table.Columns[0].TypeName);
@@ -199,7 +199,7 @@ public class SchemaTests
 
         var table = schema.GetTable("t")!;
         Assert.NotNull(table.PrimaryKey);
-        Assert.Equal(2, table.PrimaryKey.Columns.Count);
+        Assert.Equal(2, table.PrimaryKey.Columns.Length);
 
         // Columns participating in table-level PK should be marked
         Assert.True(table.Columns[0].IsPrimaryKey);
@@ -213,7 +213,7 @@ public class SchemaTests
 
         var table = schema.GetTable("t")!;
         Assert.Single(table.UniqueConstraints);
-        Assert.Equal(2, table.UniqueConstraints[0].Columns.Count);
+        Assert.Equal(2, table.UniqueConstraints[0].Columns.Length);
     }
 
     [Fact]
@@ -337,7 +337,7 @@ public class SchemaTests
             "CREATE INDEX idx ON t (a, b DESC)");
 
         var index = schema.GetIndex("idx")!;
-        Assert.Equal(2, index.Columns.Count);
+        Assert.Equal(2, index.Columns.Length);
         Assert.Equal(SortOrder.Desc, index.Columns[1].Order);
     }
 
@@ -412,7 +412,7 @@ public class SchemaTests
 
         var view = schema.GetView("v")!;
         Assert.NotNull(view.Columns);
-        Assert.Equal(2, view.Columns.Count);
+        Assert.Equal(2, view.Columns.Length);
         Assert.Equal("a", view.Columns[0]);
         Assert.Equal("b", view.Columns[1]);
     }
@@ -615,7 +615,7 @@ public class SchemaTests
             "ALTER TABLE t ADD COLUMN y TEXT NOT NULL DEFAULT 'hello'");
 
         var table = schema.GetTable("t")!;
-        Assert.Equal(2, table.Columns.Count);
+        Assert.Equal(2, table.Columns.Length);
         var added = table.Columns[1];
         Assert.Equal("y", added.Name);
         Assert.Equal("TEXT", added.TypeName);
@@ -631,7 +631,7 @@ public class SchemaTests
             "ALTER TABLE t DROP COLUMN y");
 
         var table = schema.GetTable("t")!;
-        Assert.Equal(2, table.Columns.Count);
+        Assert.Equal(2, table.Columns.Length);
         Assert.Equal("x", table.Columns[0].Name);
         Assert.Equal("z", table.Columns[1].Name);
     }
@@ -689,7 +689,7 @@ public class SchemaTests
             """);
 
         var table = schema.GetTable("orders")!;
-        Assert.Equal(4, table.Columns.Count);
+        Assert.Equal(4, table.Columns.Length);
 
         // id
         Assert.True(table.Columns[0].IsPrimaryKey);
@@ -710,7 +710,7 @@ public class SchemaTests
 
         // table-level constraints
         Assert.Single(table.UniqueConstraints);
-        Assert.Equal(2, table.UniqueConstraints[0].Columns.Count);
+        Assert.Equal(2, table.UniqueConstraints[0].Columns.Length);
         Assert.Single(table.CheckConstraints);
     }
 
@@ -999,7 +999,7 @@ public class SchemaTests
         schema.Apply(SqlParser.Parse("ALTER TABLE t ADD COLUMN y TEXT"));
 
         var cols = schema.GetTable("t")!.Columns;
-        Assert.Equal(3, cols.Count);
+        Assert.Equal(3, cols.Length);
         Assert.Equal(1, cols[0].SeqNo); // a — original
         Assert.Equal(4, cols[1].SeqNo); // x — skips 2,3
         Assert.Equal(5, cols[2].SeqNo); // y
@@ -1089,9 +1089,9 @@ public class SchemaTests
         Assert.Equal(expected.IsTemporary, actual.IsTemporary);
         Assert.Equal(expected.WithoutRowId, actual.WithoutRowId);
         Assert.Equal(expected.IsStrict, actual.IsStrict);
-        Assert.Equal(expected.Columns.Count, actual.Columns.Count);
+        Assert.Equal(expected.Columns.Length, actual.Columns.Length);
 
-        for (int i = 0; i < expected.Columns.Count; i++)
+        for (int i = 0; i < expected.Columns.Length; i++)
         {
             var ec = expected.Columns[i];
             var ac = actual.Columns[i];
@@ -1112,20 +1112,20 @@ public class SchemaTests
                 Assert.Equal(ec.ForeignKey.Table, ac.ForeignKey!.Table);
                 Assert.Equal(ec.ForeignKey.OnDelete, ac.ForeignKey.OnDelete);
                 Assert.Equal(ec.ForeignKey.OnUpdate, ac.ForeignKey.OnUpdate);
-                Assert.Equal(ec.ForeignKey.Columns?.Count, ac.ForeignKey.Columns?.Count);
+                Assert.Equal(ec.ForeignKey.Columns?.Length, ac.ForeignKey.Columns?.Length);
             }
         }
 
         Assert.Equal(expected.PrimaryKey != null, actual.PrimaryKey != null);
         if (expected.PrimaryKey != null)
         {
-            Assert.Equal(expected.PrimaryKey.Columns.Count, actual.PrimaryKey!.Columns.Count);
+            Assert.Equal(expected.PrimaryKey.Columns.Length, actual.PrimaryKey!.Columns.Length);
             Assert.Equal(expected.PrimaryKey.OnConflict, actual.PrimaryKey.OnConflict);
         }
 
-        Assert.Equal(expected.UniqueConstraints.Count, actual.UniqueConstraints.Count);
-        Assert.Equal(expected.CheckConstraints.Count, actual.CheckConstraints.Count);
-        Assert.Equal(expected.ForeignKeys.Count, actual.ForeignKeys.Count);
+        Assert.Equal(expected.UniqueConstraints.Length, actual.UniqueConstraints.Length);
+        Assert.Equal(expected.CheckConstraints.Length, actual.CheckConstraints.Length);
+        Assert.Equal(expected.ForeignKeys.Length, actual.ForeignKeys.Length);
     }
 
     // ---- Table roundtrip tests ----
@@ -1275,7 +1275,7 @@ public class SchemaTests
 
         var actual = rt.GetTable("t")!;
         Assert.NotNull(actual.PrimaryKey);
-        Assert.Equal(2, actual.PrimaryKey.Columns.Count);
+        Assert.Equal(2, actual.PrimaryKey.Columns.Length);
         Assert.True(actual.Columns[0].IsPrimaryKey);
         Assert.True(actual.Columns[1].IsPrimaryKey);
         AssertTableRoundtrip(orig.GetTable("t")!, actual);
@@ -1288,7 +1288,7 @@ public class SchemaTests
 
         var actual = rt.GetTable("t")!;
         Assert.Single(actual.UniqueConstraints);
-        Assert.Equal(2, actual.UniqueConstraints[0].Columns.Count);
+        Assert.Equal(2, actual.UniqueConstraints[0].Columns.Length);
         AssertTableRoundtrip(orig.GetTable("t")!, actual);
     }
 
@@ -1386,7 +1386,7 @@ public class SchemaTests
         var actual = rt.GetIndex("idx")!;
         Assert.Equal(expected.Name, actual.Name);
         Assert.Equal(expected.IsUnique, actual.IsUnique);
-        Assert.Equal(expected.Columns.Count, actual.Columns.Count);
+        Assert.Equal(expected.Columns.Length, actual.Columns.Length);
         Assert.Null(actual.Where);
     }
 
@@ -1408,7 +1408,7 @@ public class SchemaTests
             "CREATE INDEX idx ON t (a, b DESC)");
 
         var actual = rt.GetIndex("idx")!;
-        Assert.Equal(2, actual.Columns.Count);
+        Assert.Equal(2, actual.Columns.Length);
         Assert.Equal(SortOrder.Desc, actual.Columns[1].Order);
     }
 
@@ -1450,7 +1450,7 @@ public class SchemaTests
 
         var actual = rt.GetView("v")!;
         Assert.NotNull(actual.Columns);
-        Assert.Equal(2, actual.Columns.Count);
+        Assert.Equal(2, actual.Columns.Length);
         Assert.Equal("a", actual.Columns[0]);
         Assert.Equal("b", actual.Columns[1]);
     }
@@ -1507,7 +1507,7 @@ public class SchemaTests
         var actual = rt.GetTrigger("trg")!;
         var updEvent = Assert.IsType<UpdateTriggerEvent>(actual.Event);
         Assert.NotNull(updEvent.Columns);
-        Assert.Equal(2, updEvent.Columns.Count);
+        Assert.Equal(2, updEvent.Columns.Length);
     }
 
     [Fact]

@@ -21,9 +21,9 @@ internal static class SqlWriter
         sb.Append('"');
     }
 
-    private static void AppendQuotedNameList(StringBuilder sb, IReadOnlyList<string> names)
+    private static void AppendQuotedNameList(StringBuilder sb, string[] names)
     {
-        for (int i = 0; i < names.Count; i++)
+        for (int i = 0; i < names.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             AppendQuotedName(sb, names[i]);
@@ -274,9 +274,9 @@ internal static class SqlWriter
         }
     }
 
-    private static void AppendExprList(StringBuilder sb, IReadOnlyList<SqlExpr> exprs)
+    private static void AppendExprList(StringBuilder sb, SqlExpr[] exprs)
     {
-        for (int i = 0; i < exprs.Count; i++)
+        for (int i = 0; i < exprs.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             AppendExpr(sb, exprs[i]);
@@ -323,7 +323,7 @@ internal static class SqlWriter
         {
             if (func.Distinct) sb.Append("DISTINCT ");
             AppendExprList(sb, func.Arguments);
-            if (func.OrderBy is { Count: > 0 })
+            if (func.OrderBy is { Length: > 0 })
             {
                 sb.Append(" ORDER BY ");
                 AppendOrderingTermList(sb, func.OrderBy);
@@ -383,10 +383,10 @@ internal static class SqlWriter
     public static void AppendTypeName(StringBuilder sb, TypeName type)
     {
         sb.Append(type.Name);
-        if (type.Arguments is { Count: > 0 })
+        if (type.Arguments is { Length: > 0 })
         {
             sb.Append('(');
-            for (int i = 0; i < type.Arguments.Count; i++)
+            for (int i = 0; i < type.Arguments.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
                 sb.Append(type.Arguments[i]);
@@ -405,9 +405,9 @@ internal static class SqlWriter
         else if (col.Order == SortOrder.Desc) sb.Append(" DESC");
     }
 
-    public static void AppendIndexedColumnList(StringBuilder sb, IReadOnlyList<IndexedColumn> cols)
+    public static void AppendIndexedColumnList(StringBuilder sb, IndexedColumn[] cols)
     {
-        for (int i = 0; i < cols.Count; i++)
+        for (int i = 0; i < cols.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             AppendIndexedColumn(sb, cols[i]);
@@ -426,9 +426,9 @@ internal static class SqlWriter
         else if (term.Nulls == NullsOrder.Last) sb.Append(" NULLS LAST");
     }
 
-    private static void AppendOrderingTermList(StringBuilder sb, IReadOnlyList<OrderingTerm> terms)
+    private static void AppendOrderingTermList(StringBuilder sb, OrderingTerm[] terms)
     {
-        for (int i = 0; i < terms.Count; i++)
+        for (int i = 0; i < terms.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             AppendOrderingTerm(sb, terms[i]);
@@ -441,7 +441,7 @@ internal static class SqlWriter
     {
         sb.Append("REFERENCES ");
         AppendQuotedName(sb, fk.Table);
-        if (fk.Columns is { Count: > 0 })
+        if (fk.Columns is { Length: > 0 })
         {
             sb.Append('(');
             AppendQuotedNameList(sb, fk.Columns);
@@ -507,14 +507,14 @@ internal static class SqlWriter
             AppendQuotedName(sb, def.BaseWindowName);
             needsSpace = true;
         }
-        if (def.PartitionBy is { Count: > 0 })
+        if (def.PartitionBy is { Length: > 0 })
         {
             if (needsSpace) sb.Append(' ');
             sb.Append("PARTITION BY ");
             AppendExprList(sb, def.PartitionBy);
             needsSpace = true;
         }
-        if (def.OrderBy is { Count: > 0 })
+        if (def.OrderBy is { Length: > 0 })
         {
             if (needsSpace) sb.Append(' ');
             sb.Append("ORDER BY ");
@@ -630,7 +630,7 @@ internal static class SqlWriter
             });
             AppendSelectBody(sb, compound.Body);
         }
-        if (stmt.OrderBy is { Count: > 0 })
+        if (stmt.OrderBy is { Length: > 0 })
         {
             sb.Append(" ORDER BY ");
             AppendOrderingTermList(sb, stmt.OrderBy);
@@ -656,7 +656,7 @@ internal static class SqlWriter
                 break;
             case ValuesBody values:
                 sb.Append("VALUES ");
-                for (int i = 0; i < values.Rows.Count; i++)
+                for (int i = 0; i < values.Rows.Length; i++)
                 {
                     if (i > 0) sb.Append(", ");
                     sb.Append('(');
@@ -671,7 +671,7 @@ internal static class SqlWriter
     {
         sb.Append("SELECT ");
         if (core.Distinct) sb.Append("DISTINCT ");
-        for (int i = 0; i < core.Columns.Count; i++)
+        for (int i = 0; i < core.Columns.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             AppendResultColumn(sb, core.Columns[i]);
@@ -686,7 +686,7 @@ internal static class SqlWriter
             sb.Append(" WHERE ");
             AppendExpr(sb, core.Where);
         }
-        if (core.GroupBy is { Count: > 0 })
+        if (core.GroupBy is { Length: > 0 })
         {
             sb.Append(" GROUP BY ");
             AppendExprList(sb, core.GroupBy);
@@ -696,10 +696,10 @@ internal static class SqlWriter
                 AppendExpr(sb, core.Having);
             }
         }
-        if (core.Windows is { Count: > 0 })
+        if (core.Windows is { Length: > 0 })
         {
             sb.Append(" WINDOW ");
-            for (int i = 0; i < core.Windows.Count; i++)
+            for (int i = 0; i < core.Windows.Length; i++)
             {
                 if (i > 0) sb.Append(", ");
                 AppendQuotedName(sb, core.Windows[i].Name);
@@ -816,12 +816,12 @@ internal static class SqlWriter
     {
         sb.Append("WITH ");
         if (with.Recursive) sb.Append("RECURSIVE ");
-        for (int i = 0; i < with.Tables.Count; i++)
+        for (int i = 0; i < with.Tables.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             var cte = with.Tables[i];
             AppendQuotedName(sb, cte.Name);
-            if (cte.ColumnNames is { Count: > 0 })
+            if (cte.ColumnNames is { Length: > 0 })
             {
                 sb.Append('(');
                 AppendQuotedNameList(sb, cte.ColumnNames);
@@ -859,7 +859,7 @@ internal static class SqlWriter
         if (stmt.Schema != null) { AppendQuotedName(sb, stmt.Schema); sb.Append('.'); }
         AppendQuotedName(sb, stmt.Table);
         if (stmt.Alias != null) { sb.Append(" AS "); AppendQuotedName(sb, stmt.Alias); }
-        if (stmt.Columns is { Count: > 0 })
+        if (stmt.Columns is { Length: > 0 })
         {
             sb.Append(" (");
             AppendQuotedNameList(sb, stmt.Columns);
@@ -882,7 +882,7 @@ internal static class SqlWriter
             foreach (var upsert in stmt.Upserts)
             {
                 sb.Append(" ON CONFLICT");
-                if (upsert.ConflictColumns is { Count: > 0 })
+                if (upsert.ConflictColumns is { Length: > 0 })
                 {
                     sb.Append(" (");
                     AppendIndexedColumnList(sb, upsert.ConflictColumns);
@@ -944,7 +944,7 @@ internal static class SqlWriter
         }
         if (stmt.Returning != null)
             AppendReturningClause(sb, stmt.Returning);
-        if (stmt.OrderBy is { Count: > 0 })
+        if (stmt.OrderBy is { Length: > 0 })
         {
             sb.Append(" ORDER BY ");
             AppendOrderingTermList(sb, stmt.OrderBy);
@@ -976,7 +976,7 @@ internal static class SqlWriter
         }
         if (stmt.Returning != null)
             AppendReturningClause(sb, stmt.Returning);
-        if (stmt.OrderBy is { Count: > 0 })
+        if (stmt.OrderBy is { Length: > 0 })
         {
             sb.Append(" ORDER BY ");
             AppendOrderingTermList(sb, stmt.OrderBy);
@@ -1021,13 +1021,13 @@ internal static class SqlWriter
         }
     }
 
-    private static void AppendUpdateSetterList(StringBuilder sb, IReadOnlyList<UpdateSetter> setters)
+    private static void AppendUpdateSetterList(StringBuilder sb, UpdateSetter[] setters)
     {
-        for (int i = 0; i < setters.Count; i++)
+        for (int i = 0; i < setters.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             var setter = setters[i];
-            if (setter.Columns.Count == 1)
+            if (setter.Columns.Length == 1)
                 AppendQuotedName(sb, setter.Columns[0]);
             else
             {
@@ -1040,10 +1040,10 @@ internal static class SqlWriter
         }
     }
 
-    private static void AppendReturningClause(StringBuilder sb, IReadOnlyList<ReturningColumn> cols)
+    private static void AppendReturningClause(StringBuilder sb, ReturningColumn[] cols)
     {
         sb.Append(" RETURNING ");
-        for (int i = 0; i < cols.Count; i++)
+        for (int i = 0; i < cols.Length; i++)
         {
             if (i > 0) sb.Append(", ");
             switch (cols[i])

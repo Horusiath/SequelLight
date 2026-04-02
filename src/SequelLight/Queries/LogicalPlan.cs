@@ -22,10 +22,10 @@ public sealed class ScanPlan : LogicalPlan
 
 public sealed class ProjectPlan : LogicalPlan
 {
-    public IReadOnlyList<ResultColumn> Columns { get; }
+    public ResultColumn[] Columns { get; }
     public LogicalPlan Source { get; }
 
-    public ProjectPlan(IReadOnlyList<ResultColumn> columns, LogicalPlan source)
+    public ProjectPlan(ResultColumn[] columns, LogicalPlan source)
     {
         Columns = columns;
         Source = source;

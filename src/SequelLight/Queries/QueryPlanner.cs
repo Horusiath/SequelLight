@@ -19,7 +19,7 @@ public sealed class QueryPlanner
 
     public IDbEnumerator Plan(SelectStmt stmt, ReadOnlyTransaction tx)
     {
-        if (stmt.Compounds.Count > 0)
+        if (stmt.Compounds.Length > 0)
             throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
 
         return stmt.First switch
@@ -30,13 +30,13 @@ public sealed class QueryPlanner
         };
     }
 
-    private IDbEnumerator PlanSelectCore(SelectCore core, IReadOnlyList<OrderingTerm>? orderBy, ReadOnlyTransaction tx)
+    private IDbEnumerator PlanSelectCore(SelectCore core, OrderingTerm[]? orderBy, ReadOnlyTransaction tx)
     {
         var logical = BuildLogicalPlan(core);
         logical = HeuristicOptimizer.Optimize(logical);
 
         // No ORDER BY — use the existing fast path
-        if (orderBy is not { Count: > 0 })
+        if (orderBy is not { Length: > 0 })
             return BuildPhysical(logical, tx);
 
         // Peel off the top-level ProjectPlan (always present from BuildLogicalPlan)
@@ -50,7 +50,7 @@ public sealed class QueryPlanner
         int nOBSat = ComputeNOBSat(orderBy, providedOrder, source.Projection);
 
         // Insert sort if not fully satisfied
-        if (nOBSat < orderBy.Count)
+        if (nOBSat < orderBy.Length)
             source = BuildSortEnumerator(source, orderBy);
 
         // Apply the final projection
@@ -298,7 +298,7 @@ public sealed class QueryPlanner
         return true;
     }
 
-    private static Selector[] ResolveSelectors(IReadOnlyList<ResultColumn> columns, Projection sourceProjection)
+    private static Selector[] ResolveSelectors(ResultColumn[] columns, Projection sourceProjection)
     {
         // Pre-count output columns to allocate exact array
         int count = 0;
@@ -397,11 +397,11 @@ public sealed class QueryPlanner
 
     private static SortKey[] ExtractPkSortKeys(TableSchema table, Projection projection)
     {
-        if (table.PrimaryKey is not { Columns.Count: > 0 } pk)
+        if (table.PrimaryKey is not { Columns.Length: > 0 } pk)
             return Array.Empty<SortKey>();
 
-        var keys = new SortKey[pk.Columns.Count];
-        for (int i = 0; i < pk.Columns.Count; i++)
+        var keys = new SortKey[pk.Columns.Length];
+        for (int i = 0; i < pk.Columns.Length; i++)
         {
             // PK columns are always ColumnRefExpr in IndexedColumn
             if (pk.Columns[i].Expression is not ColumnRefExpr colRef)
@@ -443,10 +443,10 @@ public sealed class QueryPlanner
         return count == sourceKeys.Length ? remapped : remapped.AsSpan(0, count).ToArray();
     }
 
-    private static int ComputeNOBSat(IReadOnlyList<OrderingTerm> orderBy, SortKey[] providedOrder, Projection projection)
+    private static int ComputeNOBSat(OrderingTerm[] orderBy, SortKey[] providedOrder, Projection projection)
     {
         int satisfied = 0;
-        for (int i = 0; i < orderBy.Count && i < providedOrder.Length; i++)
+        for (int i = 0; i < orderBy.Length && i < providedOrder.Length; i++)
         {
             var term = orderBy[i];
 
@@ -477,12 +477,12 @@ public sealed class QueryPlanner
         return satisfied;
     }
 
-    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, IReadOnlyList<OrderingTerm> orderBy)
+    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy)
     {
-        var ordinals = new int[orderBy.Count];
-        var orders = new SortOrder[orderBy.Count];
+        var ordinals = new int[orderBy.Length];
+        var orders = new SortOrder[orderBy.Length];
 
-        for (int i = 0; i < orderBy.Count; i++)
+        for (int i = 0; i < orderBy.Length; i++)
         {
             var term = orderBy[i];
             var resolved = ResolveColumns(term.Expression, source.Projection);

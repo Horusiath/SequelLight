@@ -23,7 +23,7 @@ public class SchemaPersistenceTests : TempDirTest
         {
             var table = conn.Db!.Schema.GetTable("t");
             Assert.NotNull(table);
-            Assert.Equal(2, table.Columns.Count);
+            Assert.Equal(2, table.Columns.Length);
             Assert.Equal("x", table.Columns[0].Name);
             Assert.True(table.Columns[0].IsPrimaryKey);
             Assert.Equal("name", table.Columns[1].Name);
@@ -160,7 +160,7 @@ public class SchemaPersistenceTests : TempDirTest
         {
             var table = conn.Db!.Schema.GetTable("t");
             Assert.NotNull(table);
-            Assert.Equal(2, table.Columns.Count);
+            Assert.Equal(2, table.Columns.Length);
             Assert.Equal("y", table.Columns[1].Name);
         }
     }

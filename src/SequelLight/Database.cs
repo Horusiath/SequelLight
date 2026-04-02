@@ -126,7 +126,7 @@ public sealed class Database : IAsyncDisposable
         await using var cursor = ro.CreateCursor();
         await cursor.SeekAsync(prefix);
 
-        var decodeBuf = new DbValue[rootTable.Columns.Count];
+        var decodeBuf = new DbValue[rootTable.Columns.Length];
         var pkBuf = new DbValue[1];
 
         while (cursor.IsValid)
@@ -183,20 +183,20 @@ public sealed class Database : IAsyncDisposable
         var insertColumns = stmt.Columns;
         int[] columnMap; // columnMap[i] = index into table.Columns for the i-th INSERT column
 
-        if (insertColumns is null || insertColumns.Count == 0)
+        if (insertColumns is null || insertColumns.Length == 0)
         {
             // No column list specified — values must match all columns in order
-            columnMap = new int[table.Columns.Count];
+            columnMap = new int[table.Columns.Length];
             for (int i = 0; i < columnMap.Length; i++)
                 columnMap[i] = i;
         }
         else
         {
-            columnMap = new int[insertColumns.Count];
-            for (int i = 0; i < insertColumns.Count; i++)
+            columnMap = new int[insertColumns.Length];
+            for (int i = 0; i < insertColumns.Length; i++)
             {
                 int found = -1;
-                for (int j = 0; j < table.Columns.Count; j++)
+                for (int j = 0; j < table.Columns.Length; j++)
                 {
                     if (string.Equals(table.Columns[j].Name, insertColumns[i], StringComparison.OrdinalIgnoreCase))
                     {
@@ -222,7 +222,7 @@ public sealed class Database : IAsyncDisposable
                 throw new InvalidOperationException(
                     $"INSERT has {columnMap.Length} target column(s) but {source.Projection.ColumnCount} value(s) were supplied.");
 
-            var row = new DbValue[table.Columns.Count];
+            var row = new DbValue[table.Columns.Length];
 
             while (await source.NextAsync().ConfigureAwait(false))
             {
@@ -238,7 +238,7 @@ public sealed class Database : IAsyncDisposable
                 }
 
                 // Fill defaults and validate NOT NULL for columns not in the INSERT column list
-                for (int i = 0; i < table.Columns.Count; i++)
+                for (int i = 0; i < table.Columns.Length; i++)
                 {
                     if (!row[i].IsNull)
                         continue;

@@ -8,8 +8,8 @@ public sealed record ExplainStmt(bool QueryPlan, SqlStmt Statement) : SqlStmt;
 public sealed record SelectStmt(
     WithClause? With,
     SelectBody First,
-    IReadOnlyList<CompoundSelectClause> Compounds,
-    IReadOnlyList<OrderingTerm>? OrderBy,
+    CompoundSelectClause[] Compounds,
+    OrderingTerm[]? OrderBy,
     SqlExpr? Limit,
     SqlExpr? Offset) : SqlStmt;
 
@@ -19,20 +19,20 @@ public sealed record InsertStmt(
     string? Schema,
     string Table,
     string? Alias,
-    IReadOnlyList<string>? Columns,
+    string[]? Columns,
     InsertSource Source,
-    IReadOnlyList<UpsertClause>? Upserts,
-    IReadOnlyList<ReturningColumn>? Returning) : SqlStmt;
+    UpsertClause[]? Upserts,
+    ReturningColumn[]? Returning) : SqlStmt;
 
 public sealed record UpdateStmt(
     WithClause? With,
     ConflictAction? OrAction,
     QualifiedTableName Table,
-    IReadOnlyList<UpdateSetter> Setters,
+    UpdateSetter[] Setters,
     JoinClause? From,
     SqlExpr? Where,
-    IReadOnlyList<ReturningColumn>? Returning,
-    IReadOnlyList<OrderingTerm>? OrderBy,
+    ReturningColumn[]? Returning,
+    OrderingTerm[]? OrderBy,
     SqlExpr? Limit,
     SqlExpr? Offset) : SqlStmt;
 
@@ -40,8 +40,8 @@ public sealed record DeleteStmt(
     WithClause? With,
     QualifiedTableName Table,
     SqlExpr? Where,
-    IReadOnlyList<ReturningColumn>? Returning,
-    IReadOnlyList<OrderingTerm>? OrderBy,
+    ReturningColumn[]? Returning,
+    OrderingTerm[]? OrderBy,
     SqlExpr? Limit,
     SqlExpr? Offset) : SqlStmt;
 
@@ -55,9 +55,9 @@ public sealed record CreateTableStmt(
 public abstract record CreateTableBody;
 
 public sealed record ColumnsTableBody(
-    IReadOnlyList<ColumnDef> Columns,
-    IReadOnlyList<TableConstraint> Constraints,
-    IReadOnlyList<TableOption> Options) : CreateTableBody;
+    ColumnDef[] Columns,
+    TableConstraint[] Constraints,
+    TableOption[] Options) : CreateTableBody;
 
 public sealed record AsSelectTableBody(SelectStmt Query) : CreateTableBody;
 
@@ -67,7 +67,7 @@ public sealed record CreateIndexStmt(
     string? Schema,
     string Index,
     string Table,
-    IReadOnlyList<IndexedColumn> Columns,
+    IndexedColumn[] Columns,
     SqlExpr? Where) : SqlStmt;
 
 public sealed record CreateViewStmt(
@@ -75,7 +75,7 @@ public sealed record CreateViewStmt(
     bool IfNotExists,
     string? Schema,
     string View,
-    IReadOnlyList<string>? Columns,
+    string[]? Columns,
     SelectStmt Query) : SqlStmt;
 
 public sealed record CreateTriggerStmt(
@@ -88,14 +88,14 @@ public sealed record CreateTriggerStmt(
     string Table,
     bool ForEachRow,
     SqlExpr? When,
-    IReadOnlyList<SqlStmt> Body) : SqlStmt;
+    SqlStmt[] Body) : SqlStmt;
 
 public sealed record CreateVirtualTableStmt(
     bool IfNotExists,
     string? Schema,
     string Table,
     string Module,
-    IReadOnlyList<string>? Arguments) : SqlStmt;
+    string[]? Arguments) : SqlStmt;
 
 public sealed record DropStmt(DropObjectKind Kind, bool IfExists, string? Schema, string Name) : SqlStmt;
 

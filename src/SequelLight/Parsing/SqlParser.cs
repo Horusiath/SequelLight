@@ -25,7 +25,7 @@ public sealed partial class SqlParser
         return stmt;
     }
 
-    public static IReadOnlyList<SqlStmt> ParseScript(string sql)
+    public static SqlStmt[] ParseScript(string sql)
     {
         var parser = new SqlParser(sql);
         var stmts = new List<SqlStmt>();
@@ -40,7 +40,7 @@ public sealed partial class SqlParser
             if (parser._current.Kind == TokenKind.Semicolon)
                 parser.Advance();
         }
-        return stmts;
+        return stmts.ToArray();
     }
 
     // ---- Token helpers ----
@@ -701,7 +701,7 @@ public sealed partial class SqlParser
         var args = new ValueListBuilder<SqlExpr>();
         var distinct = false;
         var isStar = false;
-        IReadOnlyList<OrderingTerm>? orderBy = null;
+        OrderingTerm[]? orderBy = null;
 
         if (Check(TokenKind.Star))
         {
@@ -783,7 +783,7 @@ public sealed partial class SqlParser
             }
         }
 
-        IReadOnlyList<SqlExpr>? partitionBy = null;
+        SqlExpr[]? partitionBy = null;
         if (Match(TokenKind.Partition))
         {
             Expect(TokenKind.By);
@@ -794,7 +794,7 @@ public sealed partial class SqlParser
             partitionBy = exprs.ToArray();
         }
 
-        IReadOnlyList<OrderingTerm>? orderBy = null;
+        OrderingTerm[]? orderBy = null;
         if (Check(TokenKind.Order))
             orderBy = ParseOrderByClause();
 
@@ -993,7 +993,7 @@ public sealed partial class SqlParser
             typeName = string.Join(" ", names);
         }
 
-        IReadOnlyList<string>? args = null;
+        string[]? args = null;
         if (Match(TokenKind.OpenParen))
         {
             var first = ParseSignedNumber();
@@ -1019,7 +1019,7 @@ public sealed partial class SqlParser
         return Expect(TokenKind.NumericLiteral).Text.ToString();
     }
 
-    internal IReadOnlyList<OrderingTerm> ParseOrderByClause()
+    internal OrderingTerm[] ParseOrderByClause()
     {
         Expect(TokenKind.Order);
         Expect(TokenKind.By);

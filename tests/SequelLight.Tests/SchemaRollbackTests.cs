@@ -55,7 +55,7 @@ public class SchemaRollbackTests : TempDirTest
 
         var table = conn.Db!.Schema.GetTable("t");
         Assert.NotNull(table);
-        Assert.Equal(2, table.Columns.Count);
+        Assert.Equal(2, table.Columns.Length);
     }
 
     [Fact]
@@ -93,7 +93,7 @@ public class SchemaRollbackTests : TempDirTest
         cmd.CommandText = "CREATE TABLE t (x INTEGER PRIMARY KEY)";
         await cmd.ExecuteNonQueryAsync();
 
-        var originalColCount = conn.Db!.Schema.GetTable("t")!.Columns.Count;
+        var originalColCount = conn.Db!.Schema.GetTable("t")!.Columns.Length;
 
         await using (var tx = conn.BeginTransaction())
         {
@@ -102,12 +102,12 @@ public class SchemaRollbackTests : TempDirTest
             cmd.CommandText = "ALTER TABLE t ADD COLUMN y TEXT";
             await cmd.ExecuteNonQueryAsync();
 
-            Assert.Equal(originalColCount + 1, conn.Db.Schema.GetTable("t")!.Columns.Count);
+            Assert.Equal(originalColCount + 1, conn.Db.Schema.GetTable("t")!.Columns.Length);
 
             await tx.RollbackAsync();
         }
 
-        Assert.Equal(originalColCount, conn.Db!.Schema.GetTable("t")!.Columns.Count);
+        Assert.Equal(originalColCount, conn.Db!.Schema.GetTable("t")!.Columns.Length);
     }
 
     [Fact]

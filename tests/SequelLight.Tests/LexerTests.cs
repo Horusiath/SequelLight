@@ -200,7 +200,7 @@ public class ExpressionParserTests
         Assert.False(inExpr.Negated);
         var list = inExpr.Target as InExprList;
         Assert.NotNull(list);
-        Assert.Equal(3, list.Expressions.Count);
+        Assert.Equal(3, list.Expressions.Length);
     }
 
     [Fact]
@@ -260,7 +260,7 @@ public class ExpressionParserTests
         var caseExpr = col!.Expression as CaseExpr;
         Assert.NotNull(caseExpr);
         Assert.NotNull(caseExpr.Operand);
-        Assert.Equal(2, caseExpr.WhenClauses.Count);
+        Assert.Equal(2, caseExpr.WhenClauses.Length);
         Assert.NotNull(caseExpr.ElseExpr);
     }
 
@@ -368,7 +368,7 @@ public class SelectParserTests
         Assert.NotNull(stmt);
         var core = stmt.First as SelectCore;
         Assert.NotNull(core);
-        Assert.Equal(3, core.Columns.Count);
+        Assert.Equal(3, core.Columns.Length);
         Assert.False(core.Distinct);
         Assert.Null(core.From);
     }
@@ -447,7 +447,7 @@ public class SelectParserTests
         var stmt = SqlParser.Parse("SELECT * FROM a INNER JOIN b ON a.id = b.id LEFT OUTER JOIN c USING (id)") as SelectStmt;
         var core = stmt!.First as SelectCore;
         Assert.NotNull(core!.From);
-        Assert.Equal(2, core.From!.Joins.Count);
+        Assert.Equal(2, core.From!.Joins.Length);
         Assert.Equal(JoinKind.Inner, core.From.Joins[0].Operator.Kind);
         Assert.IsType<OnJoinConstraint>(core.From.Joins[0].Constraint);
         Assert.Equal(JoinKind.LeftOuter, core.From.Joins[1].Operator.Kind);
@@ -458,7 +458,7 @@ public class SelectParserTests
     public void Parse_UnionSelect()
     {
         var stmt = SqlParser.Parse("SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3") as SelectStmt;
-        Assert.Equal(2, stmt!.Compounds.Count);
+        Assert.Equal(2, stmt!.Compounds.Length);
         Assert.Equal(CompoundOp.UnionAll, stmt.Compounds[0].Op);
         Assert.Equal(CompoundOp.Intersect, stmt.Compounds[1].Op);
     }
@@ -470,7 +470,7 @@ public class SelectParserTests
         Assert.NotNull(stmt!.With);
         Assert.Single(stmt.With!.Tables);
         Assert.Equal("cte", stmt.With.Tables[0].Name);
-        Assert.Equal(2, stmt.With.Tables[0].ColumnNames!.Count);
+        Assert.Equal(2, stmt.With.Tables[0].ColumnNames!.Length);
     }
 
     [Fact]
@@ -479,8 +479,8 @@ public class SelectParserTests
         var stmt = SqlParser.Parse("VALUES (1, 'a'), (2, 'b')") as SelectStmt;
         var body = stmt!.First as ValuesBody;
         Assert.NotNull(body);
-        Assert.Equal(2, body.Rows.Count);
-        Assert.Equal(2, body.Rows[0].Count);
+        Assert.Equal(2, body.Rows.Length);
+        Assert.Equal(2, body.Rows[0].Length);
     }
 
     [Fact]
@@ -503,7 +503,7 @@ public class DmlParserTests
         Assert.NotNull(stmt);
         Assert.Equal("users", stmt.Table);
         Assert.Equal(InsertVerb.Insert, stmt.Verb);
-        Assert.Equal(2, stmt.Columns!.Count);
+        Assert.Equal(2, stmt.Columns!.Length);
         var src = stmt.Source as SelectInsertSource;
         Assert.NotNull(src);
     }
@@ -552,7 +552,7 @@ public class DmlParserTests
         var stmt = SqlParser.Parse("UPDATE users SET name = 'Bob', age = 25 WHERE id = 1") as UpdateStmt;
         Assert.NotNull(stmt);
         Assert.Equal("users", stmt.Table.Table);
-        Assert.Equal(2, stmt.Setters.Count);
+        Assert.Equal(2, stmt.Setters.Length);
         Assert.NotNull(stmt.Where);
     }
 
@@ -593,7 +593,7 @@ public class DdlParserTests
         Assert.False(stmt.Temporary);
         var body = stmt.Body as ColumnsTableBody;
         Assert.NotNull(body);
-        Assert.Equal(3, body.Columns.Count);
+        Assert.Equal(3, body.Columns.Length);
         // id column
         Assert.Equal("id", body.Columns[0].Name);
         Assert.Equal("INTEGER", body.Columns[0].Type!.Name);
@@ -628,8 +628,8 @@ public class DdlParserTests
             "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a), UNIQUE (b), CHECK (a > 0))"
         ) as CreateTableStmt;
         var body = stmt!.Body as ColumnsTableBody;
-        Assert.Equal(2, body!.Columns.Count);
-        Assert.Equal(3, body.Constraints.Count);
+        Assert.Equal(2, body!.Columns.Length);
+        Assert.Equal(3, body.Constraints.Length);
         Assert.IsType<PrimaryKeyTableConstraint>(body.Constraints[0]);
         Assert.IsType<UniqueTableConstraint>(body.Constraints[1]);
         Assert.IsType<CheckTableConstraint>(body.Constraints[2]);
@@ -666,7 +666,7 @@ public class DdlParserTests
         Assert.True(stmt.IfNotExists);
         Assert.Equal("idx", stmt.Index);
         Assert.Equal("t", stmt.Table);
-        Assert.Equal(2, stmt.Columns.Count);
+        Assert.Equal(2, stmt.Columns.Length);
     }
 
     [Fact]
@@ -817,7 +817,7 @@ public class MiscParserTests
     public void Parse_MultipleStatements()
     {
         var stmts = SqlParser.ParseScript("SELECT 1; SELECT 2; INSERT INTO t DEFAULT VALUES");
-        Assert.Equal(3, stmts.Count);
+        Assert.Equal(3, stmts.Length);
         Assert.IsType<SelectStmt>(stmts[0]);
         Assert.IsType<SelectStmt>(stmts[1]);
         Assert.IsType<InsertStmt>(stmts[2]);

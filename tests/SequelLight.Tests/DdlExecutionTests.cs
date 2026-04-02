@@ -39,7 +39,7 @@ public class DdlExecutionTests : TempDirTest
         var valueBytes = await ro.GetAsync(SchemaKey(1));
         Assert.NotNull(valueBytes);
 
-        Span<DbValue> values = new DbValue[rootTable.Columns.Count];
+        Span<DbValue> values = new DbValue[rootTable.Columns.Length];
         RowValueEncoder.Decode(valueBytes, values, rootTable.Columns);
 
         Assert.True(values[0].IsNull); // PK is in the key
@@ -66,7 +66,7 @@ public class DdlExecutionTests : TempDirTest
         var valueBytes = await ro.GetAsync(SchemaKey(2));
         Assert.NotNull(valueBytes);
 
-        Span<DbValue> values = new DbValue[rootTable.Columns.Count];
+        Span<DbValue> values = new DbValue[rootTable.Columns.Length];
         RowValueEncoder.Decode(valueBytes, values, rootTable.Columns);
 
         Assert.Equal((long)ObjectType.Index, values[1].AsInteger());
@@ -129,7 +129,7 @@ public class DdlExecutionTests : TempDirTest
         var valueBytes = await ro.GetAsync(SchemaKey(1));
         Assert.NotNull(valueBytes);
 
-        Span<DbValue> values = new DbValue[rootTable.Columns.Count];
+        Span<DbValue> values = new DbValue[rootTable.Columns.Length];
         RowValueEncoder.Decode(valueBytes, values, rootTable.Columns);
 
         var definition = Encoding.UTF8.GetString(values[3].AsText().Span);

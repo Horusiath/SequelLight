@@ -110,14 +110,14 @@ public static class RowValueEncoder
         return result;
     }
 
-    public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, IReadOnlyList<ColumnSchema> columns)
+    public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, ColumnSchema[] columns)
     {
         values.Clear();
         if (src.IsEmpty) return;
 
         ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(src);
 
-        for (int i = 0; i < columns.Count; i++)
+        for (int i = 0; i < columns.Length; i++)
         {
             ushort seqNo = columns[i].SeqNo;
             if (seqNo >= slotCount) continue;
@@ -186,7 +186,7 @@ public static class RowValueEncoder
     /// Bytes fields are sliced from <paramref name="src"/> without allocation.
     /// The caller must ensure <paramref name="src"/> outlives the decoded <see cref="DbValue"/>s.
     /// </summary>
-    public static void Decode(ReadOnlyMemory<byte> src, Span<DbValue> values, IReadOnlyList<ColumnSchema> columns)
+    public static void Decode(ReadOnlyMemory<byte> src, Span<DbValue> values, ColumnSchema[] columns)
     {
         values.Clear();
         if (src.IsEmpty) return;
@@ -194,7 +194,7 @@ public static class RowValueEncoder
         var span = src.Span;
         ushort slotCount = BinaryPrimitives.ReadUInt16LittleEndian(span);
 
-        for (int i = 0; i < columns.Count; i++)
+        for (int i = 0; i < columns.Length; i++)
         {
             ushort seqNo = columns[i].SeqNo;
             if (seqNo >= slotCount) continue;

@@ -121,8 +121,8 @@ public sealed class DatabaseSchema
             {
                 case PrimaryKeyTableConstraint pk:
                     primaryKey = new PrimaryKeySchema(pk.Name, pk.Columns, pk.OnConflict);
-                    tablePkColumnNames = new string[pk.Columns.Count];
-                    for (int j = 0; j < pk.Columns.Count; j++)
+                    tablePkColumnNames = new string[pk.Columns.Length];
+                    for (int j = 0; j < pk.Columns.Length; j++)
                     {
                         if (pk.Columns[j].Expression is ColumnRefExpr colRef)
                             tablePkColumnNames[j] = colRef.Column;
@@ -141,9 +141,9 @@ public sealed class DatabaseSchema
         }
 
         // Build columns, resolving column-level constraints
-        var columns = new ColumnSchema[body.Columns.Count];
+        var columns = new ColumnSchema[body.Columns.Length];
         ushort nextColSeq = 0;
-        for (int i = 0; i < body.Columns.Count; i++)
+        for (int i = 0; i < body.Columns.Length; i++)
         {
             var colDef = body.Columns[i];
             columns[i] = BuildColumn(++nextColSeq, colDef, tablePkColumnNames);
@@ -187,7 +187,7 @@ public sealed class DatabaseSchema
         }
 
         // Every table must have a primary key with at least one column
-        if (primaryKey is null || primaryKey.Columns.Count == 0)
+        if (primaryKey is null || primaryKey.Columns.Length == 0)
             throw new InvalidOperationException($"Table '{stmt.Table}' must have a PRIMARY KEY.");
 
         // Table options — manual loop avoids LINQ Contains enumerator allocation
@@ -212,9 +212,9 @@ public sealed class DatabaseSchema
             columns,
             (ushort)(nextColSeq + 1),
             primaryKey,
-            (IReadOnlyList<UniqueConstraintSchema>?)uniqueConstraints ?? Array.Empty<UniqueConstraintSchema>(),
-            (IReadOnlyList<CheckConstraintSchema>?)checkConstraints ?? Array.Empty<CheckConstraintSchema>(),
-            (IReadOnlyList<ForeignKeyConstraintSchema>?)foreignKeys ?? Array.Empty<ForeignKeyConstraintSchema>());
+            uniqueConstraints?.ToArray() ?? Array.Empty<UniqueConstraintSchema>(),
+            checkConstraints?.ToArray() ?? Array.Empty<CheckConstraintSchema>(),
+            foreignKeys?.ToArray() ?? Array.Empty<ForeignKeyConstraintSchema>());
         _tables[oid] = table;
         _tableNames[stmt.Table] = oid;
 
@@ -372,7 +372,7 @@ public sealed class DatabaseSchema
             case RenameColumnAction renameCol:
             {
                 bool found = false;
-                for (int i = 0; i < table.Columns.Count; i++)
+                for (int i = 0; i < table.Columns.Length; i++)
                 {
                     if (string.Equals(table.Columns[i].Name, renameCol.OldName, StringComparison.OrdinalIgnoreCase))
                     {
@@ -388,10 +388,10 @@ public sealed class DatabaseSchema
             case AddColumnAction addCol:
             {
                 var newColumn = BuildColumn(table.NextColumnSeqNo, addCol.Column, tablePkColumns: null);
-                var columns = new ColumnSchema[table.Columns.Count + 1];
-                for (int i = 0; i < table.Columns.Count; i++)
+                var columns = new ColumnSchema[table.Columns.Length + 1];
+                for (int i = 0; i < table.Columns.Length; i++)
                     columns[i] = table.Columns[i];
-                columns[table.Columns.Count] = newColumn;
+                columns[table.Columns.Length] = newColumn;
                 table.Columns = columns;
                 table.NextColumnSeqNo++;
                 break;
@@ -399,7 +399,7 @@ public sealed class DatabaseSchema
             case DropColumnAction dropCol:
             {
                 int dropIndex = -1;
-                for (int i = 0; i < table.Columns.Count; i++)
+                for (int i = 0; i < table.Columns.Length; i++)
                 {
                     if (string.Equals(table.Columns[i].Name, dropCol.ColumnName, StringComparison.OrdinalIgnoreCase))
                     {
@@ -410,8 +410,8 @@ public sealed class DatabaseSchema
                 if (dropIndex < 0)
                     throw new InvalidOperationException($"Column '{dropCol.ColumnName}' does not exist in table '{stmt.Table}'.");
 
-                var columns = new ColumnSchema[table.Columns.Count - 1];
-                for (int i = 0, j = 0; i < table.Columns.Count; i++)
+                var columns = new ColumnSchema[table.Columns.Length - 1];
+                for (int i = 0, j = 0; i < table.Columns.Length; i++)
                 {
                     if (i != dropIndex)
                         columns[j++] = table.Columns[i];

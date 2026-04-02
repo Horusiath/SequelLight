@@ -680,7 +680,7 @@ public class RowValueEncoderTests
         Assert.Equal(0, decoded[0].AsBlob().Length);
     }
 
-    private static IReadOnlyList<ColumnSchema> MakeColumns(params (string Name, string TypeName, ushort SeqNo)[] cols)
+    private static ColumnSchema[] MakeColumns(params (string Name, string TypeName, ushort SeqNo)[] cols)
     {
         return cols.Select(c => new ColumnSchema(
             seqNo: c.SeqNo,
@@ -692,7 +692,7 @@ public class RowValueEncoderTests
             defaultValue: null,
             checkExpression: null,
             foreignKey: null,
-            generatedExpression: null)).ToList();
+            generatedExpression: null)).ToArray();
     }
 }
 
@@ -971,7 +971,7 @@ public class RowValueDecodeColumnsTests
             Assert.Equal(fullDecoded[i], partialDecoded[i]);
     }
 
-    private static IReadOnlyList<ColumnSchema> MakeColumns(params (string Name, string TypeName, ushort SeqNo)[] cols)
+    private static ColumnSchema[] MakeColumns(params (string Name, string TypeName, ushort SeqNo)[] cols)
     {
         return cols.Select(c => new ColumnSchema(
             seqNo: c.SeqNo,
@@ -983,6 +983,6 @@ public class RowValueDecodeColumnsTests
             defaultValue: null,
             checkExpression: null,
             foreignKey: null,
-            generatedExpression: null)).ToList();
+            generatedExpression: null)).ToArray();
     }
 }
