@@ -45,6 +45,7 @@ public sealed class Database : IAsyncDisposable
             CreateTableStmt or CreateIndexStmt or CreateViewStmt or CreateTriggerStmt
                 or DropStmt or AlterTableStmt => await ExecuteDdlAsync(stmt, transaction).ConfigureAwait(false),
             InsertStmt insert => await ExecuteInsertAsync(insert, parameters, transaction).ConfigureAwait(false),
+            UpdateStmt update => await ExecuteUpdateAsync(update, parameters, transaction).ConfigureAwait(false),
             _ => throw new NotImplementedException()
         };
     }
@@ -283,6 +284,116 @@ public sealed class Database : IAsyncDisposable
         await InsertRows(autoTx).ConfigureAwait(false);
         await autoTx.CommitAsync().ConfigureAwait(false);
         return totalInserted;
+    }
+
+    private async ValueTask<int> ExecuteUpdateAsync(UpdateStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
+    {
+        var table = Schema.GetTable(stmt.Table.Table)
+            ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+
+        // Map each setter's column name to its index in the table
+        var setColumnIndices = new int[stmt.Setters.Length];
+        for (int s = 0; s < stmt.Setters.Length; s++)
+        {
+            // UpdateSetter.Columns is an array but we only support single-column SET (SET x = expr)
+            var colName = stmt.Setters[s].Columns[0];
+            int found = -1;
+            for (int c = 0; c < table.Columns.Length; c++)
+            {
+                if (string.Equals(table.Columns[c].Name, colName, StringComparison.OrdinalIgnoreCase))
+                {
+                    found = c;
+                    break;
+                }
+            }
+            if (found < 0)
+                throw new InvalidOperationException($"Column '{colName}' does not exist in table '{stmt.Table.Table}'.");
+            setColumnIndices[s] = found;
+        }
+
+        // Build scan projection (matches TableScan output)
+        var columnNames = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            columnNames[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(columnNames);
+
+        // Resolve bind parameters and column refs in WHERE and SET expressions
+        var planner = new QueryPlanner(Schema, parameters);
+        SqlExpr? resolvedWhere = stmt.Where is not null
+            ? planner.ResolveColumns(planner.ResolveBindParametersFromDict(stmt.Where), scanProjection)
+            : null;
+
+        var resolvedSetExprs = new SqlExpr[stmt.Setters.Length];
+        for (int i = 0; i < stmt.Setters.Length; i++)
+            resolvedSetExprs[i] = planner.ResolveColumns(planner.ResolveBindParametersFromDict(stmt.Setters[i].Value), scanProjection);
+
+        // Evaluate LIMIT/OFFSET if present
+        long? limit = null, offset = null;
+        if (stmt.Limit is not null)
+        {
+            var resolved = planner.ResolveBindParametersFromDict(stmt.Limit);
+            var lv = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            limit = lv.IsNull ? null : lv.AsInteger();
+        }
+        if (stmt.Offset is not null)
+        {
+            var resolved = planner.ResolveBindParametersFromDict(stmt.Offset);
+            var ov = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            offset = ov.IsNull ? null : ov.AsInteger();
+        }
+
+        int totalUpdated = 0;
+
+        async ValueTask<int> UpdateRows(ReadWriteTransaction rw)
+        {
+            // Phase 1: Materialize matching rows
+            await using var cursor = rw.CreateCursor();
+            IDbEnumerator source = new TableScan(cursor, table);
+
+            if (resolvedWhere is not null)
+                source = new Filter(source, resolvedWhere);
+
+            if (limit.HasValue || offset.HasValue)
+                source = new LimitEnumerator(source, limit ?? long.MaxValue, Math.Max(0, offset ?? 0));
+
+            var matchedRows = new List<(byte[] Key, DbValue[] Row)>();
+            while (await source.NextAsync().ConfigureAwait(false))
+            {
+                byte[] key = table.EncodeRowKey(source.Current);
+                var row = new DbValue[table.Columns.Length];
+                Array.Copy(source.Current, row, row.Length);
+                matchedRows.Add((key, row));
+            }
+
+            // Phase 2: Apply SET expressions and write back
+            foreach (var (oldKey, row) in matchedRows)
+            {
+                for (int i = 0; i < resolvedSetExprs.Length; i++)
+                {
+                    var newValue = ExprEvaluator.Evaluate(resolvedSetExprs[i], row, scanProjection);
+                    row[setColumnIndices[i]] = CoerceToColumnType(newValue, table.Columns[setColumnIndices[i]]);
+                }
+
+                var newKey = table.EncodeRowKey(row);
+                if (!oldKey.AsSpan().SequenceEqual(newKey))
+                    rw.Delete(oldKey);
+                rw.Put(newKey, table.EncodeRowValue(row));
+            }
+
+            return matchedRows.Count;
+        }
+
+        if (transaction is ReadWriteTransaction rwTx)
+        {
+            totalUpdated = await UpdateRows(rwTx).ConfigureAwait(false);
+            return totalUpdated;
+        }
+
+        // Auto-commit
+        await using var autoTx = _store.BeginReadWrite();
+        totalUpdated = await UpdateRows(autoTx).ConfigureAwait(false);
+        await autoTx.CommitAsync().ConfigureAwait(false);
+        return totalUpdated;
     }
 
     /// <summary>

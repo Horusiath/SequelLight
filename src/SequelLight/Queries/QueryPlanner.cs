@@ -178,7 +178,7 @@ public sealed class QueryPlanner
         return result;
     }
 
-    private SqlExpr ResolveBindParametersFromDict(SqlExpr expr)
+    internal SqlExpr ResolveBindParametersFromDict(SqlExpr expr)
     {
         return expr switch
         {

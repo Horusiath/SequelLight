@@ -5,8 +5,15 @@ A (vibe-coded) C# implementation of an embedded SQL database (parser using the S
 - A native ADO.NET compatible API.
 - Schema DDL (uses strict schema) for tables.
 - Primary Key support for indexing.
-- SELECT, JOINs, WHERE, ORDER BY.
-- INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT.
+- SELECT, JOINs, WHERE, ORDER BY, LIMIT/OFFSET.
+- INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT, UPDATE.
+- Heuristics used to optimise query plan:
+    - Nested loop join
+    - Merge join
+    - Haah join
+    - Push down predicates
+    - Push down projections
+    - Constant folding
 
 More features to come.
 
