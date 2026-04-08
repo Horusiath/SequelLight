@@ -1,5 +1,7 @@
 using System.Data;
 using System.Data.Common;
+using System.Text;
+using SequelLight.Data;
 
 namespace SequelLight;
 
@@ -59,7 +61,7 @@ public sealed class SequelLightCommand : DbCommand
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         var (db, tx) = EnsureValid();
-        return await db.ExecuteNonQueryAsync(_commandText, tx).ConfigureAwait(false);
+        return await db.ExecuteNonQueryAsync(_commandText, CollectParameters(), tx).ConfigureAwait(false);
     }
 
     public override object? ExecuteScalar()
@@ -70,7 +72,7 @@ public sealed class SequelLightCommand : DbCommand
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         var (db, tx) = EnsureValid();
-        return await db.ExecuteScalarAsync(_commandText, tx).ConfigureAwait(false);
+        return await db.ExecuteScalarAsync(_commandText, CollectParameters(), tx).ConfigureAwait(false);
     }
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
@@ -82,7 +84,7 @@ public sealed class SequelLightCommand : DbCommand
         CommandBehavior behavior, CancellationToken cancellationToken)
     {
         var (db, tx) = EnsureValid();
-        return await db.ExecuteReaderAsync(_commandText, tx).ConfigureAwait(false);
+        return await db.ExecuteReaderAsync(_commandText, CollectParameters(), tx).ConfigureAwait(false);
     }
 
     public override void Prepare()
@@ -105,5 +107,43 @@ public sealed class SequelLightCommand : DbCommand
             throw new InvalidOperationException("CommandText has not been set.");
 
         return (Connection.Db, Transaction?.Inner);
+    }
+
+    private Dictionary<string, DbValue>? CollectParameters()
+    {
+        var coll = (SequelLightParameterCollection)DbParameterCollection;
+        if (coll.Count == 0) return null;
+
+        var dict = new Dictionary<string, DbValue>(coll.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (SequelLightParameter p in coll)
+        {
+            dict[NormalizeParameterName(p.ParameterName)] = ConvertParameterValue(p.Value);
+        }
+        return dict;
+    }
+
+    internal static string NormalizeParameterName(string name)
+    {
+        if (name.Length > 0 && name[0] is '@' or ':' or '$')
+            return name[1..];
+        return name;
+    }
+
+    internal static DbValue ConvertParameterValue(object? value)
+    {
+        return value switch
+        {
+            null or DBNull => DbValue.Null,
+            long l => DbValue.Integer(l),
+            int i => DbValue.Integer(i),
+            short s => DbValue.Integer(s),
+            byte b => DbValue.Integer(b),
+            double d => DbValue.Real(d),
+            float f => DbValue.Real(f),
+            string s => DbValue.Text(Encoding.UTF8.GetBytes(s)),
+            byte[] b => DbValue.Blob(b),
+            bool b => DbValue.Integer(b ? 1 : 0),
+            _ => throw new NotSupportedException($"Parameter value type '{value.GetType().Name}' is not supported.")
+        };
     }
 }

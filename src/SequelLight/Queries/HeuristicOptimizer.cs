@@ -92,6 +92,7 @@ public static class HeuristicOptimizer
             case ColumnRefExpr:
             case ResolvedColumnExpr:
             case BindParameterExpr:
+            case ResolvedParameterExpr:
                 return expr;
 
             case UnaryExpr unary:

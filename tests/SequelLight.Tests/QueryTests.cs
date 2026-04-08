@@ -1,6 +1,7 @@
 using SequelLight.Data;
 using SequelLight.Parsing.Ast;
 using SequelLight.Queries;
+using SequelLight.Schema;
 
 namespace SequelLight.Tests;
 
@@ -817,7 +818,7 @@ public class ResolveColumnsTests
         var projection = new Projection(["id", "name"]);
         var expr = new ColumnRefExpr(null, null, "name");
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
         Assert.Equal(1, rc.Ordinal);
@@ -829,7 +830,7 @@ public class ResolveColumnsTests
         var projection = new Projection(["t.id", "t.name"]);
         var expr = new ColumnRefExpr(null, "t", "name");
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
         Assert.Equal(1, rc.Ordinal);
@@ -841,7 +842,7 @@ public class ResolveColumnsTests
         var projection = new Projection(["users.id", "users.name"]);
         var expr = new ColumnRefExpr(null, null, "name");
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var rc = Assert.IsType<ResolvedColumnExpr>(resolved);
         Assert.Equal(1, rc.Ordinal);
@@ -856,7 +857,7 @@ public class ResolveColumnsTests
             BinaryOp.Add,
             new ColumnRefExpr(null, null, "y"));
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var binary = Assert.IsType<BinaryExpr>(resolved);
         Assert.Equal(0, Assert.IsType<ResolvedColumnExpr>(binary.Left).Ordinal);
@@ -869,7 +870,7 @@ public class ResolveColumnsTests
         var projection = new Projection(["x"]);
         var expr = new LiteralExpr(LiteralKind.Integer, "42");
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var rl = Assert.IsType<ResolvedLiteralExpr>(resolved);
         Assert.Equal(42L, rl.Value.AsInteger());
@@ -885,7 +886,7 @@ public class ResolveColumnsTests
             new LiteralExpr(LiteralKind.Integer, "1"),
             new LiteralExpr(LiteralKind.Integer, "10"));
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var between = Assert.IsType<BetweenExpr>(resolved);
         Assert.Equal(0, Assert.IsType<ResolvedColumnExpr>(between.Operand).Ordinal);
@@ -897,7 +898,7 @@ public class ResolveColumnsTests
         var projection = new Projection(Array.Empty<string>());
         var expr = new LiteralExpr(LiteralKind.Real, "3.14");
 
-        var resolved = QueryPlanner.ResolveColumns(expr, projection);
+        var resolved = new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection);
 
         var rl = Assert.IsType<ResolvedLiteralExpr>(resolved);
         Assert.Equal(3.14, rl.Value.AsReal());
@@ -910,7 +911,7 @@ public class ResolveColumnsTests
         var expr = new ColumnRefExpr(null, null, "missing");
 
         Assert.Throws<InvalidOperationException>(() =>
-            QueryPlanner.ResolveColumns(expr, projection));
+            new QueryPlanner(new DatabaseSchema()).ResolveColumns(expr, projection));
     }
 }
 
@@ -2514,5 +2515,178 @@ public class QueryCacheTests : TempDirTest
         Assert.Equal(0, SequelLightConnection.ParseQueryCacheSize("Data Source=/tmp/db;Query Cache Size=0"));
         Assert.Equal(256, SequelLightConnection.ParseQueryCacheSize("Data Source=/tmp/db"));
         Assert.Equal(256, SequelLightConnection.ParseQueryCacheSize(""));
+    }
+}
+
+public class ParameterTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    private async Task SetupTable(SequelLightConnection conn)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'charlie', 30), (4, 'dave', 40), (5, 'eve', 50)";
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task Parameter_WhereClause()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, name FROM t WHERE id = $id";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("id", System.Data.DbType.Int64).Value = 2L;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(2L, reader.GetInt64(0));
+        Assert.Equal("bob", reader.GetString(1));
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Parameter_MultipleParams()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE id > @lo AND id < @hi";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("lo", System.Data.DbType.Int64).Value = 1L;
+        ((SequelLightParameterCollection)cmd.Parameters).Add("hi", System.Data.DbType.Int64).Value = 4L;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(new[] { 2L, 3L }, rows);
+    }
+
+    [Fact]
+    public async Task Parameter_Insert()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES ($id, $name)";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("id", System.Data.DbType.Int64).Value = 42L;
+        ((SequelLightParameterCollection)cmd.Parameters).Add("name", System.Data.DbType.String).Value = "test";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.Parameters.Clear();
+        cmd.CommandText = "SELECT id, name FROM t WHERE id = 42";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(42L, reader.GetInt64(0));
+        Assert.Equal("test", reader.GetString(1));
+    }
+
+    [Fact]
+    public async Task Parameter_NullValue()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, $name)";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("name", System.Data.DbType.String).Value = null;
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.Parameters.Clear();
+        cmd.CommandText = "SELECT name FROM t WHERE id = 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.IsDBNull(0));
+    }
+
+    [Fact]
+    public async Task Parameter_CachedPlan_DifferentValues()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        const string sql = "SELECT name FROM t WHERE id = $id";
+
+        // First execution — cache miss
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        ((SequelLightParameterCollection)cmd.Parameters).Add("id", System.Data.DbType.Int64).Value = 1L;
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader1.ReadAsync());
+        Assert.Equal("alice", reader1.GetString(0));
+
+        // Second execution — same SQL, different value → cache hit, different result
+        var cmd2 = conn.CreateCommand();
+        cmd2.CommandText = sql;
+        ((SequelLightParameterCollection)cmd2.Parameters).Add("id", System.Data.DbType.Int64).Value = 3L;
+        await using var reader2 = await cmd2.ExecuteReaderAsync();
+        Assert.True(await reader2.ReadAsync());
+        Assert.Equal("charlie", reader2.GetString(0));
+    }
+
+    [Fact]
+    public async Task Parameter_LimitOffset()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t ORDER BY id ASC LIMIT $n OFFSET $skip";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("n", System.Data.DbType.Int64).Value = 2L;
+        ((SequelLightParameterCollection)cmd.Parameters).Add("skip", System.Data.DbType.Int64).Value = 1L;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(new[] { 2L, 3L }, rows);
+    }
+
+    [Fact]
+    public async Task Parameter_NameNormalization()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        // SQL uses $id, ADO.NET parameter named @id — should still match (both normalize to "id")
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM t WHERE id = $id";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("@id", System.Data.DbType.Int64).Value = 2L;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("bob", reader.GetString(0));
+    }
+
+    [Fact]
+    public async Task Parameter_Expression()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT value + $offset FROM t WHERE id = 1";
+        ((SequelLightParameterCollection)cmd.Parameters).Add("offset", System.Data.DbType.Int64).Value = 100L;
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(110L, reader.GetInt64(0));
     }
 }

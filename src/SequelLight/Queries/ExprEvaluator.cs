@@ -44,6 +44,12 @@ public static class ExprEvaluator
             case CastExpr cast:
                 return EvaluateCast(cast, row, projection);
 
+            case BindParameterExpr bind:
+                throw new InvalidOperationException($"Unresolved parameter '{bind.Name}'. Ensure parameters are provided.");
+
+            case ResolvedParameterExpr param:
+                throw new InvalidOperationException($"Unresolved parameter at ordinal {param.Ordinal}. Parameters must be bound before evaluation.");
+
             default:
                 throw new NotSupportedException($"Expression type '{expr.GetType().Name}' is not supported in evaluation.");
         }

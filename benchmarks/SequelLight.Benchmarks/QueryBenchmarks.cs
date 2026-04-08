@@ -285,7 +285,7 @@ public class SelectScanBenchmarks
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
         // Create narrow table (3 columns)
-        _db.ExecuteNonQueryAsync("CREATE TABLE narrow (id INTEGER PRIMARY KEY, val INTEGER, name TEXT)", null)
+        _db.ExecuteNonQueryAsync("CREATE TABLE narrow (id INTEGER PRIMARY KEY, val INTEGER, name TEXT)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         // Create wide table (20 columns)
@@ -298,7 +298,7 @@ public class SelectScanBenchmarks
                 wideCols.Append($", c{i} INTEGER");
         }
         wideCols.Append(')');
-        _db.ExecuteNonQueryAsync(wideCols.ToString(), null).AsTask().GetAwaiter().GetResult();
+        _db.ExecuteNonQueryAsync(wideCols.ToString(), null, null).AsTask().GetAwaiter().GetResult();
 
         // Insert rows via SequelLight
         {
@@ -416,7 +416,7 @@ public class SelectScanBenchmarks
     [Benchmark(Description = "SELECT * FROM narrow (3 cols)")]
     public async Task<int> ScanNarrow_AllColumns()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM narrow", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM narrow", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -426,7 +426,7 @@ public class SelectScanBenchmarks
     [Benchmark(Description = "SELECT id FROM narrow (1 col)")]
     public async Task<int> ScanNarrow_OneColumn()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT id FROM narrow", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT id FROM narrow", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -436,7 +436,7 @@ public class SelectScanBenchmarks
     [Benchmark(Description = "SELECT * FROM wide (20 cols)")]
     public async Task<int> ScanWide_AllColumns()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM wide", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM wide", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -446,7 +446,7 @@ public class SelectScanBenchmarks
     [Benchmark(Description = "SELECT c10 FROM wide (mid col)")]
     public async Task<int> ScanWide_MidColumn()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT c10 FROM wide", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT c10 FROM wide", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -456,7 +456,7 @@ public class SelectScanBenchmarks
     [Benchmark(Description = "SELECT c1,c10,c19 FROM wide (3 cols spread)")]
     public async Task<int> ScanWide_ThreeColumns()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT c1, c10, c19 FROM wide", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT c1, c10, c19 FROM wide", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -549,9 +549,9 @@ public class JoinBenchmarks
         _db = new Database(_store, _tempDir);
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
-        _db.ExecuteNonQueryAsync("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)", null)
+        _db.ExecuteNonQueryAsync("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)", null, null)
             .AsTask().GetAwaiter().GetResult();
-        _db.ExecuteNonQueryAsync("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, value INTEGER)", null)
+        _db.ExecuteNonQueryAsync("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, value INTEGER)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         var tx = _store.BeginReadWrite();
@@ -653,7 +653,7 @@ public class JoinBenchmarks
     public async Task<int> InnerJoin_OnPk()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT parent.name, child.value FROM parent INNER JOIN child ON parent.id = child.parent_id", null);
+            "SELECT parent.name, child.value FROM parent INNER JOIN child ON parent.id = child.parent_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -664,7 +664,7 @@ public class JoinBenchmarks
     public async Task<int> LeftJoin_OnPk()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT parent.name, child.value FROM parent LEFT JOIN child ON parent.id = child.parent_id", null);
+            "SELECT parent.name, child.value FROM parent LEFT JOIN child ON parent.id = child.parent_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -675,7 +675,7 @@ public class JoinBenchmarks
     public async Task<int> CrossJoin()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT parent.name, child.value FROM parent CROSS JOIN child", null);
+            "SELECT parent.name, child.value FROM parent CROSS JOIN child", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -686,7 +686,7 @@ public class JoinBenchmarks
     public async Task<int> Join_WithProjection()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT parent.name FROM parent INNER JOIN child ON parent.id = child.parent_id", null);
+            "SELECT parent.name FROM parent INNER JOIN child ON parent.id = child.parent_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -770,9 +770,9 @@ public class HashJoinBenchmarks
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
         // "orders" has a non-PK customer_id column used as the join key
-        _db.ExecuteNonQueryAsync("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region INTEGER)", null)
+        _db.ExecuteNonQueryAsync("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region INTEGER)", null, null)
             .AsTask().GetAwaiter().GetResult();
-        _db.ExecuteNonQueryAsync("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)", null)
+        _db.ExecuteNonQueryAsync("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         var tx = _store.BeginReadWrite();
@@ -877,7 +877,7 @@ public class HashJoinBenchmarks
     public async Task<int> HashJoin_Inner()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT customers.name, orders.amount FROM customers INNER JOIN orders ON customers.id = orders.customer_id", null);
+            "SELECT customers.name, orders.amount FROM customers INNER JOIN orders ON customers.id = orders.customer_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -888,7 +888,7 @@ public class HashJoinBenchmarks
     public async Task<int> HashJoin_Left()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT customers.name, orders.amount FROM customers LEFT JOIN orders ON customers.id = orders.customer_id", null);
+            "SELECT customers.name, orders.amount FROM customers LEFT JOIN orders ON customers.id = orders.customer_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -899,7 +899,7 @@ public class HashJoinBenchmarks
     public async Task<int> HashJoin_InnerWithWhere()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT customers.name, orders.amount FROM customers INNER JOIN orders ON customers.id = orders.customer_id WHERE customers.region = 1", null);
+            "SELECT customers.name, orders.amount FROM customers INNER JOIN orders ON customers.id = orders.customer_id WHERE customers.region = 1", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -910,7 +910,7 @@ public class HashJoinBenchmarks
     public async Task<int> HashJoin_InnerProjected()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT customers.name FROM customers INNER JOIN orders ON customers.id = orders.customer_id", null);
+            "SELECT customers.name FROM customers INNER JOIN orders ON customers.id = orders.customer_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -921,7 +921,7 @@ public class HashJoinBenchmarks
     public async Task<int> HashJoin_CommaJoin()
     {
         var reader = await _db.ExecuteReaderAsync(
-            "SELECT customers.name, orders.amount FROM customers, orders WHERE customers.id = orders.customer_id", null);
+            "SELECT customers.name, orders.amount FROM customers, orders WHERE customers.id = orders.customer_id", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1004,7 +1004,7 @@ public class WhereBenchmarks
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
         _db.ExecuteNonQueryAsync(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null)
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         var tx = _store.BeginReadWrite();
@@ -1071,7 +1071,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "WHERE pk = constant (point)")]
     public async Task<int> Where_PkEquality()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE id = 500", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE id = 500", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1083,7 +1083,7 @@ public class WhereBenchmarks
     {
         int lo = RowCount / 10;
         int hi = RowCount / 10 + RowCount / 10;
-        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id >= {lo} AND id < {hi}", null);
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id >= {lo} AND id < {hi}", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1093,7 +1093,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "WHERE non-pk = constant (~10%)")]
     public async Task<int> Where_NonPkEquality()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE category = 3", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE category = 3", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1103,7 +1103,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "WHERE non-pk range (~50%)")]
     public async Task<int> Where_NonPkRange()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE score < 500", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE score < 500", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1114,7 +1114,7 @@ public class WhereBenchmarks
     public async Task<int> Where_Compound()
     {
         int hi = RowCount / 2;
-        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id < {hi} AND category = 5", null);
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id < {hi} AND category = 5", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1124,7 +1124,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "WHERE no match (0 rows)")]
     public async Task<int> Where_NoMatch()
     {
-        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id = {RowCount + 999}", null);
+        var reader = await _db.ExecuteReaderAsync($"SELECT * FROM t WHERE id = {RowCount + 999}", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1134,7 +1134,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "WHERE IS NULL (on non-null col)")]
     public async Task<int> Where_IsNull()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE name IS NULL", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t WHERE name IS NULL", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1144,7 +1144,7 @@ public class WhereBenchmarks
     [Benchmark(Description = "Full scan (no WHERE)")]
     public async Task<int> FullScan_NoWhere()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1276,12 +1276,12 @@ public class OrderByBenchmarks
 
         // Single-PK table
         _db.ExecuteNonQueryAsync(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null)
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         // Composite-PK table
         _db.ExecuteNonQueryAsync(
-            "CREATE TABLE t2 (a INTEGER, b INTEGER, val INTEGER, PRIMARY KEY (a, b))", null)
+            "CREATE TABLE t2 (a INTEGER, b INTEGER, val INTEGER, PRIMARY KEY (a, b))", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         var tx = _store.BeginReadWrite();
@@ -1383,7 +1383,7 @@ public class OrderByBenchmarks
     [Benchmark(Description = "ORDER BY pk ASC (sort elided)")]
     public async Task<int> OrderBy_PkAsc()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY id ASC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY id ASC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1393,7 +1393,7 @@ public class OrderByBenchmarks
     [Benchmark(Description = "ORDER BY composite pk ASC (sort elided)")]
     public async Task<int> OrderBy_CompositePkAsc()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t2 ORDER BY a ASC, b ASC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t2 ORDER BY a ASC, b ASC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1405,7 +1405,7 @@ public class OrderByBenchmarks
     [Benchmark(Description = "ORDER BY pk prefix + non-pk (partial match, sort)")]
     public async Task<int> OrderBy_PartialPk()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t2 ORDER BY a ASC, val ASC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t2 ORDER BY a ASC, val ASC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1417,7 +1417,7 @@ public class OrderByBenchmarks
     [Benchmark(Description = "ORDER BY non-pk col (full sort)")]
     public async Task<int> OrderBy_NonPk()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1427,7 +1427,7 @@ public class OrderByBenchmarks
     [Benchmark(Description = "ORDER BY pk DESC (direction mismatch, sort)")]
     public async Task<int> OrderBy_PkDesc()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY id DESC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY id DESC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1521,7 +1521,7 @@ public class LimitBenchmarks
         _db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
         _db.ExecuteNonQueryAsync(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null)
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)", null, null)
             .AsTask().GetAwaiter().GetResult();
 
         var tx = _store.BeginReadWrite();
@@ -1590,7 +1590,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "SELECT * LIMIT 10")]
     public async Task<int> Scan_Limit10()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 10", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 10", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1600,7 +1600,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "SELECT * LIMIT 100")]
     public async Task<int> Scan_Limit100()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 100", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 100", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1610,7 +1610,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "SELECT * LIMIT 10 OFFSET 500")]
     public async Task<int> Scan_Limit10_Offset500()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 10 OFFSET 500", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t LIMIT 10 OFFSET 500", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1622,7 +1622,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "ORDER BY score LIMIT 10 (TopN)")]
     public async Task<int> OrderBy_Limit10()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 10", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 10", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1632,7 +1632,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "ORDER BY score LIMIT 100 (TopN)")]
     public async Task<int> OrderBy_Limit100()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 100", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 100", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1642,7 +1642,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "ORDER BY score (no limit, full sort)")]
     public async Task<int> OrderBy_NoLimit()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1652,7 +1652,7 @@ public class LimitBenchmarks
     [Benchmark(Description = "ORDER BY score LIMIT 10 OFFSET 50 (TopN)")]
     public async Task<int> OrderBy_Limit10_Offset50()
     {
-        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 10 OFFSET 50", null);
+        var reader = await _db.ExecuteReaderAsync("SELECT * FROM t ORDER BY score ASC LIMIT 10 OFFSET 50", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1781,8 +1781,8 @@ public class QueryCacheBenchmarks
         _dbCached.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
 
         const string ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER, name TEXT)";
-        _dbNoCache.ExecuteNonQueryAsync(ddl, null).AsTask().GetAwaiter().GetResult();
-        _dbCached.ExecuteNonQueryAsync(ddl, null).AsTask().GetAwaiter().GetResult();
+        _dbNoCache.ExecuteNonQueryAsync(ddl, null, null).AsTask().GetAwaiter().GetResult();
+        _dbCached.ExecuteNonQueryAsync(ddl, null, null).AsTask().GetAwaiter().GetResult();
 
         SeedData(_storeNoCache, _dbNoCache);
         SeedData(_storeCached, _dbCached);
@@ -1814,7 +1814,7 @@ public class QueryCacheBenchmarks
 
     private static void DrainQuery(Database db, string sql)
     {
-        var reader = db.ExecuteReaderAsync(sql, null).AsTask().GetAwaiter().GetResult();
+        var reader = db.ExecuteReaderAsync(sql, null, null).AsTask().GetAwaiter().GetResult();
         while (reader.ReadAsync().GetAwaiter().GetResult()) { }
         reader.CloseAsync().GetAwaiter().GetResult();
     }
@@ -1833,7 +1833,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Baseline = true, Description = "No cache: SELECT *")]
     public async Task<int> NoCache_Scan()
     {
-        var reader = await _dbNoCache.ExecuteReaderAsync(ScanQuery, null);
+        var reader = await _dbNoCache.ExecuteReaderAsync(ScanQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1843,7 +1843,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Description = "No cache: SELECT .. WHERE")]
     public async Task<int> NoCache_Filter()
     {
-        var reader = await _dbNoCache.ExecuteReaderAsync(FilterQuery, null);
+        var reader = await _dbNoCache.ExecuteReaderAsync(FilterQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1853,7 +1853,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Description = "No cache: ORDER BY .. LIMIT")]
     public async Task<int> NoCache_SortLimit()
     {
-        var reader = await _dbNoCache.ExecuteReaderAsync(SortLimitQuery, null);
+        var reader = await _dbNoCache.ExecuteReaderAsync(SortLimitQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1865,7 +1865,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Description = "Cached: SELECT *")]
     public async Task<int> Cached_Scan()
     {
-        var reader = await _dbCached.ExecuteReaderAsync(ScanQuery, null);
+        var reader = await _dbCached.ExecuteReaderAsync(ScanQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1875,7 +1875,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Description = "Cached: SELECT .. WHERE")]
     public async Task<int> Cached_Filter()
     {
-        var reader = await _dbCached.ExecuteReaderAsync(FilterQuery, null);
+        var reader = await _dbCached.ExecuteReaderAsync(FilterQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
@@ -1885,7 +1885,7 @@ public class QueryCacheBenchmarks
     [Benchmark(Description = "Cached: ORDER BY .. LIMIT")]
     public async Task<int> Cached_SortLimit()
     {
-        var reader = await _dbCached.ExecuteReaderAsync(SortLimitQuery, null);
+        var reader = await _dbCached.ExecuteReaderAsync(SortLimitQuery, null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();

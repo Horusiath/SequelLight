@@ -6,8 +6,9 @@ using SequelLight.Storage;
 namespace SequelLight.Queries;
 
 /// <summary>
-/// Cached result of query compilation: the optimized logical plan plus evaluated
-/// ORDER BY / LIMIT / OFFSET metadata. Transaction-independent and immutable.
+/// Cached result of query compilation: the optimized logical plan with
+/// <see cref="BindParameterExpr"/> resolved to <see cref="ResolvedParameterExpr"/> ordinals.
+/// Parameter values are supplied as a <c>DbValue[]</c> at execution time.
 /// </summary>
 internal sealed class CompiledQuery
 {
@@ -15,16 +16,24 @@ internal sealed class CompiledQuery
     public readonly OrderingTerm[]? OrderBy;
     public readonly long? Limit;
     public readonly long? Offset;
+    public readonly SqlExpr? LimitExpr;
+    public readonly SqlExpr? OffsetExpr;
+    public readonly string[] ParameterNames;
     private long _executionCount;
 
     public long ExecutionCount => Volatile.Read(ref _executionCount);
 
-    public CompiledQuery(LogicalPlan plan, OrderingTerm[]? orderBy, long? limit, long? offset)
+    public CompiledQuery(LogicalPlan plan, OrderingTerm[]? orderBy,
+        long? limit, long? offset, SqlExpr? limitExpr, SqlExpr? offsetExpr,
+        string[] parameterNames)
     {
         Plan = plan;
         OrderBy = orderBy;
         Limit = limit;
         Offset = offset;
+        LimitExpr = limitExpr;
+        OffsetExpr = offsetExpr;
+        ParameterNames = parameterNames;
     }
 
     internal void IncrementExecutionCount() => Interlocked.Increment(ref _executionCount);
@@ -36,10 +45,13 @@ internal sealed class CompiledQuery
 public sealed class QueryPlanner
 {
     private readonly DatabaseSchema _schema;
+    private readonly IReadOnlyDictionary<string, DbValue>? _parameters;
+    private DbValue[]? _parameterValues;
 
-    public QueryPlanner(DatabaseSchema schema)
+    public QueryPlanner(DatabaseSchema schema, IReadOnlyDictionary<string, DbValue>? parameters = null)
     {
         _schema = schema;
+        _parameters = parameters;
     }
 
     /// <summary>
@@ -61,14 +73,15 @@ public sealed class QueryPlanner
 
         return stmt.First switch
         {
-            ValuesBody values => WrapWithLimit(new ValuesEnumerator(values.Rows), limit, offset),
+            ValuesBody values => WrapWithLimit(new ValuesEnumerator(ResolveValuesParams(values.Rows)), limit, offset),
             _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
         };
     }
 
     /// <summary>
     /// Compiles a SELECT statement into a cacheable <see cref="CompiledQuery"/>.
-    /// Returns null for non-cacheable queries (ValuesBody).
+    /// <see cref="BindParameterExpr"/> nodes are replaced with <see cref="ResolvedParameterExpr"/>
+    /// ordinals so parameter values can be provided as a flat array at execution time.
     /// </summary>
     internal CompiledQuery? Compile(SelectStmt stmt)
     {
@@ -78,14 +91,42 @@ public sealed class QueryPlanner
         if (stmt.First is not SelectCore core)
             return null;
 
-        long? limit = EvaluateLimitOffset(stmt.Limit);
-        long? offset = EvaluateLimitOffset(stmt.Offset);
-        NormalizeLimitOffset(ref limit, ref offset);
-
         var logical = BuildLogicalPlan(core);
         logical = HeuristicOptimizer.Optimize(logical);
 
-        return new CompiledQuery(logical, stmt.OrderBy, limit, offset);
+        // Resolve BindParameterExpr → ResolvedParameterExpr, collecting the name→ordinal mapping
+        var paramMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        logical = ResolveParameterOrdinals(logical, paramMap);
+
+        // Also resolve parameters in ORDER BY and LIMIT/OFFSET expressions
+        var orderBy = stmt.OrderBy;
+        if (orderBy is { Length: > 0 })
+        {
+            var resolved = new OrderingTerm[orderBy.Length];
+            for (int i = 0; i < orderBy.Length; i++)
+                resolved[i] = orderBy[i] with { Expression = ResolveParamExpr(orderBy[i].Expression, paramMap) };
+            orderBy = resolved;
+        }
+
+        var limitExpr = ResolveParamExpr(stmt.Limit, paramMap);
+        var offsetExpr = ResolveParamExpr(stmt.Offset, paramMap);
+
+        bool limitHasParam = limitExpr is not null && ContainsResolvedParameter(limitExpr);
+        bool offsetHasParam = offsetExpr is not null && ContainsResolvedParameter(offsetExpr);
+
+        long? limit = limitHasParam ? null : EvaluateLimitOffset(limitExpr);
+        long? offset = offsetHasParam ? null : EvaluateLimitOffset(offsetExpr);
+        NormalizeLimitOffset(ref limit, ref offset);
+
+        // Build parameter name array ordered by ordinal
+        var names = new string[paramMap.Count];
+        foreach (var kvp in paramMap)
+            names[kvp.Value] = kvp.Key;
+
+        return new CompiledQuery(logical, orderBy, limit, offset,
+            limitHasParam ? limitExpr : null,
+            offsetHasParam ? offsetExpr : null,
+            names);
     }
 
     /// <summary>
@@ -94,7 +135,31 @@ public sealed class QueryPlanner
     internal IDbEnumerator Execute(CompiledQuery compiled, ReadOnlyTransaction tx)
     {
         compiled.IncrementExecutionCount();
-        return BuildFromCompiled(compiled.Plan, compiled.OrderBy, compiled.Limit, compiled.Offset, tx);
+
+        // Build parameter value array from the dictionary using compiled ordinal mapping
+        _parameterValues = BuildParameterValues(compiled.ParameterNames, _parameters);
+
+        // Resolve parameterized LIMIT/OFFSET at execution time
+        long? limit = compiled.Limit ?? EvaluateResolvedLimitOffset(compiled.LimitExpr);
+        long? offset = compiled.Offset ?? EvaluateResolvedLimitOffset(compiled.OffsetExpr);
+        NormalizeLimitOffset(ref limit, ref offset);
+
+        return BuildFromCompiled(compiled.Plan, compiled.OrderBy, limit, offset, tx);
+    }
+
+    private static DbValue[]? BuildParameterValues(string[] names, IReadOnlyDictionary<string, DbValue>? parameters)
+    {
+        if (names.Length == 0) return null;
+        if (parameters is null)
+            throw new InvalidOperationException("Query contains parameters but none were provided.");
+
+        var values = new DbValue[names.Length];
+        for (int i = 0; i < names.Length; i++)
+        {
+            if (!parameters.TryGetValue(names[i], out values[i]))
+                throw new InvalidOperationException($"Parameter '{names[i]}' not found.");
+        }
+        return values;
     }
 
     private static long? EvaluateLimitOffset(SqlExpr? expr)
@@ -102,6 +167,163 @@ public sealed class QueryPlanner
         if (expr is null) return null;
         var value = ExprEvaluator.Evaluate(expr, Array.Empty<DbValue>(), new Projection(Array.Empty<QualifiedName>()));
         return value.IsNull ? null : value.AsInteger();
+    }
+
+    private long? EvaluateResolvedLimitOffset(SqlExpr? expr)
+    {
+        if (expr is null) return null;
+        // ResolvedParameterExpr nodes are resolved to literals via ResolveColumns
+        var resolved = ResolveColumns(expr, new Projection(Array.Empty<QualifiedName>()));
+        var value = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), new Projection(Array.Empty<QualifiedName>()));
+        return value.IsNull ? null : value.AsInteger();
+    }
+
+    private SqlExpr[][] ResolveValuesParams(SqlExpr[][] rows)
+    {
+        if (_parameters is null) return rows;
+        var emptyProjection = new Projection(Array.Empty<QualifiedName>());
+        // For one-shot VALUES path, resolve BindParameterExpr directly via dictionary
+        var result = new SqlExpr[rows.Length][];
+        for (int r = 0; r < rows.Length; r++)
+        {
+            result[r] = new SqlExpr[rows[r].Length];
+            for (int c = 0; c < rows[r].Length; c++)
+                result[r][c] = ResolveBindParametersFromDict(rows[r][c]);
+        }
+        return result;
+    }
+
+    private SqlExpr ResolveBindParametersFromDict(SqlExpr expr)
+    {
+        return expr switch
+        {
+            BindParameterExpr bind => new ResolvedLiteralExpr(LookupParameterByName(bind.Name)),
+            BinaryExpr b => b with { Left = ResolveBindParametersFromDict(b.Left), Right = ResolveBindParametersFromDict(b.Right) },
+            UnaryExpr u => u with { Operand = ResolveBindParametersFromDict(u.Operand) },
+            CastExpr c => c with { Operand = ResolveBindParametersFromDict(c.Operand) },
+            _ => expr,
+        };
+    }
+
+    private DbValue LookupParameterByName(string name)
+    {
+        if (_parameters is null)
+            throw new InvalidOperationException($"Parameter '{name}' referenced but no parameters were provided.");
+        var normalized = NormalizeParameterName(name);
+        if (normalized.Length > 0 && _parameters.TryGetValue(normalized, out var value))
+            return value;
+        throw new InvalidOperationException($"Parameter '{name}' not found.");
+    }
+
+    /// <summary>
+    /// Walks a logical plan and replaces <see cref="BindParameterExpr"/> with
+    /// <see cref="ResolvedParameterExpr"/> ordinals, building the name→ordinal mapping.
+    /// </summary>
+    private static LogicalPlan ResolveParameterOrdinals(LogicalPlan plan, Dictionary<string, int> paramMap)
+    {
+        switch (plan)
+        {
+            case FilterPlan filter:
+            {
+                var predicate = ResolveParamExpr(filter.Predicate, paramMap);
+                var source = ResolveParameterOrdinals(filter.Source, paramMap);
+                return ReferenceEquals(predicate, filter.Predicate) && ReferenceEquals(source, filter.Source)
+                    ? plan : new FilterPlan(predicate, source);
+            }
+            case ProjectPlan project:
+            {
+                var source = ResolveParameterOrdinals(project.Source, paramMap);
+                var columns = ResolveParamColumns(project.Columns, paramMap);
+                return ReferenceEquals(source, project.Source) && ReferenceEquals(columns, project.Columns)
+                    ? plan : new ProjectPlan(columns, source);
+            }
+            case JoinPlan join:
+            {
+                var left = ResolveParameterOrdinals(join.Left, paramMap);
+                var right = ResolveParameterOrdinals(join.Right, paramMap);
+                var condition = join.Condition is not null ? ResolveParamExpr(join.Condition, paramMap) : null;
+                return ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right) && ReferenceEquals(condition, join.Condition)
+                    ? plan : new JoinPlan(left, right, join.Kind, condition);
+            }
+            case LimitPlan limit:
+            {
+                var source = ResolveParameterOrdinals(limit.Source, paramMap);
+                return ReferenceEquals(source, limit.Source) ? plan : new LimitPlan(limit.Limit, limit.Offset, source);
+            }
+            default:
+                return plan; // ScanPlan, DualPlan — no expressions
+        }
+    }
+
+    private static ResultColumn[] ResolveParamColumns(ResultColumn[] columns, Dictionary<string, int> paramMap)
+    {
+        ResultColumn[]? result = null;
+        for (int i = 0; i < columns.Length; i++)
+        {
+            if (columns[i] is ExprResultColumn erc)
+            {
+                var resolved = ResolveParamExpr(erc.Expression, paramMap);
+                if (!ReferenceEquals(resolved, erc.Expression))
+                {
+                    result ??= (ResultColumn[])columns.Clone();
+                    result[i] = new ExprResultColumn(resolved, erc.Alias);
+                }
+            }
+        }
+        return result ?? columns;
+    }
+
+    private static SqlExpr? ResolveParamExpr(SqlExpr? expr, Dictionary<string, int> paramMap)
+    {
+        if (expr is null) return null;
+        return expr switch
+        {
+            BindParameterExpr bind => new ResolvedParameterExpr(GetOrAddParamOrdinal(bind.Name, paramMap)),
+            ResolvedParameterExpr => expr,
+            BinaryExpr b => b with { Left = ResolveParamExpr(b.Left, paramMap)!, Right = ResolveParamExpr(b.Right, paramMap)! },
+            UnaryExpr u => u with { Operand = ResolveParamExpr(u.Operand, paramMap)! },
+            IsExpr i => i with { Left = ResolveParamExpr(i.Left, paramMap)!, Right = ResolveParamExpr(i.Right, paramMap)! },
+            NullTestExpr n => n with { Operand = ResolveParamExpr(n.Operand, paramMap)! },
+            BetweenExpr bt => bt with
+            {
+                Operand = ResolveParamExpr(bt.Operand, paramMap)!,
+                Low = ResolveParamExpr(bt.Low, paramMap)!,
+                High = ResolveParamExpr(bt.High, paramMap)!,
+            },
+            CastExpr c => c with { Operand = ResolveParamExpr(c.Operand, paramMap)! },
+            _ => expr,
+        };
+    }
+
+    private static int GetOrAddParamOrdinal(string name, Dictionary<string, int> paramMap)
+    {
+        var normalized = NormalizeParameterName(name);
+        if (!paramMap.TryGetValue(normalized, out int ordinal))
+        {
+            ordinal = paramMap.Count;
+            paramMap[normalized] = ordinal;
+        }
+        return ordinal;
+    }
+
+    internal static string NormalizeParameterName(string name)
+    {
+        if (name.Length > 0 && name[0] is '?' or '@' or ':' or '$')
+            return name[1..];
+        return name;
+    }
+
+    private static bool ContainsResolvedParameter(SqlExpr? expr)
+    {
+        return expr switch
+        {
+            null => false,
+            ResolvedParameterExpr => true,
+            BinaryExpr b => ContainsResolvedParameter(b.Left) || ContainsResolvedParameter(b.Right),
+            UnaryExpr u => ContainsResolvedParameter(u.Operand),
+            CastExpr c => ContainsResolvedParameter(c.Operand),
+            _ => false,
+        };
     }
 
     private static void NormalizeLimitOffset(ref long? limit, ref long? offset)
@@ -437,12 +659,14 @@ public sealed class QueryPlanner
     /// <see cref="ResolvedLiteralExpr"/> (pre-parsed DbValue).
     /// Eliminates per-row dictionary lookups, string allocations, and numeric parsing.
     /// </summary>
-    internal static SqlExpr ResolveColumns(SqlExpr expr, Projection projection)
+    internal SqlExpr ResolveColumns(SqlExpr expr, Projection projection)
     {
         return expr switch
         {
             ColumnRefExpr col => ResolveColumnRef(col, projection),
             LiteralExpr lit => new ResolvedLiteralExpr(ExprEvaluator.EvaluateLiteral(lit)),
+            ResolvedParameterExpr p => new ResolvedLiteralExpr(
+                _parameterValues?[p.Ordinal] ?? throw new InvalidOperationException("No parameter values provided.")),
             ResolvedColumnExpr => expr,
             ResolvedLiteralExpr => expr,
             UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection) },
@@ -505,7 +729,7 @@ public sealed class QueryPlanner
         return true;
     }
 
-    private static Selector[] ResolveSelectors(ResultColumn[] columns, Projection sourceProjection)
+    private Selector[] ResolveSelectors(ResultColumn[] columns, Projection sourceProjection)
     {
         // Pre-count output columns to allocate exact array
         int count = 0;
@@ -690,7 +914,7 @@ public sealed class QueryPlanner
         return satisfied;
     }
 
-    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0)
+    private SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0)
     {
         var ordinals = new int[orderBy.Length];
         var orders = new SortOrder[orderBy.Length];
@@ -713,7 +937,7 @@ public sealed class QueryPlanner
         return new SortEnumerator(source, ordinals, orders, maxRows);
     }
 
-    private static Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)
+    private Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)
     {
         // Optimize simple column references
         if (exprCol.Expression is ColumnRefExpr colRef)

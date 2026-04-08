@@ -37,14 +37,14 @@ public sealed class Database : IAsyncDisposable
     public ReadOnlyTransaction BeginReadOnly() => _store.BeginReadOnly();
     public ReadWriteTransaction BeginReadWrite() => _store.BeginReadWrite();
 
-    internal async ValueTask<int> ExecuteNonQueryAsync(string sql, ReadOnlyTransaction? transaction)
+    internal async ValueTask<int> ExecuteNonQueryAsync(string sql, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
         var stmt = SqlParser.Parse(sql);
         return stmt switch
         {
             CreateTableStmt or CreateIndexStmt or CreateViewStmt or CreateTriggerStmt
                 or DropStmt or AlterTableStmt => await ExecuteDdlAsync(stmt, transaction).ConfigureAwait(false),
-            InsertStmt insert => await ExecuteInsertAsync(insert, transaction).ConfigureAwait(false),
+            InsertStmt insert => await ExecuteInsertAsync(insert, parameters, transaction).ConfigureAwait(false),
             _ => throw new NotImplementedException()
         };
     }
@@ -176,7 +176,7 @@ public sealed class Database : IAsyncDisposable
             rootTable.Columns[0].SetAutoIncrement((long)entries[^1].Oid.Value);
     }
 
-    private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, ReadOnlyTransaction? transaction)
+    private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
         var table = Schema.GetTable(stmt.Table)
             ?? throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
@@ -219,7 +219,7 @@ public sealed class Database : IAsyncDisposable
 
         async ValueTask InsertRows(ReadWriteTransaction rw)
         {
-            var planner = new QueryPlanner(Schema);
+            var planner = new QueryPlanner(Schema, parameters);
             await using var source = planner.Plan(selectSource.Query, rw);
 
             // Validate column count up front
@@ -351,20 +351,21 @@ public sealed class Database : IAsyncDisposable
         };
     }
 
-    internal async ValueTask<object?> ExecuteScalarAsync(string sql, ReadOnlyTransaction? transaction)
+    internal async ValueTask<object?> ExecuteScalarAsync(string sql, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
         var stmt = SqlParser.Parse(sql);
         // TODO: execute statement, return first column of first row
         throw new NotImplementedException();
     }
 
-    internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql, ReadOnlyTransaction? transaction)
+    internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql,
+        IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
         // If no explicit transaction, create a read-only one (owned by the reader)
         var tx = transaction ?? _store.BeginReadOnly();
         bool ownsTx = transaction is null;
 
-        var planner = new QueryPlanner(Schema);
+        var planner = new QueryPlanner(Schema, parameters);
         IDbEnumerator enumerator;
 
         if (_queryCache.TryGet(sql, out var compiled))

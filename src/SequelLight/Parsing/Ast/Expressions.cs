@@ -37,6 +37,9 @@ public sealed record ResolvedColumnExpr(int Ordinal) : SqlExpr;
 /// <summary>Literal pre-evaluated to a DbValue at plan time. Eliminates per-row parsing.</summary>
 public sealed record ResolvedLiteralExpr(Data.DbValue Value) : SqlExpr;
 
+/// <summary>Bind parameter pre-resolved to an ordinal index at compile time. Eliminates per-execution dictionary lookups.</summary>
+public sealed record ResolvedParameterExpr(int Ordinal) : SqlExpr;
+
 public enum UnaryOp { Plus, Minus, BitwiseNot, Not }
 
 public sealed record UnaryExpr(UnaryOp Op, SqlExpr Operand) : SqlExpr;
