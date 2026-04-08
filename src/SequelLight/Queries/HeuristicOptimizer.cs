@@ -53,7 +53,9 @@ public static class HeuristicOptimizer
             case LimitPlan limit:
             {
                 var source = FoldConstantsInPlan(limit.Source);
-                return new LimitPlan(limit.Limit, limit.Offset, source);
+                var limitExpr = FoldConstants(limit.Limit);
+                var offsetExpr = FoldConstants(limit.Offset);
+                return new LimitPlan(limitExpr, offsetExpr, source);
             }
             default:
                 return plan;

@@ -14,25 +14,15 @@ internal sealed class CompiledQuery
 {
     public readonly LogicalPlan Plan;
     public readonly OrderingTerm[]? OrderBy;
-    public readonly long? Limit;
-    public readonly long? Offset;
-    public readonly SqlExpr? LimitExpr;
-    public readonly SqlExpr? OffsetExpr;
     public readonly string[] ParameterNames;
     private long _executionCount;
 
     public long ExecutionCount => Volatile.Read(ref _executionCount);
 
-    public CompiledQuery(LogicalPlan plan, OrderingTerm[]? orderBy,
-        long? limit, long? offset, SqlExpr? limitExpr, SqlExpr? offsetExpr,
-        string[] parameterNames)
+    public CompiledQuery(LogicalPlan plan, OrderingTerm[]? orderBy, string[] parameterNames)
     {
         Plan = plan;
         OrderBy = orderBy;
-        Limit = limit;
-        Offset = offset;
-        LimitExpr = limitExpr;
-        OffsetExpr = offsetExpr;
         ParameterNames = parameterNames;
     }
 
@@ -67,15 +57,27 @@ public sealed class QueryPlanner
             return Execute(compiled, tx);
 
         // ValuesBody — not compilable, execute directly
-        long? limit = EvaluateLimitOffset(stmt.Limit);
-        long? offset = EvaluateLimitOffset(stmt.Offset);
-        NormalizeLimitOffset(ref limit, ref offset);
+        if (stmt.First is not ValuesBody values)
+            throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}");
 
-        return stmt.First switch
+        IDbEnumerator result = new ValuesEnumerator(ResolveValuesParams(values.Rows));
+        if (stmt.Limit is not null || stmt.Offset is not null)
         {
-            ValuesBody values => WrapWithLimit(new ValuesEnumerator(ResolveValuesParams(values.Rows)), limit, offset),
-            _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
-        };
+            // Resolve any bind parameters in LIMIT/OFFSET via dictionary for one-shot path
+            var limitExpr = stmt.Limit is not null ? ResolveBindParametersFromDict(stmt.Limit) : null;
+            var offsetExpr = stmt.Offset is not null ? ResolveBindParametersFromDict(stmt.Offset) : null;
+            var emptyProjection = new Projection(Array.Empty<QualifiedName>());
+            var emptyRow = Array.Empty<DbValue>();
+            long limit = limitExpr is not null
+                ? ExprEvaluator.Evaluate(limitExpr, emptyRow, emptyProjection).AsInteger()
+                : long.MaxValue;
+            long offset = offsetExpr is not null
+                ? ExprEvaluator.Evaluate(offsetExpr, emptyRow, emptyProjection).AsInteger()
+                : 0;
+            if (limit >= 0 && (limit < long.MaxValue || offset > 0))
+                result = new LimitEnumerator(result, limit, Math.Max(0, offset));
+        }
+        return result;
     }
 
     /// <summary>
@@ -92,13 +94,22 @@ public sealed class QueryPlanner
             return null;
 
         var logical = BuildLogicalPlan(core);
+
+        // Wrap with LimitPlan if LIMIT/OFFSET are present
+        if (stmt.Limit is not null || stmt.Offset is not null)
+        {
+            var limitExpr = stmt.Limit ?? new ResolvedLiteralExpr(DbValue.Integer(long.MaxValue));
+            var offsetExpr = stmt.Offset ?? new ResolvedLiteralExpr(DbValue.Integer(0));
+            logical = new LimitPlan(limitExpr, offsetExpr, logical);
+        }
+
         logical = HeuristicOptimizer.Optimize(logical);
 
         // Resolve BindParameterExpr → ResolvedParameterExpr, collecting the name→ordinal mapping
         var paramMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         logical = ResolveParameterOrdinals(logical, paramMap);
 
-        // Also resolve parameters in ORDER BY and LIMIT/OFFSET expressions
+        // Also resolve parameters in ORDER BY expressions
         var orderBy = stmt.OrderBy;
         if (orderBy is { Length: > 0 })
         {
@@ -108,25 +119,12 @@ public sealed class QueryPlanner
             orderBy = resolved;
         }
 
-        var limitExpr = ResolveParamExpr(stmt.Limit, paramMap);
-        var offsetExpr = ResolveParamExpr(stmt.Offset, paramMap);
-
-        bool limitHasParam = limitExpr is not null && ContainsResolvedParameter(limitExpr);
-        bool offsetHasParam = offsetExpr is not null && ContainsResolvedParameter(offsetExpr);
-
-        long? limit = limitHasParam ? null : EvaluateLimitOffset(limitExpr);
-        long? offset = offsetHasParam ? null : EvaluateLimitOffset(offsetExpr);
-        NormalizeLimitOffset(ref limit, ref offset);
-
         // Build parameter name array ordered by ordinal
         var names = new string[paramMap.Count];
         foreach (var kvp in paramMap)
             names[kvp.Value] = kvp.Key;
 
-        return new CompiledQuery(logical, orderBy, limit, offset,
-            limitHasParam ? limitExpr : null,
-            offsetHasParam ? offsetExpr : null,
-            names);
+        return new CompiledQuery(logical, orderBy, names);
     }
 
     /// <summary>
@@ -135,16 +133,8 @@ public sealed class QueryPlanner
     internal IDbEnumerator Execute(CompiledQuery compiled, ReadOnlyTransaction tx)
     {
         compiled.IncrementExecutionCount();
-
-        // Build parameter value array from the dictionary using compiled ordinal mapping
         _parameterValues = BuildParameterValues(compiled.ParameterNames, _parameters);
-
-        // Resolve parameterized LIMIT/OFFSET at execution time
-        long? limit = compiled.Limit ?? EvaluateResolvedLimitOffset(compiled.LimitExpr);
-        long? offset = compiled.Offset ?? EvaluateResolvedLimitOffset(compiled.OffsetExpr);
-        NormalizeLimitOffset(ref limit, ref offset);
-
-        return BuildFromCompiled(compiled.Plan, compiled.OrderBy, limit, offset, tx);
+        return BuildFromCompiled(compiled.Plan, compiled.OrderBy, tx);
     }
 
     private static DbValue[]? BuildParameterValues(string[] names, IReadOnlyDictionary<string, DbValue>? parameters)
@@ -162,20 +152,15 @@ public sealed class QueryPlanner
         return values;
     }
 
-    private static long? EvaluateLimitOffset(SqlExpr? expr)
+    /// <summary>
+    /// Evaluates a LIMIT/OFFSET expression (which may contain <see cref="ResolvedParameterExpr"/>)
+    /// to a long value. Called during physical plan building when parameters are already bound.
+    /// </summary>
+    private long EvaluateLimitExpr(SqlExpr expr)
     {
-        if (expr is null) return null;
-        var value = ExprEvaluator.Evaluate(expr, Array.Empty<DbValue>(), new Projection(Array.Empty<QualifiedName>()));
-        return value.IsNull ? null : value.AsInteger();
-    }
-
-    private long? EvaluateResolvedLimitOffset(SqlExpr? expr)
-    {
-        if (expr is null) return null;
-        // ResolvedParameterExpr nodes are resolved to literals via ResolveColumns
         var resolved = ResolveColumns(expr, new Projection(Array.Empty<QualifiedName>()));
         var value = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), new Projection(Array.Empty<QualifiedName>()));
-        return value.IsNull ? null : value.AsInteger();
+        return value.IsNull ? long.MaxValue : value.AsInteger();
     }
 
     private SqlExpr[][] ResolveValuesParams(SqlExpr[][] rows)
@@ -248,7 +233,10 @@ public sealed class QueryPlanner
             case LimitPlan limit:
             {
                 var source = ResolveParameterOrdinals(limit.Source, paramMap);
-                return ReferenceEquals(source, limit.Source) ? plan : new LimitPlan(limit.Limit, limit.Offset, source);
+                var limitExpr = ResolveParamExpr(limit.Limit, paramMap)!;
+                var offsetExpr = ResolveParamExpr(limit.Offset, paramMap)!;
+                return ReferenceEquals(source, limit.Source) && ReferenceEquals(limitExpr, limit.Limit) && ReferenceEquals(offsetExpr, limit.Offset)
+                    ? plan : new LimitPlan(limitExpr, offsetExpr, source);
             }
             default:
                 return plan; // ScanPlan, DualPlan — no expressions
@@ -313,41 +301,31 @@ public sealed class QueryPlanner
         return name;
     }
 
-    private static bool ContainsResolvedParameter(SqlExpr? expr)
-    {
-        return expr switch
-        {
-            null => false,
-            ResolvedParameterExpr => true,
-            BinaryExpr b => ContainsResolvedParameter(b.Left) || ContainsResolvedParameter(b.Right),
-            UnaryExpr u => ContainsResolvedParameter(u.Operand),
-            CastExpr c => ContainsResolvedParameter(c.Operand),
-            _ => false,
-        };
-    }
-
-    private static void NormalizeLimitOffset(ref long? limit, ref long? offset)
-    {
-        if (limit < 0) limit = null;
-        if (offset is null or <= 0) offset = null;
-    }
-
-    private static IDbEnumerator WrapWithLimit(IDbEnumerator source, long? limit, long? offset)
-    {
-        if (limit is null && offset is null) return source;
-        return new LimitEnumerator(source, limit ?? long.MaxValue, offset ?? 0);
-    }
 
     private IDbEnumerator BuildFromCompiled(LogicalPlan logical, OrderingTerm[]? orderBy,
-        long? limit, long? offset, ReadOnlyTransaction tx)
+        ReadOnlyTransaction tx)
     {
+        // Peel off top-level LimitPlan if present
+        LimitPlan? limitPlan = null;
+        if (logical is LimitPlan lp)
+        {
+            limitPlan = lp;
+            logical = lp.Source;
+        }
+
         // No ORDER BY — use the existing fast path
         if (orderBy is not { Length: > 0 })
-            return WrapWithLimit(BuildPhysical(logical, tx), limit, offset);
+        {
+            var result = BuildPhysical(logical, tx);
+            return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
+        }
 
         // Peel off the top-level ProjectPlan (always present from BuildLogicalPlan)
         if (logical is not ProjectPlan topProject)
-            return WrapWithLimit(BuildPhysical(logical, tx), limit, offset);
+        {
+            var result = BuildPhysical(logical, tx);
+            return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
+        }
 
         // Build physical plan for the pre-projection source, tracking sort order
         var (source, providedOrder) = BuildPhysicalWithOrder(topProject.Source, tx);
@@ -358,19 +336,37 @@ public sealed class QueryPlanner
         // Insert sort if not fully satisfied — use TopN when LIMIT is present
         if (nOBSat < orderBy.Length)
         {
-            long maxRows = (limit is not null && offset is not null)
-                ? limit.Value + offset.Value
-                : limit ?? 0;
-            source = BuildSortEnumerator(source, orderBy, maxRows > 0 ? maxRows : 0);
+            long maxRows = 0;
+            if (limitPlan is not null)
+                maxRows = EvaluateLimitForTopN(limitPlan);
+            source = BuildSortEnumerator(source, orderBy, maxRows);
         }
 
         // Apply the final projection
         var selectors = ResolveSelectors(topProject.Columns, source.Projection);
-        IDbEnumerator result = IsIdentityProjection(selectors, source.Projection)
+        IDbEnumerator physicalResult = IsIdentityProjection(selectors, source.Projection)
             ? source
             : new Select(source, selectors);
 
-        return WrapWithLimit(result, limit, offset);
+        return limitPlan is not null ? BuildLimitEnumerator(limitPlan, physicalResult) : physicalResult;
+    }
+
+    private LimitEnumerator BuildLimitEnumerator(LimitPlan plan, IDbEnumerator source)
+    {
+        long limit = EvaluateLimitExpr(plan.Limit);
+        long offset = EvaluateLimitExpr(plan.Offset);
+        if (limit < 0) limit = long.MaxValue;
+        if (offset < 0) offset = 0;
+        return new LimitEnumerator(source, limit, offset);
+    }
+
+    private long EvaluateLimitForTopN(LimitPlan plan)
+    {
+        long limit = EvaluateLimitExpr(plan.Limit);
+        long offset = EvaluateLimitExpr(plan.Offset);
+        if (limit < 0) return 0;
+        if (offset <= 0) return limit;
+        return limit + offset;
     }
 
     private LogicalPlan BuildLogicalPlan(SelectCore core)
@@ -462,7 +458,7 @@ public sealed class QueryPlanner
             case LimitPlan limit:
             {
                 var child = BuildPhysical(limit.Source, tx);
-                return new LimitEnumerator(child, limit.Limit, limit.Offset);
+                return BuildLimitEnumerator(limit, child);
             }
 
             default:
@@ -824,7 +820,7 @@ public sealed class QueryPlanner
             case LimitPlan limit:
             {
                 var (child, childOrder) = BuildPhysicalWithOrder(limit.Source, tx);
-                return (new LimitEnumerator(child, limit.Limit, limit.Offset), childOrder);
+                return (BuildLimitEnumerator(limit, child), childOrder);
             }
 
             default:

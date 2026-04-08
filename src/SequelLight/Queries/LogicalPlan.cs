@@ -62,11 +62,11 @@ public sealed class JoinPlan : LogicalPlan
 
 public sealed class LimitPlan : LogicalPlan
 {
-    public long Limit { get; }
-    public long Offset { get; }
+    public SqlExpr Limit { get; }
+    public SqlExpr Offset { get; }
     public LogicalPlan Source { get; }
 
-    public LimitPlan(long limit, long offset, LogicalPlan source)
+    public LimitPlan(SqlExpr limit, SqlExpr offset, LogicalPlan source)
     {
         Limit = limit;
         Offset = offset;

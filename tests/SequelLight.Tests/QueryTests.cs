@@ -2690,3 +2690,126 @@ public class ParameterTests : TempDirTest
         Assert.Equal(110L, reader.GetInt64(0));
     }
 }
+
+public class NestedLimitTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    /// <summary>
+    /// Builds a CompiledQuery with nested LimitPlan nodes in the logical plan tree,
+    /// simulating a subquery with its own LIMIT inside an outer query with a different LIMIT.
+    /// The old flat CompiledQuery.Limit/Offset fields could only represent one level.
+    /// </summary>
+    [Fact]
+    public async Task NestedLimitPlan_InnerAndOuterLimitsApplied()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Insert 10 rows: id 1..10
+        cmd.CommandText = "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70),(8,80),(9,90),(10,100)";
+        await cmd.ExecuteNonQueryAsync();
+
+        var db = conn.Db!;
+        var table = db.Schema.GetTable("t")!;
+
+        // Build logical plan manually:
+        //   LimitPlan(limit=3, offset=0,            ← outer: take 3
+        //     ProjectPlan(*,
+        //       LimitPlan(limit=7, offset=2,          ← inner: skip 2, take 7 → rows 3..9
+        //         ScanPlan(t))))
+        //
+        // Expected: inner yields ids [3,4,5,6,7,8,9], outer takes first 3 → [3,4,5]
+
+        var scan = new ScanPlan(table, "t");
+        var innerLimit = new LimitPlan(
+            new ResolvedLiteralExpr(DbValue.Integer(7)),
+            new ResolvedLiteralExpr(DbValue.Integer(2)),
+            scan);
+        var project = new ProjectPlan(
+            new ResultColumn[] { new StarResultColumn() },
+            innerLimit);
+        var outerLimit = new LimitPlan(
+            new ResolvedLiteralExpr(DbValue.Integer(3)),
+            new ResolvedLiteralExpr(DbValue.Integer(0)),
+            project);
+
+        var compiled = new CompiledQuery(outerLimit, orderBy: null, parameterNames: []);
+        var planner = new QueryPlanner(db.Schema);
+
+        using var tx = db.BeginReadOnly();
+        await using var enumerator = planner.Execute(compiled, tx);
+
+        var ids = new List<long>();
+        while (await enumerator.NextAsync())
+            ids.Add(enumerator.Current[0].AsInteger());
+
+        Assert.Equal([3L, 4L, 5L], ids);
+    }
+
+    /// <summary>
+    /// Same structure but with parameterized limits at both levels,
+    /// proving each LimitPlan resolves its own parameter independently.
+    /// </summary>
+    [Fact]
+    public async Task NestedLimitPlan_ParameterizedAtBothLevels()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70),(8,80),(9,90),(10,100)";
+        await cmd.ExecuteNonQueryAsync();
+
+        var db = conn.Db!;
+        var table = db.Schema.GetTable("t")!;
+
+        // Build plan with ResolvedParameterExpr for both limit values:
+        //   LimitPlan(limit=param[1], offset=0,     ← outer: take param[1]=2
+        //     ProjectPlan(*,
+        //       LimitPlan(limit=param[0], offset=3,  ← inner: skip 3, take param[0]=5 → rows 4..8
+        //         ScanPlan(t))))
+        //
+        // Expected: inner yields [4,5,6,7,8], outer takes 2 → [4,5]
+
+        var scan = new ScanPlan(table, "t");
+        var innerLimit = new LimitPlan(
+            new ResolvedParameterExpr(0),              // param[0] = inner limit
+            new ResolvedLiteralExpr(DbValue.Integer(3)),
+            scan);
+        var project = new ProjectPlan(
+            new ResultColumn[] { new StarResultColumn() },
+            innerLimit);
+        var outerLimit = new LimitPlan(
+            new ResolvedParameterExpr(1),              // param[1] = outer limit
+            new ResolvedLiteralExpr(DbValue.Integer(0)),
+            project);
+
+        var compiled = new CompiledQuery(outerLimit, orderBy: null,
+            parameterNames: ["innerLimit", "outerLimit"]);
+
+        var parameters = new Dictionary<string, DbValue>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["innerLimit"] = DbValue.Integer(5),
+            ["outerLimit"] = DbValue.Integer(2),
+        };
+        var planner = new QueryPlanner(db.Schema, parameters);
+
+        using var tx = db.BeginReadOnly();
+        await using var enumerator = planner.Execute(compiled, tx);
+
+        var ids = new List<long>();
+        while (await enumerator.NextAsync())
+            ids.Add(enumerator.Current[0].AsInteger());
+
+        Assert.Equal([4L, 5L], ids);
+    }
+}
