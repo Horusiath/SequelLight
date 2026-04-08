@@ -256,6 +256,11 @@ public sealed class QueryPlanner
                 return ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right) && ReferenceEquals(condition, join.Condition)
                     ? plan : new JoinPlan(left, right, join.Kind, condition);
             }
+            case DistinctPlan distinct:
+            {
+                var source = ResolveParameterOrdinals(distinct.Source, paramMap);
+                return ReferenceEquals(source, distinct.Source) ? plan : new DistinctPlan(source);
+            }
             case AggregatePlan agg:
             {
                 var source = ResolveParameterOrdinals(agg.Source, paramMap);
@@ -361,10 +366,19 @@ public sealed class QueryPlanner
             logical = lp.Source;
         }
 
+        // Peel off DistinctPlan if present
+        bool distinct = false;
+        if (logical is DistinctPlan dp)
+        {
+            distinct = true;
+            logical = dp.Source;
+        }
+
         // No ORDER BY — use the existing fast path
         if (orderBy is not { Length: > 0 })
         {
             var result = BuildPhysical(logical, tx);
+            if (distinct) result = new DistinctEnumerator(result);
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
@@ -372,6 +386,7 @@ public sealed class QueryPlanner
         if (logical is not ProjectPlan topProject)
         {
             var result = BuildPhysical(logical, tx);
+            if (distinct) result = new DistinctEnumerator(result);
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
@@ -396,6 +411,7 @@ public sealed class QueryPlanner
             ? source
             : new Select(source, selectors);
 
+        if (distinct) physicalResult = new DistinctEnumerator(physicalResult);
         return limitPlan is not null ? BuildLimitEnumerator(limitPlan, physicalResult) : physicalResult;
     }
 
@@ -438,6 +454,8 @@ public sealed class QueryPlanner
             return new AggregatePlan(core.Columns, source);
 
         source = new ProjectPlan(core.Columns, source);
+        if (core.Distinct)
+            source = new DistinctPlan(source);
         return source;
     }
 
@@ -528,6 +546,12 @@ public sealed class QueryPlanner
 
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx).Enumerator;
+
+            case DistinctPlan distinct:
+            {
+                var child = BuildPhysical(distinct.Source, tx);
+                return new DistinctEnumerator(child);
+            }
 
             case AggregatePlan agg:
                 return BuildAggregate(agg, tx);
@@ -790,6 +814,7 @@ public sealed class QueryPlanner
             ScanPlan scan => scan.Alias,
             FilterPlan filter => GetPlanAlias(filter.Source),
             ProjectPlan project => GetPlanAlias(project.Source),
+            DistinctPlan distinct => GetPlanAlias(distinct.Source),
             AggregatePlan agg => GetPlanAlias(agg.Source),
             LimitPlan limit => GetPlanAlias(limit.Source),
             _ => "t"
@@ -1006,6 +1031,12 @@ public sealed class QueryPlanner
 
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx);
+
+            case DistinctPlan distinct:
+            {
+                var (child, childOrder) = BuildPhysicalWithOrder(distinct.Source, tx);
+                return (new DistinctEnumerator(child), Array.Empty<SortKey>());
+            }
 
             case AggregatePlan agg:
                 return (BuildAggregate(agg, tx), Array.Empty<SortKey>());

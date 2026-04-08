@@ -351,4 +351,153 @@ public class AggregateFunctionTests : TempDirTest
         Assert.Equal(10L, reader.GetInt64(3));  // min
         Assert.Equal(30L, reader.GetInt64(4));  // max
     }
+
+    [Fact]
+    public async Task Count_Distinct()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE d (id INTEGER PRIMARY KEY, category TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO d VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT count(DISTINCT category) FROM d";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(3L, reader.GetInt64(0)); // a, b, c
+    }
+
+    [Fact]
+    public async Task Sum_Distinct()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE d (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO d VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT sum(DISTINCT val) FROM d";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(60L, reader.GetInt64(0)); // 10 + 20 + 30
+    }
+}
+
+public class SelectDistinctTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task SelectDistinct_RemovesDuplicateRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT DISTINCT category FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var categories = new HashSet<string>();
+        while (await reader.ReadAsync())
+            categories.Add(reader.GetString(0));
+        Assert.Equal(3, categories.Count);
+        Assert.Contains("a", categories);
+        Assert.Contains("b", categories);
+        Assert.Contains("c", categories);
+    }
+
+    [Fact]
+    public async Task SelectDistinct_MultiColumn()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 1, 1), (4, 2, 1), (5, 1, 2)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT DISTINCT x, y FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var pairs = new HashSet<(long, long)>();
+        while (await reader.ReadAsync())
+            pairs.Add((reader.GetInt64(0), reader.GetInt64(1)));
+        Assert.Equal(3, pairs.Count); // (1,1), (1,2), (2,1)
+    }
+
+    [Fact]
+    public async Task SelectDistinct_AllUnique_NoRowsLost()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT DISTINCT val FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        Assert.Equal(3, count);
+    }
+
+    [Fact]
+    public async Task SelectDistinct_WithOrderBy()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'c'), (2, 'a'), (3, 'b'), (4, 'a'), (5, 'c')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT DISTINCT category FROM t ORDER BY category";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var results = new List<string>();
+        while (await reader.ReadAsync())
+            results.Add(reader.GetString(0));
+        Assert.Equal(new[] { "a", "b", "c" }, results);
+    }
+
+    [Fact]
+    public async Task SelectDistinct_WithLimit()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT DISTINCT category FROM t LIMIT 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        Assert.Equal(2, count);
+    }
+
+    [Fact]
+    public async Task Explain_ShowsDistinctNode()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "EXPLAIN SELECT DISTINCT val FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        Assert.Contains(details, d => d == "DISTINCT");
+    }
 }

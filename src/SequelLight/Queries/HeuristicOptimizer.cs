@@ -50,6 +50,11 @@ public static class HeuristicOptimizer
                 var columns = FoldResultColumns(project.Columns);
                 return new ProjectPlan(columns, source);
             }
+            case DistinctPlan distinct:
+            {
+                var source = FoldConstantsInPlan(distinct.Source);
+                return new DistinctPlan(source);
+            }
             case AggregatePlan agg:
             {
                 var source = FoldConstantsInPlan(agg.Source);
@@ -280,6 +285,11 @@ public static class HeuristicOptimizer
                 var source = PushDownPredicates(project.Source);
                 return new ProjectPlan(project.Columns, source);
             }
+            case DistinctPlan distinct:
+            {
+                var source = PushDownPredicates(distinct.Source);
+                return new DistinctPlan(source);
+            }
             case AggregatePlan agg:
             {
                 var source = PushDownPredicates(agg.Source);
@@ -491,17 +501,26 @@ public static class HeuristicOptimizer
 
     private static LogicalPlan PushDownProjections(LogicalPlan plan)
     {
+        // Peel off DistinctPlan wrapper if present
+        bool hasDistinct = false;
+        if (plan is DistinctPlan distinctPlan)
+        {
+            hasDistinct = true;
+            plan = distinctPlan.Source;
+        }
+
         if (plan is not ProjectPlan topProject)
-            return plan;
+            return hasDistinct ? new DistinctPlan(plan) : plan;
 
         var required = new HashSet<QualifiedName>();
         var allColumnsNeeded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (!CollectRequiredFromResultColumns(topProject.Columns, required, allColumnsNeeded))
-            return plan; // StarResultColumn present — bail out
+            return hasDistinct ? new DistinctPlan(plan) : plan;
 
         var source = PushProjectionsInto(topProject.Source, required, allColumnsNeeded);
-        return new ProjectPlan(topProject.Columns, source);
+        LogicalPlan result = new ProjectPlan(topProject.Columns, source);
+        return hasDistinct ? new DistinctPlan(result) : result;
     }
 
     private static LogicalPlan PushProjectionsInto(

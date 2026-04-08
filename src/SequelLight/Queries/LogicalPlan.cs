@@ -60,6 +60,16 @@ public sealed class JoinPlan : LogicalPlan
     }
 }
 
+public sealed class DistinctPlan : LogicalPlan
+{
+    public LogicalPlan Source { get; }
+
+    public DistinctPlan(LogicalPlan source)
+    {
+        Source = source;
+    }
+}
+
 /// <summary>
 /// Aggregate plan: materializes all source rows, computes aggregate functions,
 /// and emits a single summary row (without GROUP BY) or one row per group.

@@ -67,6 +67,11 @@ internal static class PlanFormatter
                 Visit(limit.Source, id, rows);
                 break;
 
+            case DistinctEnumerator distinct:
+                rows.Add((id, parentId, "DISTINCT"));
+                Visit(distinct.Source, id, rows);
+                break;
+
             case AggregateEnumerator agg:
                 rows.Add((id, parentId, FormatAggregate(agg)));
                 Visit(agg.Source, id, rows);
