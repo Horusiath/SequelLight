@@ -681,6 +681,11 @@ public sealed class SSTableScanner : IAsyncDisposable
     private int _offset;
     private byte[] _prevKey = Array.Empty<byte>();
 
+    // Reusable workspace for assembling keys during prefix decompression.
+    // The full key is built here, then copied to an exact-sized CurrentKey array.
+    // This avoids intermediate allocations when shared > 0 (prefix reuse).
+    private byte[] _keyWorkspace;
+
     // Reusable value buffer
     private byte[] _valueBuf;
 
@@ -705,6 +710,7 @@ public sealed class SSTableScanner : IAsyncDisposable
         _blockIdx = -1; // will be incremented on first MoveNextAsync
         _offset = 0;
         _blockLen = 0;
+        _keyWorkspace = ArrayPool<byte>.Shared.Rent(128);
         _valueBuf = ArrayPool<byte>.Shared.Rent(4096);
     }
 
@@ -725,14 +731,23 @@ public sealed class SSTableScanner : IAsyncDisposable
                 int keyLen = shared + suffixLen;
                 if (_offset + suffixLen + 4 > _blockLen) return false;
 
-                var key = new byte[keyLen];
-                if (shared > 0) _prevKey.AsSpan(0, shared).CopyTo(key);
-                block.Slice(_offset, suffixLen).CopyTo(key.AsSpan(shared));
+                // Grow workspace if needed
+                if (keyLen > _keyWorkspace.Length)
+                {
+                    ArrayPool<byte>.Shared.Return(_keyWorkspace);
+                    _keyWorkspace = ArrayPool<byte>.Shared.Rent(keyLen);
+                }
+
+                // Assemble key in workspace: shared prefix from previous + suffix from block
+                if (shared > 0) _prevKey.AsSpan(0, shared).CopyTo(_keyWorkspace);
+                block.Slice(_offset, suffixLen).CopyTo(_keyWorkspace.AsSpan(shared));
                 _offset += suffixLen;
 
                 int valueLen = BinaryPrimitives.ReadInt32LittleEndian(block[_offset..]);
                 _offset += 4;
 
+                // Produce exact-sized owned key for the caller
+                var key = _keyWorkspace.AsSpan(0, keyLen).ToArray();
                 CurrentKey = key;
                 _prevKey = key;
 
@@ -783,7 +798,9 @@ public sealed class SSTableScanner : IAsyncDisposable
             ArrayPool<byte>.Shared.Return(_blockBuf);
             _blockBuf = null;
         }
+        ArrayPool<byte>.Shared.Return(_keyWorkspace);
         ArrayPool<byte>.Shared.Return(_valueBuf);
+        _keyWorkspace = null!;
         _valueBuf = null!;
         return ValueTask.CompletedTask;
     }
