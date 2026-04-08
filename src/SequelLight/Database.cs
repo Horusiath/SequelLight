@@ -230,6 +230,51 @@ public sealed class Database : IAsyncDisposable
                     $"INSERT has {columnMap.Length} target column(s) but {source.Projection.ColumnCount} value(s) were supplied.");
 
             var row = new DbValue[table.Columns.Length];
+            bool skipConflictCheck = stmt.Verb is InsertVerb.Replace or InsertVerb.InsertOrReplace;
+
+            // Pre-resolve upsert SET expressions if needed
+            SqlExpr[]? upsertSetExprs = null;
+            int[]? upsertSetIndices = null;
+            SqlExpr? upsertWhere = null;
+            Projection? upsertProjection = null;
+
+            if (stmt.Upserts is { Length: > 0 } && stmt.Upserts[0].Action is DoUpdateAction doUpdate)
+            {
+                // Build combined projection: [table_cols..., excluded_cols...]
+                var names = new QualifiedName[table.Columns.Length * 2];
+                for (int i = 0; i < table.Columns.Length; i++)
+                {
+                    names[i] = new QualifiedName(null, table.Columns[i].Name);
+                    names[table.Columns.Length + i] = new QualifiedName("excluded", table.Columns[i].Name);
+                }
+                upsertProjection = new Projection(names);
+
+                var upsertPlanner = new QueryPlanner(Schema, parameters);
+                upsertSetExprs = new SqlExpr[doUpdate.Setters.Length];
+                upsertSetIndices = new int[doUpdate.Setters.Length];
+                for (int i = 0; i < doUpdate.Setters.Length; i++)
+                {
+                    upsertSetExprs[i] = upsertPlanner.ResolveColumns(
+                        upsertPlanner.ResolveBindParametersFromDict(doUpdate.Setters[i].Value), upsertProjection);
+
+                    var colName = doUpdate.Setters[i].Columns[0];
+                    upsertSetIndices[i] = -1;
+                    for (int c = 0; c < table.Columns.Length; c++)
+                    {
+                        if (string.Equals(table.Columns[c].Name, colName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            upsertSetIndices[i] = c;
+                            break;
+                        }
+                    }
+                    if (upsertSetIndices[i] < 0)
+                        throw new InvalidOperationException($"Column '{colName}' does not exist in table '{stmt.Table}'.");
+                }
+
+                if (doUpdate.Where is not null)
+                    upsertWhere = upsertPlanner.ResolveColumns(
+                        upsertPlanner.ResolveBindParametersFromDict(doUpdate.Where), upsertProjection);
+            }
 
             while (await source.NextAsync().ConfigureAwait(false))
             {
@@ -237,14 +282,11 @@ public sealed class Database : IAsyncDisposable
                 for (int i = 0; i < row.Length; i++)
                     row[i] = DbValue.Null;
 
-                // Map source values to target columns with type coercion
+                // Map source values to target columns
                 for (int i = 0; i < columnMap.Length; i++)
-                {
-                    var colIdx = columnMap[i];
-                    row[colIdx] = CoerceToColumnType(source.Current[i], table.Columns[colIdx]);
-                }
+                    row[columnMap[i]] = source.Current[i];
 
-                // Fill defaults and validate NOT NULL for columns not in the INSERT column list
+                // Fill defaults for unset columns
                 for (int i = 0; i < table.Columns.Length; i++)
                 {
                     if (!row[i].IsNull)
@@ -263,13 +305,69 @@ public sealed class Database : IAsyncDisposable
                         row[i] = EvaluateDefault(col.DefaultValue, col);
                         continue;
                     }
-
-                    if (col.IsNotNull)
-                        throw new InvalidOperationException(
-                            $"Column '{col.Name}' is NOT NULL and has no default value.");
                 }
 
-                rw.Put(table.EncodeRowKey(row), table.EncodeRowValue(row));
+                // Validate constraints (NOT NULL + type coercion)
+                table.ValidateRow(row);
+
+                var key = table.EncodeRowKey(row);
+
+                // PK conflict detection
+                if (!skipConflictCheck)
+                {
+                    var existing = await rw.GetAsync(key).ConfigureAwait(false);
+                    if (existing is not null)
+                    {
+                        // Handle conflict based on verb or upsert clause
+                        if (stmt.Verb == InsertVerb.InsertOrIgnore)
+                        {
+                            continue; // skip this row
+                        }
+
+                        if (stmt.Upserts is { Length: > 0 })
+                        {
+                            var upsert = stmt.Upserts[0];
+                            if (upsert.Action is DoNothingAction)
+                            {
+                                continue; // skip this row
+                            }
+
+                            if (upsertSetExprs is not null && upsertSetIndices is not null && upsertProjection is not null)
+                            {
+                                // ON CONFLICT DO UPDATE: decode existing row, evaluate SET with excluded alias
+                                var existingRow = table.DecodeRow(key, existing);
+                                var combinedRow = new DbValue[table.Columns.Length * 2];
+                                Array.Copy(existingRow, 0, combinedRow, 0, table.Columns.Length);
+                                Array.Copy(row, 0, combinedRow, table.Columns.Length, table.Columns.Length);
+
+                                // Check WHERE if present
+                                if (upsertWhere is not null)
+                                {
+                                    var whereResult = ExprEvaluator.Evaluate(upsertWhere, combinedRow, upsertProjection);
+                                    if (!DbValueComparer.IsTrue(whereResult))
+                                        continue; // WHERE false, keep existing row
+                                }
+
+                                // Apply SET expressions
+                                for (int i = 0; i < upsertSetExprs.Length; i++)
+                                {
+                                    var newVal = ExprEvaluator.Evaluate(upsertSetExprs[i], combinedRow, upsertProjection);
+                                    existingRow[upsertSetIndices[i]] = newVal;
+                                }
+
+                                table.ValidateRow(existingRow);
+                                rw.Put(key, table.EncodeRowValue(existingRow));
+                                totalInserted++;
+                                continue;
+                            }
+                        }
+
+                        // Default: plain INSERT or INSERT OR ABORT/ROLLBACK/FAIL — throw
+                        throw new InvalidOperationException($"UNIQUE constraint failed: {table.Name}");
+                    }
+                }
+
+                rw.Put(key, table.EncodeRowValue(row));
                 totalInserted++;
             }
         }
@@ -372,8 +470,10 @@ public sealed class Database : IAsyncDisposable
                 for (int i = 0; i < resolvedSetExprs.Length; i++)
                 {
                     var newValue = ExprEvaluator.Evaluate(resolvedSetExprs[i], row, scanProjection);
-                    row[setColumnIndices[i]] = CoerceToColumnType(newValue, table.Columns[setColumnIndices[i]]);
+                    row[setColumnIndices[i]] = newValue;
                 }
+
+                table.ValidateRow(row);
 
                 var newKey = table.EncodeRowKey(row);
                 if (!oldKey.AsSpan().SequenceEqual(newKey))

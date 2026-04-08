@@ -339,6 +339,88 @@ public sealed class TableSchema : IEquatable<TableSchema>
         return RowValueEncoder.Encode(values, _valueColumnSeqNos!, _valueColumnTypes!);
     }
 
+    /// <summary>
+    /// Decodes a stored row from its key and value bytes into a <c>DbValue[]</c>.
+    /// </summary>
+    public DbValue[] DecodeRow(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        EnsureEncodingMetadata();
+        var row = new DbValue[Columns.Length];
+        var pkBuf = new DbValue[_pkColumnIndices!.Length];
+        RowKeyEncoder.Decode(key, out _, pkBuf, _pkColumnTypes!);
+        for (int i = 0; i < _pkColumnIndices.Length; i++)
+            row[_pkColumnIndices[i]] = pkBuf[i];
+
+        // Collect non-PK columns for value decoding
+        var valueColumns = new ColumnSchema[_valueColumnIndices!.Length];
+        for (int i = 0; i < _valueColumnIndices.Length; i++)
+            valueColumns[i] = Columns[_valueColumnIndices[i]];
+
+        var valBuf = new DbValue[_valueColumnIndices.Length];
+        RowValueEncoder.Decode(value, valBuf, valueColumns);
+        for (int i = 0; i < _valueColumnIndices.Length; i++)
+            row[_valueColumnIndices[i]] = valBuf[i];
+
+        return row;
+    }
+
+    /// <summary>
+    /// Validates a fully-built row against the table's constraints (NOT NULL)
+    /// and coerces values to column type affinities.
+    /// </summary>
+    public void ValidateRow(DbValue[] row)
+    {
+        for (int i = 0; i < Columns.Length; i++)
+        {
+            var col = Columns[i];
+            if (!row[i].IsNull)
+            {
+                row[i] = CoerceValue(row[i], col);
+            }
+            else if (col.IsNotNull && !col.IsAutoincrement)
+            {
+                throw new InvalidOperationException($"NOT NULL constraint failed: {Name}.{col.Name}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Coerces a non-null <see cref="DbValue"/> to the target column's type affinity.
+    /// </summary>
+    public static DbValue CoerceValue(DbValue value, ColumnSchema column)
+    {
+        if (value.IsNull)
+            return DbValue.Null;
+
+        var affinity = TypeAffinity.Resolve(column.TypeName);
+
+        if (affinity.IsInteger())
+        {
+            if (value.Type.IsInteger()) return value;
+            if (value.Type == DbType.Float64) return DbValue.Integer((long)value.AsReal());
+        }
+        else if (affinity == DbType.Float64)
+        {
+            if (value.Type == DbType.Float64) return value;
+            if (value.Type.IsInteger()) return DbValue.Real(value.AsInteger());
+        }
+        else if (affinity == DbType.Text)
+        {
+            if (value.Type == DbType.Text) return value;
+        }
+        else if (affinity == DbType.Bytes)
+        {
+            if (value.Type == DbType.Bytes) return value;
+        }
+        else
+        {
+            return value;
+        }
+
+        throw new InvalidOperationException(
+            $"Cannot convert {value.Type} value to {affinity} for column '{column.Name}'.");
+    }
+
     public bool Equals(TableSchema? other) => other is not null && Oid == other.Oid;
     public override bool Equals(object? obj) => Equals(obj as TableSchema);
     public override int GetHashCode() => Oid.GetHashCode();
