@@ -184,7 +184,7 @@ public sealed class QueryPlanner
             condition = ResolveColumns(condition, new Projection(combinedNames));
         }
 
-        // Try MergeJoin for equi-joins on supported join kinds
+        // Try equi-join strategies (MergeJoin or HashJoin)
         if (condition is not null
             && join.Kind is not JoinKind.Cross and not JoinKind.Comma
             && TryExtractEquiJoinKeys(condition, leftWidth,
@@ -193,30 +193,24 @@ public sealed class QueryPlanner
             bool leftSorted = JoinKeysMatchSortOrder(leftKeyIndices, leftOrder);
             bool rightSorted = JoinKeysMatchSortOrder(rightKeyIndices, rightOrder);
 
-            if (!leftSorted)
-            {
-                var orders = new SortOrder[leftKeyIndices.Length];
-                Array.Fill(orders, SortOrder.Asc);
-                left = new SortEnumerator(left, leftKeyIndices, orders);
-            }
+            IDbEnumerator result;
+            SortKey[] outputOrder;
 
-            if (!rightSorted)
+            if (leftSorted && rightSorted)
             {
-                var orders = new SortOrder[rightKeyIndices.Length];
-                Array.Fill(orders, SortOrder.Asc);
-                right = new SortEnumerator(right, rightKeyIndices, orders);
+                // Both pre-sorted — MergeJoin with no sort overhead
+                result = new MergeJoin(left, right, leftKeyIndices, rightKeyIndices, join.Kind);
+                outputOrder = leftOrder;
             }
-
-            IDbEnumerator result = new MergeJoin(left, right, leftKeyIndices, rightKeyIndices, join.Kind);
+            else
+            {
+                // HashJoin — no sort needed, O(n+m) average
+                result = new HashJoin(left, right, leftKeyIndices, rightKeyIndices, join.Kind);
+                outputOrder = Array.Empty<SortKey>();
+            }
 
             if (residual is not null)
                 result = new Filter(result, residual);
-
-            // MergeJoin preserves the left side's sort order.
-            // Left ordinals map directly to combined output ordinals.
-            SortKey[] outputOrder = leftSorted
-                ? leftOrder
-                : BuildAscSortKeys(leftKeyIndices);
 
             return (result, outputOrder);
         }

@@ -1703,6 +1703,181 @@ public class CrossJoinPromotionIntegrationTests : TempDirTest
     }
 }
 
+public class HashJoinTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task HashJoin_NonPK_EquiJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 100, 'x'), (2, 200, 'y'), (3, 300, 'z')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 100, 'p'), (2, 200, 'q'), (3, 400, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Join on non-PK column 'fk' — forces HashJoin (not sorted on fk)
+        cmd.CommandText = "SELECT a.val, b.info FROM a INNER JOIN b ON a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("x", "p"), rows);
+        Assert.Contains(("y", "q"), rows);
+    }
+
+    [Fact]
+    public async Task HashJoin_LeftJoin_NonPK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 100, 'x'), (2, 200, 'y'), (3, 300, 'z')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 100, 'p'), (2, 200, 'q')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // LEFT JOIN on non-PK — a.fk=300 has no match in b
+        cmd.CommandText = "SELECT a.val, b.info FROM a LEFT JOIN b ON a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, object? Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("x", (object?)"p"), rows);
+        Assert.Contains(("y", (object?)"q"), rows);
+        Assert.Contains(("z", (object?)null), rows);
+    }
+
+    [Fact]
+    public async Task HashJoin_Duplicates()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 10)";
+        await cmd.ExecuteNonQueryAsync();
+        // Multiple right rows matching fk=10
+        cmd.CommandText = "INSERT INTO b VALUES (1, 10, 'p'), (2, 10, 'q'), (3, 10, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT b.info FROM a INNER JOIN b ON a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<string>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetString(0));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains("p", rows);
+        Assert.Contains("q", rows);
+        Assert.Contains("r", rows);
+    }
+
+    [Fact]
+    public async Task HashJoin_Empty_Right_Inner()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 10), (2, 20)";
+        await cmd.ExecuteNonQueryAsync();
+        // b is empty
+
+        cmd.CommandText = "SELECT a.id FROM a INNER JOIN b ON a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task HashJoin_Empty_Right_LeftJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 10, 'x'), (2, 20, 'y')";
+        await cmd.ExecuteNonQueryAsync();
+        // b is empty
+
+        cmd.CommandText = "SELECT a.val FROM a LEFT JOIN b ON a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<string>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetString(0));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains("x", rows);
+        Assert.Contains("y", rows);
+    }
+
+    [Fact]
+    public async Task CommaJoin_NonPK_Uses_HashJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 100, 'x'), (2, 200, 'y')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 100, 'p'), (2, 200, 'q')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Comma join on non-PK (promoted to Inner, then HashJoin)
+        cmd.CommandText = "SELECT a.val, b.info FROM a, b WHERE a.fk = b.fk";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("x", "p"), rows);
+        Assert.Contains(("y", "q"), rows);
+    }
+}
+
 public class ProjectionPushdownIntegrationTests : TempDirTest
 {
     private async Task<SequelLightConnection> OpenConnectionAsync()
