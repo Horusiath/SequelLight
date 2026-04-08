@@ -1163,6 +1163,152 @@ public class HeuristicOptimizerTests
         Assert.IsType<ScanPlan>(joinResult.Right);
     }
 
+    // ─── Constant folding tests ───────────────────────────────────────
+
+    [Fact]
+    public void Constant_Folding_Arithmetic()
+    {
+        // 2 + 3 → ResolvedLiteralExpr(5)
+        var expr = new BinaryExpr(
+            new LiteralExpr(LiteralKind.Integer, "2"),
+            BinaryOp.Add,
+            new LiteralExpr(LiteralKind.Integer, "3"));
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        var lit = Assert.IsType<ResolvedLiteralExpr>(folded);
+        Assert.Equal(5L, lit.Value.AsInteger());
+    }
+
+    [Fact]
+    public void Constant_Folding_Nested()
+    {
+        // (1 + 2) * 3 → ResolvedLiteralExpr(9)
+        var expr = new BinaryExpr(
+            new BinaryExpr(
+                new LiteralExpr(LiteralKind.Integer, "1"),
+                BinaryOp.Add,
+                new LiteralExpr(LiteralKind.Integer, "2")),
+            BinaryOp.Multiply,
+            new LiteralExpr(LiteralKind.Integer, "3"));
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        var lit = Assert.IsType<ResolvedLiteralExpr>(folded);
+        Assert.Equal(9L, lit.Value.AsInteger());
+    }
+
+    [Fact]
+    public void Constant_Folding_And_True()
+    {
+        // x AND TRUE → x
+        var colRef = new ColumnRefExpr(null, "t", "x");
+        var expr = new BinaryExpr(colRef, BinaryOp.And, LiteralExpr.TrueLiteral);
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        Assert.IsType<ColumnRefExpr>(folded);
+    }
+
+    [Fact]
+    public void Constant_Folding_And_False()
+    {
+        // x AND FALSE → FALSE (integer 0)
+        var colRef = new ColumnRefExpr(null, "t", "x");
+        var expr = new BinaryExpr(colRef, BinaryOp.And, LiteralExpr.FalseLiteral);
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        var lit = Assert.IsType<ResolvedLiteralExpr>(folded);
+        Assert.Equal(0L, lit.Value.AsInteger());
+    }
+
+    [Fact]
+    public void Constant_Folding_Or_True()
+    {
+        // x OR TRUE → TRUE (integer 1)
+        var colRef = new ColumnRefExpr(null, "t", "x");
+        var expr = new BinaryExpr(colRef, BinaryOp.Or, LiteralExpr.TrueLiteral);
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        var lit = Assert.IsType<ResolvedLiteralExpr>(folded);
+        Assert.Equal(1L, lit.Value.AsInteger());
+    }
+
+    [Fact]
+    public void Constant_Folding_Or_False()
+    {
+        // x OR FALSE → x
+        var colRef = new ColumnRefExpr(null, "t", "x");
+        var expr = new BinaryExpr(colRef, BinaryOp.Or, LiteralExpr.FalseLiteral);
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        Assert.IsType<ColumnRefExpr>(folded);
+    }
+
+    [Fact]
+    public void Constant_Folding_Not()
+    {
+        // NOT TRUE → FALSE, NOT FALSE → TRUE
+        var notTrue = new UnaryExpr(UnaryOp.Not, LiteralExpr.TrueLiteral);
+        var notFalse = new UnaryExpr(UnaryOp.Not, LiteralExpr.FalseLiteral);
+
+        var foldedTrue = HeuristicOptimizer.FoldConstants(notTrue);
+        var foldedFalse = HeuristicOptimizer.FoldConstants(notFalse);
+
+        var litTrue = Assert.IsType<ResolvedLiteralExpr>(foldedTrue);
+        Assert.Equal(0L, litTrue.Value.AsInteger());
+        var litFalse = Assert.IsType<ResolvedLiteralExpr>(foldedFalse);
+        Assert.Equal(1L, litFalse.Value.AsInteger());
+    }
+
+    [Fact]
+    public void Constant_Folding_Eliminates_True_Filter()
+    {
+        // FilterPlan(TRUE, source) → source
+        var scan = new ScanPlan(CreateDummyTable("t"), "t");
+        var filter = new FilterPlan(LiteralExpr.TrueLiteral, scan);
+
+        var optimized = HeuristicOptimizer.Optimize(filter);
+
+        Assert.IsType<ScanPlan>(optimized);
+    }
+
+    [Fact]
+    public void Constant_Folding_Preserves_Non_Constant()
+    {
+        // x > 5 — column ref stays, literal is pre-resolved
+        var expr = new BinaryExpr(
+            new ColumnRefExpr(null, "t", "x"),
+            BinaryOp.GreaterThan,
+            new LiteralExpr(LiteralKind.Integer, "5"));
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        var binary = Assert.IsType<BinaryExpr>(folded);
+        Assert.IsType<ColumnRefExpr>(binary.Left);
+        Assert.IsType<ResolvedLiteralExpr>(binary.Right); // literal pre-resolved
+    }
+
+    [Fact]
+    public void Constant_Folding_DivideByZero_Preserved()
+    {
+        // 1 / 0 stays as BinaryExpr (not folded)
+        var expr = new BinaryExpr(
+            new LiteralExpr(LiteralKind.Integer, "1"),
+            BinaryOp.Divide,
+            new LiteralExpr(LiteralKind.Integer, "0"));
+
+        var folded = HeuristicOptimizer.FoldConstants(expr);
+
+        // Children are folded to ResolvedLiteralExpr but the division itself is preserved
+        var binary = Assert.IsType<BinaryExpr>(folded);
+        Assert.IsType<ResolvedLiteralExpr>(binary.Left);
+        Assert.IsType<ResolvedLiteralExpr>(binary.Right);
+    }
+
     private static Schema.TableSchema CreateDummyTable(string name)
     {
         return new Schema.TableSchema(
@@ -1375,6 +1521,39 @@ public class IntegrationTests : TempDirTest
             Assert.True(await reader.ReadAsync());
             Assert.Equal("persisted", reader.GetString(0));
         }
+    }
+}
+
+public class ConstantFoldingIntegrationTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task Select_With_Constant_Folding()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // WHERE id > 1 + 1 should fold to WHERE id > 2
+        cmd.CommandText = "SELECT name FROM t WHERE id > 1 + 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<string>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetString(0));
+
+        Assert.Single(rows);
+        Assert.Equal("c", rows[0]);
     }
 }
 

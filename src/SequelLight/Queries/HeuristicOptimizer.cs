@@ -1,20 +1,221 @@
+using SequelLight.Data;
 using SequelLight.Parsing.Ast;
 
 namespace SequelLight.Queries;
 
 /// <summary>
 /// Applies fixed transformation rules to the logical plan tree.
-/// Rule 1: Predicate pushdown — push WHERE predicates closer to scans through joins.
-/// Rule 2: Projection pushdown — push narrowing projections below joins to reduce column width.
+/// Rule 1: Constant folding — evaluate constant subexpressions and simplify logical tautologies.
+/// Rule 2: Predicate pushdown — push WHERE predicates closer to scans through joins.
+/// Rule 3: Projection pushdown — push narrowing projections below joins to reduce column width.
 /// </summary>
 public static class HeuristicOptimizer
 {
+    private static readonly Projection EmptyProjection = new(Array.Empty<QualifiedName>());
+
     public static LogicalPlan Optimize(LogicalPlan plan)
     {
+        plan = FoldConstantsInPlan(plan);
         plan = PushDownPredicates(plan);
         plan = PushDownProjections(plan);
         return plan;
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Rule 1: Constant folding
+    // ───────────────────────────────────────────────────────────────────
+
+    private static LogicalPlan FoldConstantsInPlan(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case FilterPlan filter:
+            {
+                var source = FoldConstantsInPlan(filter.Source);
+                var predicate = FoldConstants(filter.Predicate);
+                if (IsConstantTrue(predicate))
+                    return source;
+                return new FilterPlan(predicate, source);
+            }
+            case JoinPlan join:
+            {
+                var left = FoldConstantsInPlan(join.Left);
+                var right = FoldConstantsInPlan(join.Right);
+                var condition = join.Condition is not null ? FoldConstants(join.Condition) : null;
+                return new JoinPlan(left, right, join.Kind, condition);
+            }
+            case ProjectPlan project:
+            {
+                var source = FoldConstantsInPlan(project.Source);
+                var columns = FoldResultColumns(project.Columns);
+                return new ProjectPlan(columns, source);
+            }
+            default:
+                return plan;
+        }
+    }
+
+    private static ResultColumn[] FoldResultColumns(ResultColumn[] columns)
+    {
+        ResultColumn[]? result = null;
+        for (int i = 0; i < columns.Length; i++)
+        {
+            if (columns[i] is ExprResultColumn erc)
+            {
+                var folded = FoldConstants(erc.Expression);
+                if (!ReferenceEquals(folded, erc.Expression))
+                {
+                    result ??= (ResultColumn[])columns.Clone();
+                    result[i] = new ExprResultColumn(folded, erc.Alias);
+                }
+            }
+        }
+        return result ?? columns;
+    }
+
+    internal static SqlExpr FoldConstants(SqlExpr expr)
+    {
+        switch (expr)
+        {
+            case LiteralExpr lit:
+                try { return new ResolvedLiteralExpr(ExprEvaluator.EvaluateLiteral(lit)); }
+                catch { return expr; }
+
+            case ResolvedLiteralExpr:
+                return expr;
+
+            case ColumnRefExpr:
+            case ResolvedColumnExpr:
+            case BindParameterExpr:
+                return expr;
+
+            case UnaryExpr unary:
+            {
+                var operand = FoldConstants(unary.Operand);
+                if (operand is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new UnaryExpr(unary.Op, operand));
+                    if (folded is not null) return folded;
+                }
+                if (unary.Op == UnaryOp.Not)
+                {
+                    if (IsConstantTrue(operand)) return new ResolvedLiteralExpr(DbValue.Integer(0));
+                    if (IsConstantFalse(operand)) return new ResolvedLiteralExpr(DbValue.Integer(1));
+                }
+                return ReferenceEquals(operand, unary.Operand) ? expr : new UnaryExpr(unary.Op, operand);
+            }
+
+            case BinaryExpr binary:
+            {
+                var left = FoldConstants(binary.Left);
+                var right = FoldConstants(binary.Right);
+
+                if (left is ResolvedLiteralExpr && right is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new BinaryExpr(left, binary.Op, right));
+                    if (folded is not null) return folded;
+                }
+
+                if (binary.Op == BinaryOp.And)
+                {
+                    if (IsConstantTrue(left)) return right;
+                    if (IsConstantTrue(right)) return left;
+                    if (IsConstantFalse(left)) return new ResolvedLiteralExpr(DbValue.Integer(0));
+                    if (IsConstantFalse(right)) return new ResolvedLiteralExpr(DbValue.Integer(0));
+                }
+                else if (binary.Op == BinaryOp.Or)
+                {
+                    if (IsConstantTrue(left)) return new ResolvedLiteralExpr(DbValue.Integer(1));
+                    if (IsConstantTrue(right)) return new ResolvedLiteralExpr(DbValue.Integer(1));
+                    if (IsConstantFalse(left)) return right;
+                    if (IsConstantFalse(right)) return left;
+                }
+
+                return ReferenceEquals(left, binary.Left) && ReferenceEquals(right, binary.Right)
+                    ? expr
+                    : new BinaryExpr(left, binary.Op, right);
+            }
+
+            case IsExpr isExpr:
+            {
+                var left = FoldConstants(isExpr.Left);
+                var right = FoldConstants(isExpr.Right);
+                if (left is ResolvedLiteralExpr && right is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new IsExpr(left, isExpr.Negated, isExpr.Distinct, right));
+                    if (folded is not null) return folded;
+                }
+                return ReferenceEquals(left, isExpr.Left) && ReferenceEquals(right, isExpr.Right)
+                    ? expr
+                    : new IsExpr(left, isExpr.Negated, isExpr.Distinct, right);
+            }
+
+            case NullTestExpr nullTest:
+            {
+                var operand = FoldConstants(nullTest.Operand);
+                if (operand is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new NullTestExpr(operand, nullTest.IsNotNull));
+                    if (folded is not null) return folded;
+                }
+                return ReferenceEquals(operand, nullTest.Operand) ? expr : new NullTestExpr(operand, nullTest.IsNotNull);
+            }
+
+            case BetweenExpr between:
+            {
+                var operand = FoldConstants(between.Operand);
+                var low = FoldConstants(between.Low);
+                var high = FoldConstants(between.High);
+                if (operand is ResolvedLiteralExpr && low is ResolvedLiteralExpr && high is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new BetweenExpr(operand, between.Negated, low, high));
+                    if (folded is not null) return folded;
+                }
+                return ReferenceEquals(operand, between.Operand)
+                       && ReferenceEquals(low, between.Low)
+                       && ReferenceEquals(high, between.High)
+                    ? expr
+                    : new BetweenExpr(operand, between.Negated, low, high);
+            }
+
+            case CastExpr cast:
+            {
+                var operand = FoldConstants(cast.Operand);
+                if (operand is ResolvedLiteralExpr)
+                {
+                    var folded = TryEvaluate(new CastExpr(operand, cast.Type));
+                    if (folded is not null) return folded;
+                }
+                return ReferenceEquals(operand, cast.Operand) ? expr : new CastExpr(operand, cast.Type);
+            }
+
+            default:
+                return expr;
+        }
+    }
+
+    private static ResolvedLiteralExpr? TryEvaluate(SqlExpr expr)
+    {
+        try
+        {
+            var value = ExprEvaluator.Evaluate(expr, Array.Empty<DbValue>(), EmptyProjection);
+            return new ResolvedLiteralExpr(value);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsConstantTrue(SqlExpr expr)
+        => expr is ResolvedLiteralExpr r && DbValueComparer.IsTrue(r.Value);
+
+    private static bool IsConstantFalse(SqlExpr expr)
+        => expr is ResolvedLiteralExpr r && !r.Value.IsNull && !DbValueComparer.IsTrue(r.Value);
+
+    // ───────────────────────────────────────────────────────────────────
+    // Rule 2: Predicate pushdown
+    // ───────────────────────────────────────────────────────────────────
 
     private static LogicalPlan PushDownPredicates(LogicalPlan plan)
     {
@@ -188,7 +389,7 @@ public static class HeuristicOptimizer
     }
 
     // ───────────────────────────────────────────────────────────────────
-    // Rule 2: Projection pushdown
+    // Rule 3: Projection pushdown
     // ───────────────────────────────────────────────────────────────────
 
     private static LogicalPlan PushDownProjections(LogicalPlan plan)
