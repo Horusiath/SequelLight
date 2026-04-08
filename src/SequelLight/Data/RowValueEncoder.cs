@@ -110,6 +110,63 @@ public static class RowValueEncoder
         return result;
     }
 
+    /// <summary>
+    /// Encodes non-PK columns by reading <paramref name="row"/>[<paramref name="indices"/>[i]]
+    /// instead of requiring a pre-gathered contiguous array. Avoids an intermediate allocation.
+    /// </summary>
+    public static byte[] EncodeIndirect(ReadOnlySpan<DbValue> row, ReadOnlySpan<int> indices,
+        ReadOnlySpan<ushort> seqNos, ReadOnlySpan<DbType> types)
+    {
+        if (indices.Length == 0) return [];
+
+        bool allNull = true;
+        ushort maxSeqNo = 0;
+        int dataSize = 0;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            ref readonly var val = ref row[indices[i]];
+            if (val.IsNull) continue;
+            allNull = false;
+            if (seqNos[i] > maxSeqNo) maxSeqNo = seqNos[i];
+            int fs = types[i].FixedSize();
+            dataSize += fs > 0 ? fs : 4 + val.AsBytes().Length;
+        }
+        if (allNull) return [];
+
+        int slotCount = maxSeqNo + 1;
+        int headerSize = 2 + slotCount * 2;
+        var result = new byte[headerSize + dataSize];
+        var dest = result.AsSpan();
+
+        BinaryPrimitives.WriteUInt16LittleEndian(dest, (ushort)slotCount);
+        dest.Slice(2, slotCount * 2).Clear();
+
+        int dataOffset = headerSize;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            ref readonly var val = ref row[indices[i]];
+            if (val.IsNull) continue;
+
+            BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(2 + seqNos[i] * 2), (ushort)dataOffset);
+
+            int fs = types[i].FixedSize();
+            if (fs > 0)
+            {
+                EncodeScalar(dest[dataOffset..], val, types[i]);
+                dataOffset += fs;
+            }
+            else
+            {
+                var data = val.AsBytes().Span;
+                BinaryPrimitives.WriteUInt32LittleEndian(dest[dataOffset..], (uint)data.Length);
+                data.CopyTo(dest[(dataOffset + 4)..]);
+                dataOffset += 4 + data.Length;
+            }
+        }
+
+        return result;
+    }
+
     public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, ColumnSchema[] columns)
     {
         values.Clear();

@@ -19,6 +19,7 @@ public sealed class Database : IAsyncDisposable
 {
     private readonly LsmStore _store;
     private readonly QueryCache _queryCache;
+    private readonly ConcurrentDictionary<string, SqlStmt> _stmtCache = new(StringComparer.Ordinal);
     private bool _schemaDirty;
 
     internal Database(LsmStore store, string directory, int queryCacheCapacity = 256)
@@ -39,7 +40,11 @@ public sealed class Database : IAsyncDisposable
 
     internal async ValueTask<int> ExecuteNonQueryAsync(string sql, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
-        var stmt = SqlParser.Parse(sql);
+        if (!_stmtCache.TryGetValue(sql, out var stmt))
+        {
+            stmt = SqlParser.Parse(sql);
+            _stmtCache.TryAdd(sql, stmt);
+        }
         return stmt switch
         {
             CreateTableStmt or CreateIndexStmt or CreateViewStmt or CreateTriggerStmt
@@ -221,16 +226,77 @@ public sealed class Database : IAsyncDisposable
 
         async ValueTask InsertRows(ReadWriteTransaction rw)
         {
+            var row = new DbValue[table.Columns.Length];
+            bool skipConflictCheck = stmt.Verb is InsertVerb.Replace or InsertVerb.InsertOrReplace;
+
+            // ---- Fast path: single-row VALUES with only literals/bind-parameters ----
+            // Bypasses QueryPlanner, ValuesEnumerator, and Projection allocation entirely.
+            var select = selectSource.Query;
+            if (select is { Compounds.Length: 0, Limit: null, Offset: null, First: ValuesBody { Rows.Length: 1 } valuesBody }
+                && !(stmt.Upserts is { Length: > 0 } && stmt.Upserts[0].Action is DoUpdateAction))
+            {
+                var exprRow = valuesBody.Rows[0];
+                if (exprRow.Length != columnMap.Length)
+                    throw new InvalidOperationException(
+                        $"INSERT has {columnMap.Length} target column(s) but {exprRow.Length} value(s) were supplied.");
+
+                bool canFastPath = true;
+                for (int i = 0; i < row.Length; i++)
+                    row[i] = DbValue.Null;
+
+                for (int i = 0; i < exprRow.Length; i++)
+                {
+                    switch (exprRow[i])
+                    {
+                        case BindParameterExpr bind:
+                            if (parameters is null) { canFastPath = false; break; }
+                            var name = QueryPlanner.NormalizeParameterName(bind.Name);
+                            if (name.Length == 0 || !parameters.TryGetValue(name, out var pval)) { canFastPath = false; break; }
+                            row[columnMap[i]] = pval;
+                            break;
+                        case LiteralExpr lit:
+                            row[columnMap[i]] = ExprEvaluator.EvaluateLiteral(lit);
+                            break;
+                        case ResolvedLiteralExpr rl:
+                            row[columnMap[i]] = rl.Value;
+                            break;
+                        default:
+                            canFastPath = false;
+                            break;
+                    }
+                    if (!canFastPath) break;
+                }
+
+                if (canFastPath)
+                {
+                    FillRowDefaults(table, row);
+                    table.ValidateRow(row);
+                    var key = table.EncodeRowKey(row);
+
+                    if (!skipConflictCheck)
+                    {
+                        var existing = await rw.GetAsync(key).ConfigureAwait(false);
+                        if (existing is not null)
+                        {
+                            if (stmt.Verb == InsertVerb.InsertOrIgnore) return;
+                            if (stmt.Upserts is { Length: > 0 } && stmt.Upserts[0].Action is DoNothingAction) return;
+                            throw new InvalidOperationException($"UNIQUE constraint failed: {table.Name}");
+                        }
+                    }
+
+                    rw.Put(key, table.EncodeRowValue(row));
+                    totalInserted++;
+                    return;
+                }
+            }
+
+            // ---- General path: multi-row, INSERT...SELECT, complex expressions, DO UPDATE ----
             var planner = new QueryPlanner(Schema, parameters);
             await using var source = planner.Plan(selectSource.Query, rw);
 
-            // Validate column count up front
             if (source.Projection.ColumnCount != columnMap.Length)
                 throw new InvalidOperationException(
                     $"INSERT has {columnMap.Length} target column(s) but {source.Projection.ColumnCount} value(s) were supplied.");
-
-            var row = new DbValue[table.Columns.Length];
-            bool skipConflictCheck = stmt.Verb is InsertVerb.Replace or InsertVerb.InsertOrReplace;
 
             // Pre-resolve upsert SET expressions if needed
             SqlExpr[]? upsertSetExprs = null;
@@ -240,7 +306,6 @@ public sealed class Database : IAsyncDisposable
 
             if (stmt.Upserts is { Length: > 0 } && stmt.Upserts[0].Action is DoUpdateAction doUpdate)
             {
-                // Build combined projection: [table_cols..., excluded_cols...]
                 var names = new QualifiedName[table.Columns.Length * 2];
                 for (int i = 0; i < table.Columns.Length; i++)
                 {
@@ -278,50 +343,25 @@ public sealed class Database : IAsyncDisposable
 
             while (await source.NextAsync().ConfigureAwait(false))
             {
-                // Initialize row with nulls
                 for (int i = 0; i < row.Length; i++)
                     row[i] = DbValue.Null;
 
-                // Map source values to target columns
                 for (int i = 0; i < columnMap.Length; i++)
                     row[columnMap[i]] = source.Current[i];
 
-                // Fill defaults for unset columns
-                for (int i = 0; i < table.Columns.Length; i++)
-                {
-                    if (!row[i].IsNull)
-                        continue;
-
-                    var col = table.Columns[i];
-
-                    if (col.IsAutoincrement)
-                    {
-                        row[i] = DbValue.Integer(col.NextAutoIncrement());
-                        continue;
-                    }
-
-                    if (col.DefaultValue is not null)
-                    {
-                        row[i] = EvaluateDefault(col.DefaultValue, col);
-                        continue;
-                    }
-                }
-
-                // Validate constraints (NOT NULL + type coercion)
+                FillRowDefaults(table, row);
                 table.ValidateRow(row);
 
                 var key = table.EncodeRowKey(row);
 
-                // PK conflict detection
                 if (!skipConflictCheck)
                 {
                     var existing = await rw.GetAsync(key).ConfigureAwait(false);
                     if (existing is not null)
                     {
-                        // Handle conflict based on verb or upsert clause
                         if (stmt.Verb == InsertVerb.InsertOrIgnore)
                         {
-                            continue; // skip this row
+                            continue;
                         }
 
                         if (stmt.Upserts is { Length: > 0 })
@@ -329,26 +369,23 @@ public sealed class Database : IAsyncDisposable
                             var upsert = stmt.Upserts[0];
                             if (upsert.Action is DoNothingAction)
                             {
-                                continue; // skip this row
+                                continue;
                             }
 
                             if (upsertSetExprs is not null && upsertSetIndices is not null && upsertProjection is not null)
                             {
-                                // ON CONFLICT DO UPDATE: decode existing row, evaluate SET with excluded alias
                                 var existingRow = table.DecodeRow(key, existing);
                                 var combinedRow = new DbValue[table.Columns.Length * 2];
                                 Array.Copy(existingRow, 0, combinedRow, 0, table.Columns.Length);
                                 Array.Copy(row, 0, combinedRow, table.Columns.Length, table.Columns.Length);
 
-                                // Check WHERE if present
                                 if (upsertWhere is not null)
                                 {
                                     var whereResult = ExprEvaluator.Evaluate(upsertWhere, combinedRow, upsertProjection);
                                     if (!DbValueComparer.IsTrue(whereResult))
-                                        continue; // WHERE false, keep existing row
+                                        continue;
                                 }
 
-                                // Apply SET expressions
                                 for (int i = 0; i < upsertSetExprs.Length; i++)
                                 {
                                     var newVal = ExprEvaluator.Evaluate(upsertSetExprs[i], combinedRow, upsertProjection);
@@ -362,7 +399,6 @@ public sealed class Database : IAsyncDisposable
                             }
                         }
 
-                        // Default: plain INSERT or INSERT OR ABORT/ROLLBACK/FAIL — throw
                         throw new InvalidOperationException($"UNIQUE constraint failed: {table.Name}");
                     }
                 }
@@ -383,6 +419,28 @@ public sealed class Database : IAsyncDisposable
         await InsertRows(autoTx).ConfigureAwait(false);
         await autoTx.CommitAsync().ConfigureAwait(false);
         return totalInserted;
+    }
+
+    private static void FillRowDefaults(TableSchema table, DbValue[] row)
+    {
+        for (int i = 0; i < table.Columns.Length; i++)
+        {
+            if (!row[i].IsNull)
+                continue;
+
+            var col = table.Columns[i];
+
+            if (col.IsAutoincrement)
+            {
+                row[i] = DbValue.Integer(col.NextAutoIncrement());
+                continue;
+            }
+
+            if (col.DefaultValue is not null)
+            {
+                row[i] = EvaluateDefault(col.DefaultValue, col);
+            }
+        }
     }
 
     private async ValueTask<int> ExecuteUpdateAsync(UpdateStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
