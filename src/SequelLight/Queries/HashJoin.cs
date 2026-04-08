@@ -175,15 +175,7 @@ public sealed class HashJoin : IDbEnumerator
     {
         var h = new HashCode();
         for (int i = 0; i < keyIndices.Length; i++)
-        {
-            var val = row[keyIndices[i]];
-            if (val.IsNull)
-                h.Add(0);
-            else if (val.Type.IsVariableLength())
-                h.AddBytes(val.AsBytes().Span);
-            else
-                h.Add(val.GetHashCode());
-        }
+            h.Add(row[keyIndices[i]]);
         return h.ToHashCode();
     }
 

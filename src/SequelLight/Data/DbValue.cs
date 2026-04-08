@@ -155,7 +155,10 @@ public readonly struct DbValue : IEquatable<DbValue>
         if (_type == 0) return 0;
         if (_type.IsInteger() || _type == DbType.Float64)
             return HashCode.Combine(_type, _bits);
-        return HashCode.Combine(_type, _bytes.Length);
+        var h = new HashCode();
+        h.Add(_type);
+        h.AddBytes(_bytes.Span);
+        return h.ToHashCode();
     }
 
     public static bool operator ==(DbValue left, DbValue right) => left.Equals(right);
