@@ -500,4 +500,72 @@ public class SelectDistinctTests : TempDirTest
             details.Add(reader.GetString(2));
         Assert.Contains(details, d => d == "DISTINCT");
     }
+
+    [Fact]
+    public async Task SelectDistinct_ElidedWhenPKIncluded()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // DISTINCT is redundant when PK (id) is in the projection
+        cmd.CommandText = "EXPLAIN SELECT DISTINCT id, val FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        Assert.DoesNotContain(details, d => d == "DISTINCT");
+    }
+
+    [Fact]
+    public async Task SelectDistinct_ElidedForSelectStar()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // SELECT DISTINCT * always includes the PK
+        cmd.CommandText = "EXPLAIN SELECT DISTINCT * FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        Assert.DoesNotContain(details, d => d == "DISTINCT");
+    }
+
+    [Fact]
+    public async Task SelectDistinct_NotElidedWithoutPK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // DISTINCT on non-PK column only — cannot be elided
+        cmd.CommandText = "EXPLAIN SELECT DISTINCT val FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        Assert.Contains(details, d => d == "DISTINCT");
+    }
+
+    [Fact]
+    public async Task SelectDistinct_NotElidedWithPartialCompositePK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Only one of two PK columns — partial PK is not unique, DISTINCT must remain
+        cmd.CommandText = "EXPLAIN SELECT DISTINCT a FROM t";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        Assert.Contains(details, d => d == "DISTINCT");
+    }
 }

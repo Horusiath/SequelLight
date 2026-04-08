@@ -8,6 +8,7 @@ namespace SequelLight.Queries;
 /// Rule 1: Constant folding — evaluate constant subexpressions and simplify logical tautologies.
 /// Rule 2: Predicate pushdown — push WHERE predicates closer to scans through joins.
 /// Rule 3: Projection pushdown — push narrowing projections below joins to reduce column width.
+/// Rule 4: Eliminate redundant DISTINCT — skip when projected columns cover all PK columns.
 /// </summary>
 public static class HeuristicOptimizer
 {
@@ -18,6 +19,7 @@ public static class HeuristicOptimizer
         plan = FoldConstantsInPlan(plan);
         plan = PushDownPredicates(plan);
         plan = PushDownProjections(plan);
+        plan = EliminateRedundantDistinct(plan);
         return plan;
     }
 
@@ -779,4 +781,104 @@ public static class HeuristicOptimizer
                 break;
         }
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Rule 4: Eliminate redundant DISTINCT
+    //
+    // If the projected columns include all primary key columns of the
+    // source table, rows are already unique — DISTINCT is a no-op.
+    // ───────────────────────────────────────────────────────────────────
+
+    private static LogicalPlan EliminateRedundantDistinct(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case DistinctPlan distinct:
+            {
+                var source = EliminateRedundantDistinct(distinct.Source);
+                if (IsGuaranteedUnique(source))
+                    return source;
+                return ReferenceEquals(source, distinct.Source) ? plan : new DistinctPlan(source);
+            }
+            case FilterPlan filter:
+            {
+                var source = EliminateRedundantDistinct(filter.Source);
+                return ReferenceEquals(source, filter.Source) ? plan : new FilterPlan(filter.Predicate, source);
+            }
+            case ProjectPlan project:
+            {
+                var source = EliminateRedundantDistinct(project.Source);
+                return ReferenceEquals(source, project.Source) ? plan : new ProjectPlan(project.Columns, source);
+            }
+            case JoinPlan join:
+            {
+                var left = EliminateRedundantDistinct(join.Left);
+                var right = EliminateRedundantDistinct(join.Right);
+                return ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right)
+                    ? plan : new JoinPlan(left, right, join.Kind, join.Condition);
+            }
+            case AggregatePlan agg:
+            {
+                var source = EliminateRedundantDistinct(agg.Source);
+                return ReferenceEquals(source, agg.Source) ? plan : new AggregatePlan(agg.Columns, source);
+            }
+            case LimitPlan limit:
+            {
+                var source = EliminateRedundantDistinct(limit.Source);
+                return ReferenceEquals(source, limit.Source) ? plan : new LimitPlan(limit.Limit, limit.Offset, source);
+            }
+            default:
+                return plan;
+        }
+    }
+
+    /// <summary>
+    /// Returns true if the plan's output rows are guaranteed unique —
+    /// meaning a wrapping DISTINCT is redundant.
+    /// </summary>
+    private static bool IsGuaranteedUnique(LogicalPlan plan)
+    {
+        // ProjectPlan over a single-table scan: unique if projection includes all PK columns
+        if (plan is ProjectPlan project)
+        {
+            var scan = FindLeafScan(project.Source);
+            if (scan is null) return false;
+
+            // Collect PK column names
+            var pkColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var col in scan.Table.Columns)
+                if (col.IsPrimaryKey)
+                    pkColumns.Add(col.Name);
+            if (pkColumns.Count == 0) return false;
+
+            // Check that every PK column appears in the projection
+            foreach (var rc in project.Columns)
+            {
+                switch (rc)
+                {
+                    case StarResultColumn:
+                        return true; // SELECT * always includes PKs
+                    case TableStarResultColumn:
+                        return true; // table.* from the same table includes PKs
+                    case ExprResultColumn { Expression: ColumnRefExpr col }:
+                        pkColumns.Remove(col.Column);
+                        break;
+                }
+            }
+            return pkColumns.Count == 0;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Walks through FilterPlan wrappers to find a leaf ScanPlan.
+    /// Returns null if the source is not a simple filtered table scan.
+    /// </summary>
+    private static ScanPlan? FindLeafScan(LogicalPlan plan) => plan switch
+    {
+        ScanPlan scan => scan,
+        FilterPlan filter => FindLeafScan(filter.Source),
+        _ => null,
+    };
 }
