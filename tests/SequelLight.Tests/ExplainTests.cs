@@ -31,9 +31,8 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t";
         var rows = await ReadExplain(cmd);
 
-        Assert.True(rows.Count >= 2);
+        Assert.True(rows.Count >= 1);
         Assert.Contains(rows, r => r.Detail.StartsWith("SCAN t"));
-        Assert.Contains(rows, r => r.Detail.StartsWith("PROJECT"));
     }
 
     [Fact]

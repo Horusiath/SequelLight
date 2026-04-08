@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.Text;
+using SequelLight.Data;
 using SequelLight.Parsing;
 using SequelLight.Parsing.Ast;
 
@@ -94,7 +96,7 @@ internal static class PlanFormatter
     private static string FormatFilter(Filter filter)
     {
         var sb = new StringBuilder("FILTER ");
-        SqlWriter.AppendExpr(sb, filter.Predicate);
+        SqlWriter.AppendExpr(sb, UnresolveExpr(filter.Predicate, filter.Projection));
         return sb.ToString();
     }
 
@@ -120,7 +122,7 @@ internal static class PlanFormatter
         if (join.Condition is not null)
         {
             sb.Append(" ON ");
-            SqlWriter.AppendExpr(sb, join.Condition);
+            SqlWriter.AppendExpr(sb, UnresolveExpr(join.Condition, join.Projection));
         }
         return sb.ToString();
     }
@@ -156,4 +158,36 @@ internal static class PlanFormatter
         JoinKind.Comma => "CROSS",
         _ => kind.ToString().ToUpperInvariant(),
     };
+
+    /// <summary>
+    /// Replaces <see cref="ResolvedColumnExpr"/> and <see cref="ResolvedLiteralExpr"/>
+    /// with their AST equivalents so <see cref="SqlWriter.AppendExpr"/> can format them.
+    /// </summary>
+    private static SqlExpr UnresolveExpr(SqlExpr expr, Projection projection) => expr switch
+    {
+        ResolvedColumnExpr col => new ColumnRefExpr(null, null, projection.GetName(col.Ordinal)),
+        ResolvedLiteralExpr lit => UnresolveLiteral(lit.Value),
+        BinaryExpr b => b with { Left = UnresolveExpr(b.Left, projection), Right = UnresolveExpr(b.Right, projection) },
+        UnaryExpr u => u with { Operand = UnresolveExpr(u.Operand, projection) },
+        IsExpr i => i with { Left = UnresolveExpr(i.Left, projection), Right = UnresolveExpr(i.Right, projection) },
+        NullTestExpr n => n with { Operand = UnresolveExpr(n.Operand, projection) },
+        BetweenExpr bt => bt with
+        {
+            Operand = UnresolveExpr(bt.Operand, projection),
+            Low = UnresolveExpr(bt.Low, projection),
+            High = UnresolveExpr(bt.High, projection),
+        },
+        CastExpr c => c with { Operand = UnresolveExpr(c.Operand, projection) },
+        _ => expr,
+    };
+
+    private static LiteralExpr UnresolveLiteral(DbValue value)
+    {
+        if (value.IsNull) return new LiteralExpr(LiteralKind.Null, "NULL");
+        var t = value.Type;
+        if (t.IsInteger()) return new LiteralExpr(LiteralKind.Integer, value.AsInteger().ToString(CultureInfo.InvariantCulture));
+        if (t == DbType.Float64) return new LiteralExpr(LiteralKind.Real, value.AsReal().ToString(CultureInfo.InvariantCulture));
+        if (t == DbType.Text) return new LiteralExpr(LiteralKind.String, Encoding.UTF8.GetString(value.AsText().Span));
+        return new LiteralExpr(LiteralKind.Null, "NULL");
+    }
 }
