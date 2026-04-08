@@ -59,3 +59,17 @@ public sealed class JoinPlan : LogicalPlan
         Condition = condition;
     }
 }
+
+public sealed class LimitPlan : LogicalPlan
+{
+    public long Limit { get; }
+    public long Offset { get; }
+    public LogicalPlan Source { get; }
+
+    public LimitPlan(long limit, long offset, LogicalPlan source)
+    {
+        Limit = limit;
+        Offset = offset;
+        Source = source;
+    }
+}

@@ -50,6 +50,11 @@ public static class HeuristicOptimizer
                 var columns = FoldResultColumns(project.Columns);
                 return new ProjectPlan(columns, source);
             }
+            case LimitPlan limit:
+            {
+                var source = FoldConstantsInPlan(limit.Source);
+                return new LimitPlan(limit.Limit, limit.Offset, source);
+            }
             default:
                 return plan;
         }
@@ -239,6 +244,11 @@ public static class HeuristicOptimizer
                 var source = PushDownPredicates(project.Source);
                 return new ProjectPlan(project.Columns, source);
             }
+            case LimitPlan limit:
+            {
+                var source = PushDownPredicates(limit.Source);
+                return new LimitPlan(limit.Limit, limit.Offset, source);
+            }
             default:
                 return plan;
         }
@@ -371,6 +381,9 @@ public static class HeuristicOptimizer
                 break;
             case ProjectPlan project:
                 CollectTableAliasesRecursive(project.Source, result);
+                break;
+            case LimitPlan limit:
+                CollectTableAliasesRecursive(limit.Source, result);
                 break;
         }
     }
@@ -509,6 +522,12 @@ public static class HeuristicOptimizer
                 return new ProjectPlan(project.Columns, source);
             }
 
+            case LimitPlan limit:
+            {
+                var source = PushProjectionsInto(limit.Source, required, allColumnsNeeded);
+                return new LimitPlan(limit.Limit, limit.Offset, source);
+            }
+
             default:
                 return plan; // ScanPlan, DualPlan — leaf nodes
         }
@@ -614,6 +633,8 @@ public static class HeuristicOptimizer
                 return project.Columns.Length;
             case JoinPlan join:
                 return CountAvailableColumns(join.Left) + CountAvailableColumns(join.Right);
+            case LimitPlan limit:
+                return CountAvailableColumns(limit.Source);
             default:
                 return 0;
         }
@@ -682,6 +703,9 @@ public static class HeuristicOptimizer
                 break;
             case ProjectPlan project:
                 CollectAvailableColumns(project.Source, result);
+                break;
+            case LimitPlan limit:
+                CollectAvailableColumns(limit.Source, result);
                 break;
             case JoinPlan join:
                 CollectAvailableColumns(join.Left, result);

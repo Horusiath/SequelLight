@@ -2160,3 +2160,191 @@ public class OrderByTests : TempDirTest
         Assert.False(await reader.ReadAsync());
     }
 }
+
+public class LimitTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    private async Task SetupTable(SequelLightConnection conn)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'alice', 10), (2, 'bob', 30), (3, 'charlie', 20), (4, 'dave', 50), (5, 'eve', 40)";
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task Limit_ReturnsFirstNRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t LIMIT 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(1L, rows[0]);
+        Assert.Equal(2L, rows[1]);
+    }
+
+    [Fact]
+    public async Task Limit_WithOffset()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t LIMIT 2 OFFSET 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(2L, rows[0]);
+        Assert.Equal(3L, rows[1]);
+    }
+
+    [Fact]
+    public async Task Limit_Zero_ReturnsEmpty()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t LIMIT 0";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Limit_ExceedsRowCount_ReturnsAll()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t LIMIT 100";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(5, rows.Count);
+    }
+
+    [Fact]
+    public async Task Offset_ExceedsRowCount_ReturnsEmpty()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t LIMIT 5 OFFSET 100";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Limit_WithOrderBy()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t ORDER BY id DESC LIMIT 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(5L, rows[0]);
+        Assert.Equal(4L, rows[1]);
+    }
+
+    [Fact]
+    public async Task Limit_WithOrderByAndOffset()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, name FROM t ORDER BY name ASC LIMIT 2 OFFSET 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        // Sorted by name ASC: alice, bob, charlie, dave, eve → skip 1, take 2 → bob, charlie
+        Assert.Equal(2, rows.Count);
+        Assert.Equal((2L, "bob"), rows[0]);
+        Assert.Equal((3L, "charlie"), rows[1]);
+    }
+
+    [Fact]
+    public async Task Limit_WithWhere()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupTable(conn);
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE value > 20 LIMIT 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<long>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetInt64(0));
+
+        // Rows with value > 20: (2, bob, 30), (4, dave, 50), (5, eve, 40) → first 2
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(2L, rows[0]);
+        Assert.Equal(4L, rows[1]);
+    }
+
+    [Fact]
+    public async Task Limit_WithJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id LIMIT 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string, long)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetInt64(1)));
+
+        Assert.Equal(2, rows.Count);
+    }
+}

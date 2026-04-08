@@ -22,26 +22,47 @@ public sealed class QueryPlanner
         if (stmt.Compounds.Length > 0)
             throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
 
+        long? limit = EvaluateLimitOffset(stmt.Limit);
+        long? offset = EvaluateLimitOffset(stmt.Offset);
+
+        // Negative limit means no limit (SQLite-compatible)
+        if (limit < 0) limit = null;
+        if (offset is null or <= 0) offset = null;
+
         return stmt.First switch
         {
-            SelectCore core => PlanSelectCore(core, stmt.OrderBy, tx),
-            ValuesBody values => new ValuesEnumerator(values.Rows),
+            SelectCore core => PlanSelectCore(core, stmt.OrderBy, limit, offset, tx),
+            ValuesBody values => WrapWithLimit(new ValuesEnumerator(values.Rows), limit, offset),
             _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
         };
     }
 
-    private IDbEnumerator PlanSelectCore(SelectCore core, OrderingTerm[]? orderBy, ReadOnlyTransaction tx)
+    private static long? EvaluateLimitOffset(SqlExpr? expr)
+    {
+        if (expr is null) return null;
+        var value = ExprEvaluator.Evaluate(expr, Array.Empty<DbValue>(), new Projection(Array.Empty<QualifiedName>()));
+        return value.IsNull ? null : value.AsInteger();
+    }
+
+    private static IDbEnumerator WrapWithLimit(IDbEnumerator source, long? limit, long? offset)
+    {
+        if (limit is null && offset is null) return source;
+        return new LimitEnumerator(source, limit ?? long.MaxValue, offset ?? 0);
+    }
+
+    private IDbEnumerator PlanSelectCore(SelectCore core, OrderingTerm[]? orderBy,
+        long? limit, long? offset, ReadOnlyTransaction tx)
     {
         var logical = BuildLogicalPlan(core);
         logical = HeuristicOptimizer.Optimize(logical);
 
         // No ORDER BY — use the existing fast path
         if (orderBy is not { Length: > 0 })
-            return BuildPhysical(logical, tx);
+            return WrapWithLimit(BuildPhysical(logical, tx), limit, offset);
 
         // Peel off the top-level ProjectPlan (always present from BuildLogicalPlan)
         if (logical is not ProjectPlan topProject)
-            return BuildPhysical(logical, tx);
+            return WrapWithLimit(BuildPhysical(logical, tx), limit, offset);
 
         // Build physical plan for the pre-projection source, tracking sort order
         var (source, providedOrder) = BuildPhysicalWithOrder(topProject.Source, tx);
@@ -49,15 +70,22 @@ public sealed class QueryPlanner
         // Compute how many ORDER BY terms the physical plan already satisfies
         int nOBSat = ComputeNOBSat(orderBy, providedOrder, source.Projection);
 
-        // Insert sort if not fully satisfied
+        // Insert sort if not fully satisfied — use TopN when LIMIT is present
         if (nOBSat < orderBy.Length)
-            source = BuildSortEnumerator(source, orderBy);
+        {
+            long maxRows = (limit is not null && offset is not null)
+                ? limit.Value + offset.Value
+                : limit ?? 0;
+            source = BuildSortEnumerator(source, orderBy, maxRows > 0 ? maxRows : 0);
+        }
 
         // Apply the final projection
         var selectors = ResolveSelectors(topProject.Columns, source.Projection);
-        return IsIdentityProjection(selectors, source.Projection)
+        IDbEnumerator result = IsIdentityProjection(selectors, source.Projection)
             ? source
             : new Select(source, selectors);
+
+        return WrapWithLimit(result, limit, offset);
     }
 
     private LogicalPlan BuildLogicalPlan(SelectCore core)
@@ -145,6 +173,12 @@ public sealed class QueryPlanner
 
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx).Enumerator;
+
+            case LimitPlan limit:
+            {
+                var child = BuildPhysical(limit.Source, tx);
+                return new LimitEnumerator(child, limit.Limit, limit.Offset);
+            }
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
@@ -301,6 +335,7 @@ public sealed class QueryPlanner
             ScanPlan scan => scan.Alias,
             FilterPlan filter => GetPlanAlias(filter.Source),
             ProjectPlan project => GetPlanAlias(project.Source),
+            LimitPlan limit => GetPlanAlias(limit.Source),
             _ => "t"
         };
     }
@@ -499,6 +534,12 @@ public sealed class QueryPlanner
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx);
 
+            case LimitPlan limit:
+            {
+                var (child, childOrder) = BuildPhysicalWithOrder(limit.Source, tx);
+                return (new LimitEnumerator(child, limit.Limit, limit.Offset), childOrder);
+            }
+
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
         }
@@ -586,7 +627,7 @@ public sealed class QueryPlanner
         return satisfied;
     }
 
-    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy)
+    private static SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0)
     {
         var ordinals = new int[orderBy.Length];
         var orders = new SortOrder[orderBy.Length];
@@ -606,7 +647,7 @@ public sealed class QueryPlanner
             orders[i] = term.Order ?? SortOrder.Asc;
         }
 
-        return new SortEnumerator(source, ordinals, orders);
+        return new SortEnumerator(source, ordinals, orders, maxRows);
     }
 
     private static Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)
