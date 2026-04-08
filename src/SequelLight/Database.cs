@@ -46,6 +46,7 @@ public sealed class Database : IAsyncDisposable
                 or DropStmt or AlterTableStmt => await ExecuteDdlAsync(stmt, transaction).ConfigureAwait(false),
             InsertStmt insert => await ExecuteInsertAsync(insert, parameters, transaction).ConfigureAwait(false),
             UpdateStmt update => await ExecuteUpdateAsync(update, parameters, transaction).ConfigureAwait(false),
+            DeleteStmt delete => await ExecuteDeleteAsync(delete, parameters, transaction).ConfigureAwait(false),
             _ => throw new NotImplementedException()
         };
     }
@@ -394,6 +395,66 @@ public sealed class Database : IAsyncDisposable
         totalUpdated = await UpdateRows(autoTx).ConfigureAwait(false);
         await autoTx.CommitAsync().ConfigureAwait(false);
         return totalUpdated;
+    }
+
+    private async ValueTask<int> ExecuteDeleteAsync(DeleteStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
+    {
+        var table = Schema.GetTable(stmt.Table.Table)
+            ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+
+        var columnNames = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            columnNames[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(columnNames);
+
+        var planner = new QueryPlanner(Schema, parameters);
+        SqlExpr? resolvedWhere = stmt.Where is not null
+            ? planner.ResolveColumns(planner.ResolveBindParametersFromDict(stmt.Where), scanProjection)
+            : null;
+
+        long? limit = null, offset = null;
+        if (stmt.Limit is not null)
+        {
+            var resolved = planner.ResolveBindParametersFromDict(stmt.Limit);
+            var lv = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            limit = lv.IsNull ? null : lv.AsInteger();
+        }
+        if (stmt.Offset is not null)
+        {
+            var resolved = planner.ResolveBindParametersFromDict(stmt.Offset);
+            var ov = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            offset = ov.IsNull ? null : ov.AsInteger();
+        }
+
+        async ValueTask<int> DeleteRows(ReadWriteTransaction rw)
+        {
+            await using var cursor = rw.CreateCursor();
+            IDbEnumerator source = new TableScan(cursor, table);
+
+            if (resolvedWhere is not null)
+                source = new Filter(source, resolvedWhere);
+
+            if (limit.HasValue || offset.HasValue)
+                source = new LimitEnumerator(source, limit ?? long.MaxValue, Math.Max(0, offset ?? 0));
+
+            // Materialize keys to delete (avoid modifying during iteration)
+            var keysToDelete = new List<byte[]>();
+            while (await source.NextAsync().ConfigureAwait(false))
+                keysToDelete.Add(table.EncodeRowKey(source.Current));
+
+            foreach (var key in keysToDelete)
+                rw.Delete(key);
+
+            return keysToDelete.Count;
+        }
+
+        if (transaction is ReadWriteTransaction rwTx)
+            return await DeleteRows(rwTx).ConfigureAwait(false);
+
+        await using var autoTx = _store.BeginReadWrite();
+        var count = await DeleteRows(autoTx).ConfigureAwait(false);
+        await autoTx.CommitAsync().ConfigureAwait(false);
+        return count;
     }
 
     /// <summary>
