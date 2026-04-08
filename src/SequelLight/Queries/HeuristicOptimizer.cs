@@ -268,6 +268,43 @@ public static class HeuristicOptimizer
                 remaining.Add(conjunct);
         }
 
+        // Cross-join → equi-join promotion: absorb cross-table predicates into the
+        // join condition for Comma/Cross joins, promoting the kind to Inner.
+        SqlExpr? newCondition = join.Condition;
+        JoinKind newKind = join.Kind;
+
+        if (join.Kind is JoinKind.Comma or JoinKind.Cross && remaining.Count > 0)
+        {
+            var joinConditions = new List<SqlExpr>();
+            var trulyRemaining = new List<SqlExpr>();
+
+            foreach (var conjunct in remaining)
+            {
+                var refs = CollectColumnRefs(conjunct);
+                bool touchesLeft = false, touchesRight = false;
+                foreach (var r in refs)
+                {
+                    if (r.Table is null) continue;
+                    if (leftTables.Contains(r.Table)) touchesLeft = true;
+                    if (rightTables.Contains(r.Table)) touchesRight = true;
+                }
+
+                if (touchesLeft && touchesRight)
+                    joinConditions.Add(conjunct);
+                else
+                    trulyRemaining.Add(conjunct);
+            }
+
+            if (joinConditions.Count > 0)
+            {
+                newCondition = CombineAnd(joinConditions);
+                if (join.Condition is not null)
+                    newCondition = new BinaryExpr(join.Condition, BinaryOp.And, newCondition);
+                newKind = JoinKind.Inner;
+                remaining = trulyRemaining;
+            }
+        }
+
         var left = PushDownPredicates(join.Left);
         var right = PushDownPredicates(join.Right);
 
@@ -276,7 +313,7 @@ public static class HeuristicOptimizer
         if (rightPredicates.Count > 0)
             right = new FilterPlan(CombineAnd(rightPredicates), right);
 
-        LogicalPlan result = new JoinPlan(left, right, join.Kind, join.Condition);
+        LogicalPlan result = new JoinPlan(left, right, newKind, newCondition);
         if (remaining.Count > 0)
             result = new FilterPlan(CombineAnd(remaining), result);
 

@@ -1309,6 +1309,84 @@ public class HeuristicOptimizerTests
         Assert.IsType<ResolvedLiteralExpr>(binary.Right);
     }
 
+    // ─── Cross-join promotion tests ──────────────────────────────────
+
+    [Fact]
+    public void CrossJoin_Promotion_Absorbs_Equi_Predicate()
+    {
+        // FilterPlan(t1.x = t2.x, JoinPlan(Comma)) → JoinPlan(Inner, ON t1.x = t2.x)
+        var t1 = new ScanPlan(CreateDummyTable("t1"), "t1");
+        var t2 = new ScanPlan(CreateDummyTable("t2"), "t2");
+        var join = new JoinPlan(t1, t2, JoinKind.Comma, null);
+        var filter = new FilterPlan(
+            new BinaryExpr(
+                new ColumnRefExpr(null, "t1", "x"),
+                BinaryOp.Equal,
+                new ColumnRefExpr(null, "t2", "x")),
+            join);
+
+        var optimized = HeuristicOptimizer.Optimize(filter);
+
+        // Should be promoted to Inner join with condition, no filter above
+        var joinResult = Assert.IsType<JoinPlan>(optimized);
+        Assert.Equal(JoinKind.Inner, joinResult.Kind);
+        Assert.NotNull(joinResult.Condition);
+    }
+
+    [Fact]
+    public void CrossJoin_Promotion_Splits_Mixed_Predicates()
+    {
+        // FilterPlan(t1.x = t2.x AND t1.x > 5, JoinPlan(Comma))
+        // → JoinPlan(Inner, ON t1.x = t2.x) with t1.x > 5 pushed to left
+        var t1 = new ScanPlan(CreateDummyTable("t1"), "t1");
+        var t2 = new ScanPlan(CreateDummyTable("t2"), "t2");
+        var join = new JoinPlan(t1, t2, JoinKind.Comma, null);
+        var pred = new BinaryExpr(
+            new BinaryExpr(
+                new ColumnRefExpr(null, "t1", "x"), BinaryOp.Equal,
+                new ColumnRefExpr(null, "t2", "x")),
+            BinaryOp.And,
+            new BinaryExpr(
+                new ColumnRefExpr(null, "t1", "x"), BinaryOp.GreaterThan,
+                new LiteralExpr(LiteralKind.Integer, "5")));
+        var filter = new FilterPlan(pred, join);
+
+        var optimized = HeuristicOptimizer.Optimize(filter);
+
+        // Join promoted to Inner with equi-condition
+        var joinResult = Assert.IsType<JoinPlan>(optimized);
+        Assert.Equal(JoinKind.Inner, joinResult.Kind);
+        Assert.NotNull(joinResult.Condition);
+        // t1.x > 5 should be pushed down to left side as a filter
+        Assert.IsType<FilterPlan>(joinResult.Left);
+    }
+
+    [Fact]
+    public void CrossJoin_Promotion_Skipped_For_Inner_Join()
+    {
+        // FilterPlan(t1.x > 5, JoinPlan(Inner, ON t1.x = t2.x))
+        // Inner join is not Comma/Cross — no promotion needed, just normal pushdown
+        var t1 = new ScanPlan(CreateDummyTable("t1"), "t1");
+        var t2 = new ScanPlan(CreateDummyTable("t2"), "t2");
+        var joinCond = new BinaryExpr(
+            new ColumnRefExpr(null, "t1", "x"), BinaryOp.Equal,
+            new ColumnRefExpr(null, "t2", "x"));
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, joinCond);
+        var filter = new FilterPlan(
+            new BinaryExpr(
+                new ColumnRefExpr(null, "t1", "x"), BinaryOp.GreaterThan,
+                new LiteralExpr(LiteralKind.Integer, "5")),
+            join);
+
+        var optimized = HeuristicOptimizer.Optimize(filter);
+
+        // Join stays Inner, filter pushed to left
+        var joinResult = Assert.IsType<JoinPlan>(optimized);
+        Assert.Equal(JoinKind.Inner, joinResult.Kind);
+        Assert.IsType<FilterPlan>(joinResult.Left);
+        Assert.IsType<ScanPlan>(joinResult.Right);
+    }
+
     private static Schema.TableSchema CreateDummyTable(string name)
     {
         return new Schema.TableSchema(
@@ -1554,6 +1632,74 @@ public class ConstantFoldingIntegrationTests : TempDirTest
 
         Assert.Single(rows);
         Assert.Equal("c", rows[0]);
+    }
+}
+
+public class CrossJoinPromotionIntegrationTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task CommaJoin_With_Equality_Returns_Correct_Results()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 'x'), (2, 'y'), (3, 'z')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 'p'), (2, 'q'), (4, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Old-style comma join — should be promoted to INNER JOIN
+        cmd.CommandText = "SELECT a.name, b.info FROM a, b WHERE a.id = b.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Name, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("x", "p"), rows);
+        Assert.Contains(("y", "q"), rows);
+    }
+
+    [Fact]
+    public async Task CommaJoin_With_Mixed_Where()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO b VALUES (1, 'p'), (2, 'q'), (3, 'r')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Comma join with mixed WHERE: equi-join + single-table filter
+        cmd.CommandText = "SELECT a.val, b.info FROM a, b WHERE a.id = b.id AND a.val > 15";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long Val, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains((20L, "q"), rows);
+        Assert.Contains((30L, "r"), rows);
     }
 }
 
