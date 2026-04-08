@@ -50,6 +50,12 @@ public static class HeuristicOptimizer
                 var columns = FoldResultColumns(project.Columns);
                 return new ProjectPlan(columns, source);
             }
+            case AggregatePlan agg:
+            {
+                var source = FoldConstantsInPlan(agg.Source);
+                var columns = FoldResultColumns(agg.Columns);
+                return new AggregatePlan(columns, source);
+            }
             case LimitPlan limit:
             {
                 var source = FoldConstantsInPlan(limit.Source);
@@ -197,6 +203,33 @@ public static class HeuristicOptimizer
                 return ReferenceEquals(operand, cast.Operand) ? expr : new CastExpr(operand, cast.Type);
             }
 
+            case FunctionCallExpr func:
+            {
+                var args = new SqlExpr[func.Arguments.Length];
+                bool changed = false;
+                bool allConst = true;
+                for (int i = 0; i < func.Arguments.Length; i++)
+                {
+                    args[i] = FoldConstants(func.Arguments[i]);
+                    if (!ReferenceEquals(args[i], func.Arguments[i])) changed = true;
+                    if (args[i] is not ResolvedLiteralExpr) allConst = false;
+                }
+                var filter = func.FilterWhere is not null ? FoldConstants(func.FilterWhere) : null;
+                if (!ReferenceEquals(filter, func.FilterWhere)) changed = true;
+                var folded = changed ? func with { Arguments = args, FilterWhere = filter } : func;
+
+                // Constant-fold idempotent functions with all-constant args
+                if (allConst && func.Arguments.Length > 0)
+                {
+                    if (Functions.FunctionRegistry.TryGetScalar(func.Name, out var def) && def.IsIdempotent)
+                    {
+                        var result = TryEvaluate(folded);
+                        if (result is not null) return result;
+                    }
+                }
+                return folded;
+            }
+
             default:
                 return expr;
         }
@@ -246,6 +279,11 @@ public static class HeuristicOptimizer
             {
                 var source = PushDownPredicates(project.Source);
                 return new ProjectPlan(project.Columns, source);
+            }
+            case AggregatePlan agg:
+            {
+                var source = PushDownPredicates(agg.Source);
+                return new AggregatePlan(agg.Columns, source);
             }
             case LimitPlan limit:
             {
@@ -426,6 +464,12 @@ public static class HeuristicOptimizer
                 break;
             case CastExpr cast:
                 CollectColumnRefsRecursive(cast.Operand, result);
+                break;
+            case FunctionCallExpr func:
+                foreach (var arg in func.Arguments)
+                    CollectColumnRefsRecursive(arg, result);
+                if (func.FilterWhere is not null)
+                    CollectColumnRefsRecursive(func.FilterWhere, result);
                 break;
         }
     }

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using SequelLight.Data;
+using SequelLight.Functions;
 using SequelLight.Parsing.Ast;
 
 namespace SequelLight.Queries;
@@ -44,6 +45,9 @@ public static class ExprEvaluator
             case CastExpr cast:
                 return EvaluateCast(cast, row, projection);
 
+            case FunctionCallExpr func:
+                return EvaluateFunction(func, row, projection);
+
             case RaiseExpr raise:
                 throw new TriggerRaiseException(raise.Kind, raise.ErrorMessage);
 
@@ -56,6 +60,22 @@ public static class ExprEvaluator
             default:
                 throw new NotSupportedException($"Expression type '{expr.GetType().Name}' is not supported in evaluation.");
         }
+    }
+
+    private static DbValue EvaluateFunction(FunctionCallExpr func, DbValue[] row, Projection projection)
+    {
+        if (!FunctionRegistry.TryGetScalar(func.Name, out var def))
+            throw new InvalidOperationException($"Unknown function: {func.Name}");
+
+        int argCount = func.Arguments.Length;
+        if (argCount < def.MinArgs || argCount > def.MaxArgs)
+            throw new InvalidOperationException(
+                $"Function '{func.Name}' expects {def.MinArgs}-{def.MaxArgs} arguments, got {argCount}.");
+
+        var args = new DbValue[argCount];
+        for (int i = 0; i < argCount; i++)
+            args[i] = Evaluate(func.Arguments[i], row, projection);
+        return def.Invoke(args);
     }
 
     internal static DbValue EvaluateLiteral(LiteralExpr lit)

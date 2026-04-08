@@ -67,6 +67,11 @@ internal static class PlanFormatter
                 Visit(limit.Source, id, rows);
                 break;
 
+            case AggregateEnumerator agg:
+                rows.Add((id, parentId, FormatAggregate(agg)));
+                Visit(agg.Source, id, rows);
+                break;
+
             case DualEnumerator:
                 rows.Add((id, parentId, "CONSTANT ROW"));
                 break;
@@ -141,6 +146,26 @@ internal static class PlanFormatter
             if (i > 0) sb.Append(", ");
             sb.Append(sourceProjection.GetName(sort.KeyOrdinals[i]));
             sb.Append(sort.KeyOrders[i] == SortOrder.Desc ? " DESC" : " ASC");
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatAggregate(AggregateEnumerator agg)
+    {
+        var sb = new StringBuilder("AGGREGATE ");
+        for (int i = 0; i < agg.Aggregates.Length; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            ref readonly var desc = ref agg.Aggregates[i];
+            if (desc.IsStar) sb.Append("count(*)");
+            else
+            {
+                sb.Append(desc.Function.GetType().Name.Replace("Aggregate", "").ToLowerInvariant());
+                sb.Append('(');
+                if (desc.Distinct) sb.Append("DISTINCT ");
+                sb.Append(string.Join(", ", desc.ArgExprs.Select(a => a.ToString())));
+                sb.Append(')');
+            }
         }
         return sb.ToString();
     }

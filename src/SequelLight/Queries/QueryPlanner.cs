@@ -197,8 +197,23 @@ public sealed class QueryPlanner
             BinaryExpr b => b with { Left = ResolveBindParametersFromDict(b.Left), Right = ResolveBindParametersFromDict(b.Right) },
             UnaryExpr u => u with { Operand = ResolveBindParametersFromDict(u.Operand) },
             CastExpr c => c with { Operand = ResolveBindParametersFromDict(c.Operand) },
+            FunctionCallExpr func => ResolveBindParamsInFunction(func),
             _ => expr,
         };
+    }
+
+    private FunctionCallExpr ResolveBindParamsInFunction(FunctionCallExpr func)
+    {
+        var args = new SqlExpr[func.Arguments.Length];
+        bool changed = false;
+        for (int i = 0; i < func.Arguments.Length; i++)
+        {
+            args[i] = ResolveBindParametersFromDict(func.Arguments[i]);
+            if (!ReferenceEquals(args[i], func.Arguments[i])) changed = true;
+        }
+        var filter = func.FilterWhere is not null ? ResolveBindParametersFromDict(func.FilterWhere) : null;
+        if (!changed && ReferenceEquals(filter, func.FilterWhere)) return func;
+        return func with { Arguments = args, FilterWhere = filter };
     }
 
     private DbValue LookupParameterByName(string name)
@@ -240,6 +255,13 @@ public sealed class QueryPlanner
                 var condition = join.Condition is not null ? ResolveParamExpr(join.Condition, paramMap) : null;
                 return ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right) && ReferenceEquals(condition, join.Condition)
                     ? plan : new JoinPlan(left, right, join.Kind, condition);
+            }
+            case AggregatePlan agg:
+            {
+                var source = ResolveParameterOrdinals(agg.Source, paramMap);
+                var columns = ResolveParamColumns(agg.Columns, paramMap);
+                return ReferenceEquals(source, agg.Source) && ReferenceEquals(columns, agg.Columns)
+                    ? plan : new AggregatePlan(columns, source);
             }
             case LimitPlan limit:
             {
@@ -290,8 +312,23 @@ public sealed class QueryPlanner
                 High = ResolveParamExpr(bt.High, paramMap)!,
             },
             CastExpr c => c with { Operand = ResolveParamExpr(c.Operand, paramMap)! },
+            FunctionCallExpr func => ResolveParamExprInFunction(func, paramMap),
             _ => expr,
         };
+    }
+
+    private static FunctionCallExpr ResolveParamExprInFunction(FunctionCallExpr func, Dictionary<string, int> paramMap)
+    {
+        var args = new SqlExpr[func.Arguments.Length];
+        bool changed = false;
+        for (int i = 0; i < func.Arguments.Length; i++)
+        {
+            args[i] = ResolveParamExpr(func.Arguments[i], paramMap)!;
+            if (!ReferenceEquals(args[i], func.Arguments[i])) changed = true;
+        }
+        var filter = func.FilterWhere is not null ? ResolveParamExpr(func.FilterWhere, paramMap) : null;
+        if (!changed && ReferenceEquals(filter, func.FilterWhere)) return func;
+        return func with { Arguments = args, FilterWhere = filter };
     }
 
     private static int GetOrAddParamOrdinal(string name, Dictionary<string, int> paramMap)
@@ -386,7 +423,6 @@ public sealed class QueryPlanner
 
         if (core.From is null)
         {
-            // SELECT without FROM — single row of expressions
             source = new DualPlan();
         }
         else
@@ -397,8 +433,35 @@ public sealed class QueryPlanner
         if (core.Where is not null)
             source = new FilterPlan(core.Where, source);
 
+        // Detect aggregate functions in SELECT columns
+        if (ContainsAggregate(core.Columns))
+            return new AggregatePlan(core.Columns, source);
+
         source = new ProjectPlan(core.Columns, source);
         return source;
+    }
+
+    private static bool ContainsAggregate(ResultColumn[] columns)
+    {
+        foreach (var col in columns)
+        {
+            if (col is ExprResultColumn erc && ContainsAggregateExpr(erc.Expression))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool ContainsAggregateExpr(SqlExpr expr)
+    {
+        return expr switch
+        {
+            FunctionCallExpr func => Functions.FunctionRegistry.IsAggregate(func.Name,
+                func.IsStar ? 0 : func.Arguments.Length),
+            BinaryExpr b => ContainsAggregateExpr(b.Left) || ContainsAggregateExpr(b.Right),
+            UnaryExpr u => ContainsAggregateExpr(u.Operand),
+            CastExpr c => ContainsAggregateExpr(c.Operand),
+            _ => false,
+        };
     }
 
     private LogicalPlan BuildFromPlan(JoinClause from)
@@ -466,6 +529,9 @@ public sealed class QueryPlanner
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx).Enumerator;
 
+            case AggregatePlan agg:
+                return BuildAggregate(agg, tx);
+
             case LimitPlan limit:
             {
                 var child = BuildPhysical(limit.Source, tx);
@@ -476,6 +542,103 @@ public sealed class QueryPlanner
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
         }
     }
+
+    private AggregateEnumerator BuildAggregate(AggregatePlan plan, ReadOnlyTransaction tx)
+    {
+        var child = BuildPhysical(plan.Source, tx);
+        var sourceProjection = child.Projection;
+
+        var outputNames = new List<QualifiedName>();
+        var aggregates = new List<AggregateDescriptor>();
+        var passThru = new List<int>(); // -1 = aggregate, >= 0 = source column index
+
+        foreach (var col in plan.Columns)
+        {
+            switch (col)
+            {
+                case StarResultColumn:
+                    for (int i = 0; i < sourceProjection.ColumnCount; i++)
+                    {
+                        outputNames.Add(sourceProjection.GetQualifiedName(i));
+                        passThru.Add(i);
+                    }
+                    break;
+
+                case TableStarResultColumn ts:
+                    for (int i = 0; i < sourceProjection.ColumnCount; i++)
+                    {
+                        var qn = sourceProjection.GetQualifiedName(i);
+                        if (qn.Table is not null && string.Equals(qn.Table, ts.Table, StringComparison.OrdinalIgnoreCase))
+                        {
+                            outputNames.Add(qn);
+                            passThru.Add(i);
+                        }
+                    }
+                    break;
+
+                case ExprResultColumn erc:
+                    if (TryExtractAggregate(erc.Expression, sourceProjection, out var desc))
+                    {
+                        var name = erc.Alias ?? FormatFunctionName(erc.Expression);
+                        outputNames.Add(new QualifiedName(null, name));
+                        aggregates.Add(desc);
+                        passThru.Add(-1); // aggregate slot
+                    }
+                    else
+                    {
+                        // Non-aggregate column in aggregate query: pass through (arbitrary value)
+                        var name = new QualifiedName(null, erc.Alias ?? erc.Expression.ToString()!);
+                        outputNames.Add(name);
+                        if (erc.Expression is ColumnRefExpr colRef)
+                        {
+                            if (sourceProjection.TryGetOrdinalByColumn(colRef.Column, out int ord))
+                                passThru.Add(ord);
+                            else
+                                passThru.Add(0);
+                        }
+                        else
+                        {
+                            passThru.Add(0);
+                        }
+                    }
+                    break;
+            }
+        }
+
+        var projection = new Projection(outputNames.ToArray());
+        return new AggregateEnumerator(child, aggregates.ToArray(), passThru.ToArray(), projection);
+    }
+
+    private bool TryExtractAggregate(SqlExpr expr, Projection sourceProjection, out AggregateDescriptor desc)
+    {
+        desc = default;
+        if (expr is not FunctionCallExpr func)
+            return false;
+        if (!Functions.FunctionRegistry.IsAggregate(func.Name, func.IsStar ? 0 : func.Arguments.Length))
+            return false;
+
+        var agg = Functions.FunctionRegistry.CreateAggregate(func.Name);
+        if (agg is Functions.AggregateFunctions.CountAggregate countAgg && func.IsStar)
+            countAgg.IsStar = true;
+
+        var resolvedArgs = new SqlExpr[func.Arguments.Length];
+        for (int i = 0; i < func.Arguments.Length; i++)
+            resolvedArgs[i] = ResolveColumns(func.Arguments[i], sourceProjection);
+
+        SqlExpr? resolvedFilter = func.FilterWhere is not null
+            ? ResolveColumns(func.FilterWhere, sourceProjection)
+            : null;
+
+        desc = new AggregateDescriptor(agg, resolvedArgs, func.IsStar, func.Distinct, resolvedFilter);
+        return true;
+    }
+
+    private static string FormatFunctionName(SqlExpr expr) => expr switch
+    {
+        FunctionCallExpr { IsStar: true } f => $"{f.Name}(*)",
+        FunctionCallExpr f => $"{f.Name}({string.Join(", ", f.Arguments.Select(a => a.ToString()))})",
+        _ => expr.ToString()!,
+    };
 
     private static TableScan BuildTableScan(ScanPlan scan, ReadOnlyTransaction tx)
     {
@@ -627,6 +790,7 @@ public sealed class QueryPlanner
             ScanPlan scan => scan.Alias,
             FilterPlan filter => GetPlanAlias(filter.Source),
             ProjectPlan project => GetPlanAlias(project.Source),
+            AggregatePlan agg => GetPlanAlias(agg.Source),
             LimitPlan limit => GetPlanAlias(limit.Source),
             _ => "t"
         };
@@ -695,8 +859,23 @@ public sealed class QueryPlanner
                 High = ResolveColumns(between.High, projection),
             },
             CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
+            FunctionCallExpr func => ResolveFunctionColumns(func, projection),
             _ => expr,
         };
+    }
+
+    private FunctionCallExpr ResolveFunctionColumns(FunctionCallExpr func, Projection projection)
+    {
+        var args = new SqlExpr[func.Arguments.Length];
+        bool changed = false;
+        for (int i = 0; i < func.Arguments.Length; i++)
+        {
+            args[i] = ResolveColumns(func.Arguments[i], projection);
+            if (!ReferenceEquals(args[i], func.Arguments[i])) changed = true;
+        }
+        var filter = func.FilterWhere is not null ? ResolveColumns(func.FilterWhere, projection) : null;
+        if (!changed && ReferenceEquals(filter, func.FilterWhere)) return func;
+        return func with { Arguments = args, FilterWhere = filter };
     }
 
     private static ResolvedColumnExpr ResolveColumnRef(ColumnRefExpr col, Projection projection)
@@ -827,6 +1006,9 @@ public sealed class QueryPlanner
 
             case JoinPlan join:
                 return BuildJoinWithOrder(join, tx);
+
+            case AggregatePlan agg:
+                return (BuildAggregate(agg, tx), Array.Empty<SortKey>());
 
             case LimitPlan limit:
             {

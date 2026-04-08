@@ -60,6 +60,22 @@ public sealed class JoinPlan : LogicalPlan
     }
 }
 
+/// <summary>
+/// Aggregate plan: materializes all source rows, computes aggregate functions,
+/// and emits a single summary row (without GROUP BY) or one row per group.
+/// </summary>
+public sealed class AggregatePlan : LogicalPlan
+{
+    public ResultColumn[] Columns { get; }
+    public LogicalPlan Source { get; }
+
+    public AggregatePlan(ResultColumn[] columns, LogicalPlan source)
+    {
+        Columns = columns;
+        Source = source;
+    }
+}
+
 public sealed class LimitPlan : LogicalPlan
 {
     public SqlExpr Limit { get; }
