@@ -1013,6 +1013,156 @@ public class HeuristicOptimizerTests
         Assert.IsType<ScanPlan>(joinResult.Right);
     }
 
+    [Fact]
+    public void Projection_Pushdown_Through_Join()
+    {
+        // t1(id PK, name, age), t2(id PK, data, extra)
+        // SELECT t1.id, t1.name, t2.data FROM t1 JOIN t2 ON ...
+        // Expected: narrowing projections inserted below the join
+        var t1 = new ScanPlan(CreateMultiColumnTable("t1", "id", "name", "age"), "t1");
+        var t2 = new ScanPlan(CreateMultiColumnTable("t2", "id", "data", "extra"), "t2");
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, null);
+        var project = new ProjectPlan(
+        [
+            new ExprResultColumn(new ColumnRefExpr(null, "t1", "id"), null),
+            new ExprResultColumn(new ColumnRefExpr(null, "t1", "name"), null),
+            new ExprResultColumn(new ColumnRefExpr(null, "t2", "data"), null),
+        ], join);
+
+        var optimized = HeuristicOptimizer.Optimize(project);
+
+        // Top level is still ProjectPlan
+        var topProject = Assert.IsType<ProjectPlan>(optimized);
+        var joinResult = Assert.IsType<JoinPlan>(topProject.Source);
+
+        // Left side should be narrowed to [t1.id, t1.name] (2 of 3 columns)
+        var leftProject = Assert.IsType<ProjectPlan>(joinResult.Left);
+        Assert.Equal(2, leftProject.Columns.Length);
+        Assert.IsType<ScanPlan>(leftProject.Source);
+
+        // Right side should be narrowed to [t2.data] (1 of 3 columns)
+        var rightProject = Assert.IsType<ProjectPlan>(joinResult.Right);
+        Assert.Equal(1, rightProject.Columns.Length);
+        Assert.IsType<ScanPlan>(rightProject.Source);
+    }
+
+    [Fact]
+    public void Projection_Pushdown_Filter_Above_Join_Widens_Required_Set()
+    {
+        // SELECT t1.name FROM t1 JOIN t2 WHERE t1.age > 25
+        // After predicate pushdown, filter moves below the join.
+        // The narrowing projection sits above the filter, so it only needs
+        // columns required by the parent — t1.name. The filter below still
+        // sees the full scan. But the top-level required set must include
+        // t1.age because the filter sits above the join before predicate pushdown.
+        //
+        // If the filter remains above the join (e.g. cross-table predicate),
+        // the required set passed into PushProjectionsInto includes the filter cols.
+        var t1 = new ScanPlan(CreateMultiColumnTable("t1", "id", "name", "age"), "t1");
+        var t2 = new ScanPlan(CreateMultiColumnTable("t2", "id", "data"), "t2");
+        var joinCond = new BinaryExpr(
+            new ColumnRefExpr(null, "t1", "id"), BinaryOp.Equal,
+            new ColumnRefExpr(null, "t2", "id"));
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, joinCond);
+        // Cross-table filter that cannot be pushed into either side
+        var filter = new FilterPlan(
+            new BinaryExpr(
+                new ColumnRefExpr(null, "t1", "age"),
+                BinaryOp.GreaterThan,
+                new ColumnRefExpr(null, "t2", "data")),
+            join);
+        var project = new ProjectPlan(
+            [new ExprResultColumn(new ColumnRefExpr(null, "t1", "name"), null)],
+            filter);
+
+        var optimized = HeuristicOptimizer.Optimize(project);
+
+        // Filter stays above join (cross-table). Projection pushdown sees t1.name + t1.age + t1.id.
+        var topProject = Assert.IsType<ProjectPlan>(optimized);
+        var filterResult = Assert.IsType<FilterPlan>(topProject.Source);
+        var joinResult = Assert.IsType<JoinPlan>(filterResult.Source);
+
+        // Left: needs t1.name (SELECT) + t1.age (filter) + t1.id (join ON) = 3 columns = all of t1
+        // So no narrowing projection is inserted (3 required == 3 available)
+        Assert.IsType<ScanPlan>(joinResult.Left);
+
+        // Right: needs t2.id (join ON) + t2.data (filter) = 2 columns = all of t2
+        Assert.IsType<ScanPlan>(joinResult.Right);
+    }
+
+    [Fact]
+    public void Projection_Pushdown_Includes_JoinCondition_Columns()
+    {
+        // SELECT t1.name FROM t1 JOIN t2 ON t1.id = t2.fk
+        // t1.id and t2.fk must be included in pushed projections
+        var t1 = new ScanPlan(CreateMultiColumnTable("t1", "id", "name", "age"), "t1");
+        var t2 = new ScanPlan(CreateMultiColumnTable("t2", "id", "fk", "data"), "t2");
+        var joinCond = new BinaryExpr(
+            new ColumnRefExpr(null, "t1", "id"), BinaryOp.Equal,
+            new ColumnRefExpr(null, "t2", "fk"));
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, joinCond);
+        var project = new ProjectPlan(
+            [new ExprResultColumn(new ColumnRefExpr(null, "t1", "name"), null)],
+            join);
+
+        var optimized = HeuristicOptimizer.Optimize(project);
+
+        var topProject = Assert.IsType<ProjectPlan>(optimized);
+        var joinResult = Assert.IsType<JoinPlan>(topProject.Source);
+
+        // Left: needs t1.name (SELECT) + t1.id (JOIN ON) = 2 columns
+        var leftProject = Assert.IsType<ProjectPlan>(joinResult.Left);
+        Assert.Equal(2, leftProject.Columns.Length);
+
+        // Right: needs t2.fk (JOIN ON) = 1 column
+        var rightProject = Assert.IsType<ProjectPlan>(joinResult.Right);
+        Assert.Equal(1, rightProject.Columns.Length);
+    }
+
+    [Fact]
+    public void Projection_Pushdown_Skipped_For_Star()
+    {
+        // SELECT * FROM t1 JOIN t2 — no narrowing should happen
+        var t1 = new ScanPlan(CreateMultiColumnTable("t1", "id", "name", "age"), "t1");
+        var t2 = new ScanPlan(CreateMultiColumnTable("t2", "id", "data"), "t2");
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, null);
+        var project = new ProjectPlan(
+            [StarResultColumn.Instance],
+            join);
+
+        var optimized = HeuristicOptimizer.Optimize(project);
+
+        var topProject = Assert.IsType<ProjectPlan>(optimized);
+        var joinResult = Assert.IsType<JoinPlan>(topProject.Source);
+        // No narrowing projections inserted — children remain ScanPlans
+        Assert.IsType<ScanPlan>(joinResult.Left);
+        Assert.IsType<ScanPlan>(joinResult.Right);
+    }
+
+    [Fact]
+    public void Projection_Pushdown_Skipped_When_All_Columns_Used()
+    {
+        // SELECT t1.id, t1.name, t2.id, t2.data — all columns from both tables
+        var t1 = new ScanPlan(CreateMultiColumnTable("t1", "id", "name"), "t1");
+        var t2 = new ScanPlan(CreateMultiColumnTable("t2", "id", "data"), "t2");
+        var join = new JoinPlan(t1, t2, JoinKind.Inner, null);
+        var project = new ProjectPlan(
+        [
+            new ExprResultColumn(new ColumnRefExpr(null, "t1", "id"), null),
+            new ExprResultColumn(new ColumnRefExpr(null, "t1", "name"), null),
+            new ExprResultColumn(new ColumnRefExpr(null, "t2", "id"), null),
+            new ExprResultColumn(new ColumnRefExpr(null, "t2", "data"), null),
+        ], join);
+
+        var optimized = HeuristicOptimizer.Optimize(project);
+
+        var topProject = Assert.IsType<ProjectPlan>(optimized);
+        var joinResult = Assert.IsType<JoinPlan>(topProject.Source);
+        // No narrowing projections inserted — all columns are needed
+        Assert.IsType<ScanPlan>(joinResult.Left);
+        Assert.IsType<ScanPlan>(joinResult.Right);
+    }
+
     private static Schema.TableSchema CreateDummyTable(string name)
     {
         return new Schema.TableSchema(
@@ -1022,6 +1172,23 @@ public class HeuristicOptimizerTests
             [new Schema.ColumnSchema(1, "x", "INTEGER", Schema.ColumnFlags.PrimaryKey, null, null, null, null, null, null)],
             2,
             new Schema.PrimaryKeySchema(null, [new IndexedColumn(new ColumnRefExpr(null, null, "x"), null, null)], null),
+            [], [], []);
+    }
+
+    private static Schema.TableSchema CreateMultiColumnTable(string name, string pkColumn, params string[] otherColumns)
+    {
+        var columns = new Schema.ColumnSchema[1 + otherColumns.Length];
+        columns[0] = new Schema.ColumnSchema(1, pkColumn, "INTEGER", Schema.ColumnFlags.PrimaryKey, null, null, null, null, null, null);
+        for (int i = 0; i < otherColumns.Length; i++)
+            columns[i + 1] = new Schema.ColumnSchema((ushort)(i + 2), otherColumns[i], "TEXT", Schema.ColumnFlags.None, null, null, null, null, null, null);
+
+        return new Schema.TableSchema(
+            new Schema.Oid(1),
+            name,
+            false, false, false,
+            columns,
+            (ushort)(columns.Length + 1),
+            new Schema.PrimaryKeySchema(null, [new IndexedColumn(new ColumnRefExpr(null, null, pkColumn), null, null)], null),
             [], [], []);
     }
 }
@@ -1208,6 +1375,79 @@ public class IntegrationTests : TempDirTest
             Assert.True(await reader.ReadAsync());
             Assert.Equal("persisted", reader.GetString(0));
         }
+    }
+}
+
+public class ProjectionPushdownIntegrationTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task Select_With_Join_Projection_Pushdown()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT, bio TEXT, country TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER, pages INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO authors VALUES (1, 'Alice', 'A bio', 'US'), (2, 'Bob', 'B bio', 'UK')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO books VALUES (1, 'Book A', 1, 300), (2, 'Book B', 2, 200)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Only selects name from authors — bio, country, and books.pages are unused
+        cmd.CommandText = @"SELECT authors.name, books.title
+                            FROM authors
+                            INNER JOIN books ON authors.id = books.author_id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Author, string Title)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("Alice", "Book A"), rows);
+        Assert.Contains(("Bob", "Book B"), rows);
+    }
+
+    [Fact]
+    public async Task Select_With_Join_And_Where_Projection_Pushdown()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE departments (id INTEGER PRIMARY KEY, dept_name TEXT, budget INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO departments VALUES (1, 'Engineering', 1000000), (2, 'Marketing', 500000)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO employees VALUES (1, 'Alice', 1, 90000), (2, 'Bob', 1, 80000), (3, 'Charlie', 2, 70000)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // salary is in WHERE but not in SELECT; budget is unused
+        cmd.CommandText = @"SELECT employees.name, departments.dept_name
+                            FROM employees
+                            INNER JOIN departments ON employees.dept_id = departments.id
+                            WHERE employees.salary > 75000";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Name, string Dept)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("Alice", "Engineering"), rows);
+        Assert.Contains(("Bob", "Engineering"), rows);
     }
 }
 
