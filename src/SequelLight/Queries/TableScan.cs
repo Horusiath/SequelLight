@@ -28,6 +28,8 @@ public sealed class TableScan : IDbEnumerator
     private readonly DbValue[] _pkBuf;
     private readonly DbValue[] _valueBuf;
 
+    internal TableSchema Table => _table;
+
     public Projection Projection { get; }
     public DbValue[] Current { get; }
 

@@ -128,6 +128,17 @@ public sealed class QueryPlanner
     }
 
     /// <summary>
+    /// Builds the full physical operator tree for EXPLAIN inspection.
+    /// The returned enumerator must be disposed but is never iterated.
+    /// </summary>
+    internal IDbEnumerator BuildExplainPlan(SelectStmt stmt, ReadOnlyTransaction tx)
+    {
+        var compiled = Compile(stmt)
+            ?? throw new NotSupportedException("EXPLAIN is not supported for VALUES statements.");
+        return Execute(compiled, tx);
+    }
+
+    /// <summary>
     /// Builds a physical plan from a previously compiled query and a transaction.
     /// </summary>
     internal IDbEnumerator Execute(CompiledQuery compiled, ReadOnlyTransaction tx)

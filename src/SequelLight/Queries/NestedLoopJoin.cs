@@ -17,6 +17,11 @@ public sealed class NestedLoopJoin : IDbEnumerator
     private readonly int _leftWidth;
     private readonly int _rightWidth;
 
+    internal IDbEnumerator Left => _left;
+    internal IDbEnumerator Right => _right;
+    internal JoinKind Kind => _kind;
+    internal SqlExpr? Condition => _condition;
+
     // Materialized right side — must snapshot because source buffer is reused
     private List<DbValue[]>? _rightRows;
     private bool _rightMaterialized;

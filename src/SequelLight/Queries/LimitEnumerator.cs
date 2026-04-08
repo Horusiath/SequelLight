@@ -15,6 +15,10 @@ internal sealed class LimitEnumerator : IDbEnumerator
     private long _skipped;
     private long _yielded;
 
+    internal IDbEnumerator Source => _source;
+    internal long Limit => _limit;
+    internal long Offset => _offset;
+
     public Projection Projection => _source.Projection;
     public DbValue[] Current => _source.Current;
 

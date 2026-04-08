@@ -12,6 +12,9 @@ public sealed class Filter : IDbEnumerator
     private readonly IDbEnumerator _source;
     private readonly SqlExpr _predicate;
 
+    internal IDbEnumerator Source => _source;
+    internal SqlExpr Predicate => _predicate;
+
     public Projection Projection => _source.Projection;
     public DbValue[] Current => _source.Current;
 

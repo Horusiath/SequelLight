@@ -691,6 +691,28 @@ public sealed class Database : IAsyncDisposable
     internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql,
         IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
     {
+        if (!_stmtCache.TryGetValue(sql, out var parsedStmt))
+        {
+            parsedStmt = SqlParser.Parse(sql);
+            _stmtCache.TryAdd(sql, parsedStmt);
+        }
+
+        // EXPLAIN: build the physical plan, format it, then dispose the plan operators.
+        if (parsedStmt is ExplainStmt explain)
+        {
+            if (explain.Statement is not SelectStmt explainSelect)
+                throw new NotSupportedException("EXPLAIN is only supported for SELECT statements.");
+
+            using var explainTx = _store.BeginReadOnly();
+            var explainPlanner = new QueryPlanner(Schema, parameters);
+            await using var physicalPlan = explainPlanner.BuildExplainPlan(explainSelect, explainTx);
+            var planRows = PlanFormatter.Format(physicalPlan);
+            return new SequelLightDataReader(new ExplainEnumerator(planRows), null);
+        }
+
+        if (parsedStmt is not SelectStmt select)
+            throw new NotSupportedException("Only SELECT is supported for ExecuteReader.");
+
         // If no explicit transaction, create a read-only one (owned by the reader)
         var tx = transaction ?? _store.BeginReadOnly();
         bool ownsTx = transaction is null;
@@ -704,10 +726,6 @@ public sealed class Database : IAsyncDisposable
         }
         else
         {
-            var stmt = SqlParser.Parse(sql);
-            if (stmt is not SelectStmt select)
-                throw new NotSupportedException("Only SELECT is supported for ExecuteReader.");
-
             compiled = planner.Compile(select);
             if (compiled is not null)
             {

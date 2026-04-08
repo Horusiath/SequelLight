@@ -11,6 +11,8 @@ public sealed class Select : IDbEnumerator
     private readonly IDbEnumerator _source;
     private readonly Selector[] _selectors;
 
+    internal IDbEnumerator Source => _source;
+
     public Projection Projection { get; }
     public DbValue[] Current { get; }
 

@@ -1,0 +1,159 @@
+using System.Text;
+using SequelLight.Parsing;
+using SequelLight.Parsing.Ast;
+
+namespace SequelLight.Queries;
+
+/// <summary>
+/// Walks a physical <see cref="IDbEnumerator"/> operator tree and produces
+/// an EXPLAIN-style result set: (id, parent, detail) per operator node.
+/// </summary>
+internal static class PlanFormatter
+{
+    public static (int Id, int Parent, string Detail)[] Format(IDbEnumerator root)
+    {
+        var rows = new List<(int Id, int Parent, string Detail)>();
+        Visit(root, 0, rows);
+        return rows.ToArray();
+    }
+
+    private static void Visit(IDbEnumerator node, int parentId, List<(int, int, string)> rows)
+    {
+        int id = rows.Count + 1;
+
+        switch (node)
+        {
+            case TableScan scan:
+                rows.Add((id, parentId, FormatScan(scan)));
+                break;
+
+            case Filter filter:
+                rows.Add((id, parentId, FormatFilter(filter)));
+                Visit(filter.Source, id, rows);
+                break;
+
+            case Select select:
+                rows.Add((id, parentId, FormatProject(select)));
+                Visit(select.Source, id, rows);
+                break;
+
+            case HashJoin join:
+                rows.Add((id, parentId, FormatJoin("HASH JOIN", join.Kind)));
+                Visit(join.Left, id, rows);
+                Visit(join.Right, id, rows);
+                break;
+
+            case MergeJoin join:
+                rows.Add((id, parentId, FormatJoin("MERGE JOIN", join.Kind)));
+                Visit(join.Left, id, rows);
+                Visit(join.Right, id, rows);
+                break;
+
+            case NestedLoopJoin join:
+                rows.Add((id, parentId, FormatNestedLoopJoin(join)));
+                Visit(join.Left, id, rows);
+                Visit(join.Right, id, rows);
+                break;
+
+            case SortEnumerator sort:
+                rows.Add((id, parentId, FormatSort(sort)));
+                Visit(sort.Source, id, rows);
+                break;
+
+            case LimitEnumerator limit:
+                rows.Add((id, parentId, $"LIMIT {limit.Limit} OFFSET {limit.Offset}"));
+                Visit(limit.Source, id, rows);
+                break;
+
+            case DualEnumerator:
+                rows.Add((id, parentId, "CONSTANT ROW"));
+                break;
+
+            case ValuesEnumerator:
+                rows.Add((id, parentId, "VALUES"));
+                break;
+
+            default:
+                rows.Add((id, parentId, node.GetType().Name));
+                break;
+        }
+    }
+
+    private static string FormatScan(TableScan scan)
+    {
+        // Check if projection has a qualified table alias that differs from the table name
+        if (scan.Projection.ColumnCount > 0)
+        {
+            var qn = scan.Projection.GetQualifiedName(0);
+            if (qn.Table is not null && !string.Equals(qn.Table, scan.Table.Name, StringComparison.OrdinalIgnoreCase))
+                return $"SCAN {scan.Table.Name} AS {qn.Table}";
+        }
+        return $"SCAN {scan.Table.Name}";
+    }
+
+    private static string FormatFilter(Filter filter)
+    {
+        var sb = new StringBuilder("FILTER ");
+        SqlWriter.AppendExpr(sb, filter.Predicate);
+        return sb.ToString();
+    }
+
+    private static string FormatProject(Select select)
+    {
+        var sb = new StringBuilder("PROJECT ");
+        for (int i = 0; i < select.Projection.ColumnCount; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(select.Projection.GetName(i));
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatJoin(string strategy, JoinKind kind)
+    {
+        return $"{strategy} ({FormatJoinKind(kind)})";
+    }
+
+    private static string FormatNestedLoopJoin(NestedLoopJoin join)
+    {
+        var sb = new StringBuilder($"NESTED LOOP JOIN ({FormatJoinKind(join.Kind)})");
+        if (join.Condition is not null)
+        {
+            sb.Append(" ON ");
+            SqlWriter.AppendExpr(sb, join.Condition);
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatSort(SortEnumerator sort)
+    {
+        var sb = new StringBuilder();
+        if (sort.MaxRows > 0)
+            sb.Append($"TOP-N SORT (K={sort.MaxRows}) BY ");
+        else
+            sb.Append("SORT BY ");
+
+        var sourceProjection = sort.Source.Projection;
+        for (int i = 0; i < sort.KeyOrdinals.Length; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(sourceProjection.GetName(sort.KeyOrdinals[i]));
+            sb.Append(sort.KeyOrders[i] == SortOrder.Desc ? " DESC" : " ASC");
+        }
+        return sb.ToString();
+    }
+
+    private static string FormatJoinKind(JoinKind kind) => kind switch
+    {
+        JoinKind.Inner or JoinKind.Plain => "INNER",
+        JoinKind.Left => "LEFT",
+        JoinKind.LeftOuter => "LEFT OUTER",
+        JoinKind.Right => "RIGHT",
+        JoinKind.RightOuter => "RIGHT OUTER",
+        JoinKind.Full => "FULL",
+        JoinKind.FullOuter => "FULL OUTER",
+        JoinKind.Cross => "CROSS",
+        JoinKind.Comma => "CROSS",
+        _ => kind.ToString().ToUpperInvariant(),
+    };
+}

@@ -17,6 +17,10 @@ public sealed class MergeJoin : IDbEnumerator
     private readonly int _leftWidth;
     private readonly int _rightWidth;
 
+    internal IDbEnumerator Left => _left;
+    internal IDbEnumerator Right => _right;
+    internal JoinKind Kind => _kind;
+
     // State
     private DbValue[]? _leftSnapshot;
     private DbValue[]? _rightSnapshot;

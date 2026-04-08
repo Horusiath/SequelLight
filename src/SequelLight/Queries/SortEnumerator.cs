@@ -24,6 +24,11 @@ internal sealed class SortEnumerator : IDbEnumerator
     private List<DbValue[]>? _sorted;
     private int _index;
 
+    internal IDbEnumerator Source => _source;
+    internal int[] KeyOrdinals => _keyOrdinals;
+    internal SortOrder[] KeyOrders => _keyOrders;
+    internal long MaxRows => _maxRows;
+
     public Projection Projection { get; }
     public DbValue[] Current { get; }
 

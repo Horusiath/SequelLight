@@ -19,6 +19,10 @@ public sealed class HashJoin : IDbEnumerator
     private readonly int _leftWidth;
     private readonly int _rightWidth;
 
+    internal IDbEnumerator Left => _left;
+    internal IDbEnumerator Right => _right;
+    internal JoinKind Kind => _kind;
+
     // Hash table: hash code → list of materialized right-side row snapshots
     private Dictionary<int, List<DbValue[]>>? _hashTable;
     private bool _built;
