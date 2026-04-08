@@ -56,6 +56,47 @@ public sealed class Database : IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Executes a pre-parsed statement. Used by trigger body execution to skip SQL parsing.
+    /// </summary>
+    internal async ValueTask<int> ExecuteStmtAsync(SqlStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters,
+        ReadOnlyTransaction? transaction, int triggerDepth = 0)
+    {
+        return stmt switch
+        {
+            InsertStmt insert => await ExecuteInsertAsync(insert, parameters, transaction, triggerDepth).ConfigureAwait(false),
+            UpdateStmt update => await ExecuteUpdateAsync(update, parameters, transaction, triggerDepth).ConfigureAwait(false),
+            DeleteStmt delete => await ExecuteDeleteAsync(delete, parameters, transaction, triggerDepth).ConfigureAwait(false),
+            SelectStmt select => await ExecuteSelectInTriggerAsync(select, parameters, transaction).ConfigureAwait(false),
+            _ => throw new NotSupportedException($"Statement type '{stmt.GetType().Name}' is not supported in trigger body.")
+        };
+    }
+
+    /// <summary>
+    /// Executes a SELECT inside a trigger body. Drains all rows (evaluating expressions like RAISE)
+    /// and discards the results. Returns 0.
+    /// </summary>
+    private async ValueTask<int> ExecuteSelectInTriggerAsync(SelectStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters,
+        ReadOnlyTransaction? transaction)
+    {
+        var tx = transaction ?? _store.BeginReadOnly();
+        try
+        {
+            var planner = new QueryPlanner(Schema, parameters);
+            var compiled = planner.Compile(stmt);
+            await using var enumerator = compiled is not null
+                ? planner.Execute(compiled, tx)
+                : planner.Plan(stmt, tx);
+            while (await enumerator.NextAsync().ConfigureAwait(false)) { }
+        }
+        finally
+        {
+            if (transaction is null)
+                await tx.DisposeAsync().ConfigureAwait(false);
+        }
+        return 0;
+    }
+
     private async ValueTask<int> ExecuteDdlAsync(SqlStmt stmt, ReadOnlyTransaction? transaction)
     {
         var changes = Schema.Apply(stmt);
@@ -183,7 +224,7 @@ public sealed class Database : IAsyncDisposable
             rootTable.Columns[0].SetAutoIncrement((long)entries[^1].Oid.Value);
     }
 
-    private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
+    private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
         var table = Schema.GetTable(stmt.Table)
             ?? throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
@@ -284,8 +325,21 @@ public sealed class Database : IAsyncDisposable
                         }
                     }
 
+                    if (table.TriggerCount > 0)
+                    {
+                        if (!await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.Before,
+                            InsertTriggerEvent.Instance, null, row, triggerDepth).ConfigureAwait(false))
+                            return; // RAISE(IGNORE)
+                    }
+
                     rw.Put(key, table.EncodeRowValue(row));
                     totalInserted++;
+
+                    if (table.TriggerCount > 0)
+                    {
+                        await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.After,
+                            InsertTriggerEvent.Instance, null, row, triggerDepth).ConfigureAwait(false);
+                    }
                     return;
                 }
             }
@@ -403,8 +457,21 @@ public sealed class Database : IAsyncDisposable
                     }
                 }
 
+                if (table.TriggerCount > 0)
+                {
+                    if (!await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.Before,
+                        InsertTriggerEvent.Instance, null, row, triggerDepth).ConfigureAwait(false))
+                        continue; // RAISE(IGNORE)
+                }
+
                 rw.Put(key, table.EncodeRowValue(row));
                 totalInserted++;
+
+                if (table.TriggerCount > 0)
+                {
+                    await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.After,
+                        InsertTriggerEvent.Instance, null, row, triggerDepth).ConfigureAwait(false);
+                }
             }
         }
 
@@ -443,7 +510,7 @@ public sealed class Database : IAsyncDisposable
         }
     }
 
-    private async ValueTask<int> ExecuteUpdateAsync(UpdateStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
+    private async ValueTask<int> ExecuteUpdateAsync(UpdateStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
         var table = Schema.GetTable(stmt.Table.Table)
             ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
@@ -523,8 +590,17 @@ public sealed class Database : IAsyncDisposable
             }
 
             // Phase 2: Apply SET expressions and write back
+            int count = 0;
             foreach (var (oldKey, row) in matchedRows)
             {
+                // Snapshot old row before modification (only when triggers exist)
+                DbValue[]? oldRow = null;
+                if (table.TriggerCount > 0)
+                {
+                    oldRow = new DbValue[row.Length];
+                    Array.Copy(row, oldRow, row.Length);
+                }
+
                 for (int i = 0; i < resolvedSetExprs.Length; i++)
                 {
                     var newValue = ExprEvaluator.Evaluate(resolvedSetExprs[i], row, scanProjection);
@@ -533,13 +609,27 @@ public sealed class Database : IAsyncDisposable
 
                 table.ValidateRow(row);
 
+                if (table.TriggerCount > 0)
+                {
+                    if (!await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.Before,
+                        new UpdateTriggerEvent(null), oldRow, row, triggerDepth).ConfigureAwait(false))
+                        continue; // RAISE(IGNORE)
+                }
+
                 var newKey = table.EncodeRowKey(row);
                 if (!oldKey.AsSpan().SequenceEqual(newKey))
                     rw.Delete(oldKey);
                 rw.Put(newKey, table.EncodeRowValue(row));
+                count++;
+
+                if (table.TriggerCount > 0)
+                {
+                    await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.After,
+                        new UpdateTriggerEvent(null), oldRow, row, triggerDepth).ConfigureAwait(false);
+                }
             }
 
-            return matchedRows.Count;
+            return count;
         }
 
         if (transaction is ReadWriteTransaction rwTx)
@@ -555,7 +645,7 @@ public sealed class Database : IAsyncDisposable
         return totalUpdated;
     }
 
-    private async ValueTask<int> ExecuteDeleteAsync(DeleteStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
+    private async ValueTask<int> ExecuteDeleteAsync(DeleteStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
         var table = Schema.GetTable(stmt.Table.Table)
             ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
@@ -595,7 +685,35 @@ public sealed class Database : IAsyncDisposable
             if (limit.HasValue || offset.HasValue)
                 source = new LimitEnumerator(source, limit ?? long.MaxValue, Math.Max(0, offset ?? 0));
 
-            // Materialize keys to delete (avoid modifying during iteration)
+            if (table.TriggerCount > 0)
+            {
+                // Trigger path: materialize full rows so OLD is available
+                var rowsToDelete = new List<(byte[] Key, DbValue[] Row)>();
+                while (await source.NextAsync().ConfigureAwait(false))
+                {
+                    var key = table.EncodeRowKey(source.Current);
+                    var row = new DbValue[table.Columns.Length];
+                    Array.Copy(source.Current, row, row.Length);
+                    rowsToDelete.Add((key, row));
+                }
+
+                int count = 0;
+                foreach (var (key, row) in rowsToDelete)
+                {
+                    if (!await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.Before,
+                        DeleteTriggerEvent.Instance, row, null, triggerDepth).ConfigureAwait(false))
+                        continue; // RAISE(IGNORE)
+
+                    rw.Delete(key);
+                    count++;
+
+                    await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.After,
+                        DeleteTriggerEvent.Instance, row, null, triggerDepth).ConfigureAwait(false);
+                }
+                return count;
+            }
+
+            // Fast path: no triggers — materialize keys only
             var keysToDelete = new List<byte[]>();
             while (await source.NextAsync().ConfigureAwait(false))
                 keysToDelete.Add(table.EncodeRowKey(source.Current));

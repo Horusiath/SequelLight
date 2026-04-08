@@ -75,6 +75,53 @@ public sealed class DatabaseSchema
     public Oid GetTriggerOid(string name) => _triggerNames.GetValueOrDefault(name);
 
     /// <summary>
+    /// Collects triggers matching a given table, timing, and event into the caller-provided list.
+    /// When <paramref name="timing"/> is <see cref="TriggerTiming.Before"/>, triggers with
+    /// <c>null</c> timing (SQLite default) are also matched.
+    /// </summary>
+    internal void GetTriggers(Oid tableOid, TriggerTiming timing, TriggerEvent eventType,
+        List<TriggerSchema> result)
+    {
+        foreach (var trigger in _triggers.Values)
+        {
+            if (trigger.TableOid != tableOid)
+                continue;
+
+            // Timing: null defaults to Before in SQLite
+            var triggerTiming = trigger.Timing ?? TriggerTiming.Before;
+            if (triggerTiming != timing)
+                continue;
+
+            // Event type matching
+            switch (eventType)
+            {
+                case InsertTriggerEvent when trigger.Event is InsertTriggerEvent:
+                    break;
+                case DeleteTriggerEvent when trigger.Event is DeleteTriggerEvent:
+                    break;
+                case UpdateTriggerEvent update when trigger.Event is UpdateTriggerEvent trigUpdate:
+                    // If trigger specifies UPDATE OF columns, match only when those columns are being updated.
+                    // When caller passes null columns (meaning "any column"), always match.
+                    if (trigUpdate.Columns is { Length: > 0 } && update.Columns is { Length: > 0 })
+                    {
+                        bool anyMatch = false;
+                        foreach (var tc in trigUpdate.Columns)
+                            foreach (var uc in update.Columns)
+                                if (string.Equals(tc, uc, StringComparison.OrdinalIgnoreCase))
+                                { anyMatch = true; goto matched; }
+                        if (!anyMatch) continue;
+                        matched:;
+                    }
+                    break;
+                default:
+                    continue;
+            }
+
+            result.Add(trigger);
+        }
+    }
+
+    /// <summary>
     /// Applies a DDL statement to mutate the schema catalog.
     /// Returns the set of <see cref="SchemaChange"/> mutations to apply to the
     /// <see cref="TableSchema.Root"/> catalog table.
@@ -273,6 +320,7 @@ public sealed class DatabaseSchema
             stmt.Timing, stmt.Event, stmt.ForEachRow, stmt.When, stmt.Body);
         _triggers[oid] = trigger;
         _triggerNames[stmt.Trigger] = oid;
+        _tables[tableOid].TriggerCount++;
 
         return [SchemaChange.Insert(oid, ObjectType.Trigger, trigger.Name, trigger.ToString())];
     }
@@ -285,7 +333,7 @@ public sealed class DatabaseSchema
             DropObjectKind.Table => DropTable(stmt.Name, changes),
             DropObjectKind.Index => DropNamed(_indexes, _indexNames, stmt.Name, changes),
             DropObjectKind.View => DropNamed(_views, _viewNames, stmt.Name, changes),
-            DropObjectKind.Trigger => DropNamed(_triggers, _triggerNames, stmt.Name, changes),
+            DropObjectKind.Trigger => DropTrigger(stmt.Name, changes),
             _ => throw new InvalidOperationException($"Unsupported drop kind: {stmt.Kind}")
         };
 
@@ -302,6 +350,18 @@ public sealed class DatabaseSchema
             return false;
         changes.Add(SchemaChange.Delete(oid));
         objects.Remove(oid);
+        return true;
+    }
+
+    private bool DropTrigger(string name, List<SchemaChange> changes)
+    {
+        if (!_triggerNames.Remove(name, out var oid))
+            return false;
+        var trigger = _triggers[oid];
+        _triggers.Remove(oid);
+        changes.Add(SchemaChange.Delete(oid));
+        if (_tables.TryGetValue(trigger.TableOid, out var table))
+            table.TriggerCount--;
         return true;
     }
 

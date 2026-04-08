@@ -263,6 +263,20 @@ public sealed class TableSchema : IEquatable<TableSchema>
     public CheckConstraintSchema[] CheckConstraints { get; }
     public ForeignKeyConstraintSchema[] ForeignKeys { get; }
 
+    /// <summary>
+    /// Number of triggers attached to this table. Maintained by DDL operations.
+    /// DML executors check this before doing any trigger-related work (zero-cost when 0).
+    /// </summary>
+    public int TriggerCount;
+
+    public int GetColumnIndex(string name)
+    {
+        for (int i = 0; i < Columns.Length; i++)
+            if (string.Equals(Columns[i].Name, name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        throw new InvalidOperationException($"Column '{name}' not found in table '{Name}'.");
+    }
+
     // Encoding metadata — lazily initialized, invalidated when Columns reference changes.
     private ColumnSchema[]? _encodingColumns;
     private int[]? _pkColumnIndices;

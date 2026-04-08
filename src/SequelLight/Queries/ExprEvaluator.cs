@@ -44,6 +44,9 @@ public static class ExprEvaluator
             case CastExpr cast:
                 return EvaluateCast(cast, row, projection);
 
+            case RaiseExpr raise:
+                throw new TriggerRaiseException(raise.Kind, raise.ErrorMessage);
+
             case BindParameterExpr bind:
                 throw new InvalidOperationException($"Unresolved parameter '{bind.Name}'. Ensure parameters are provided.");
 
