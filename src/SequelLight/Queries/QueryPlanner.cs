@@ -6,6 +6,31 @@ using SequelLight.Storage;
 namespace SequelLight.Queries;
 
 /// <summary>
+/// Cached result of query compilation: the optimized logical plan plus evaluated
+/// ORDER BY / LIMIT / OFFSET metadata. Transaction-independent and immutable.
+/// </summary>
+internal sealed class CompiledQuery
+{
+    public readonly LogicalPlan Plan;
+    public readonly OrderingTerm[]? OrderBy;
+    public readonly long? Limit;
+    public readonly long? Offset;
+    private long _executionCount;
+
+    public long ExecutionCount => Volatile.Read(ref _executionCount);
+
+    public CompiledQuery(LogicalPlan plan, OrderingTerm[]? orderBy, long? limit, long? offset)
+    {
+        Plan = plan;
+        OrderBy = orderBy;
+        Limit = limit;
+        Offset = offset;
+    }
+
+    internal void IncrementExecutionCount() => Interlocked.Increment(ref _executionCount);
+}
+
+/// <summary>
 /// Orchestrates the full pipeline: AST → logical plan → optimize → physical operators.
 /// </summary>
 public sealed class QueryPlanner
@@ -17,24 +42,59 @@ public sealed class QueryPlanner
         _schema = schema;
     }
 
+    /// <summary>
+    /// Full pipeline for one-shot use (INSERT ... SELECT subqueries).
+    /// </summary>
     public IDbEnumerator Plan(SelectStmt stmt, ReadOnlyTransaction tx)
     {
         if (stmt.Compounds.Length > 0)
             throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
 
+        var compiled = Compile(stmt);
+        if (compiled is not null)
+            return Execute(compiled, tx);
+
+        // ValuesBody — not compilable, execute directly
         long? limit = EvaluateLimitOffset(stmt.Limit);
         long? offset = EvaluateLimitOffset(stmt.Offset);
-
-        // Negative limit means no limit (SQLite-compatible)
-        if (limit < 0) limit = null;
-        if (offset is null or <= 0) offset = null;
+        NormalizeLimitOffset(ref limit, ref offset);
 
         return stmt.First switch
         {
-            SelectCore core => PlanSelectCore(core, stmt.OrderBy, limit, offset, tx),
             ValuesBody values => WrapWithLimit(new ValuesEnumerator(values.Rows), limit, offset),
             _ => throw new NotSupportedException($"Unsupported SELECT body: {stmt.First.GetType().Name}")
         };
+    }
+
+    /// <summary>
+    /// Compiles a SELECT statement into a cacheable <see cref="CompiledQuery"/>.
+    /// Returns null for non-cacheable queries (ValuesBody).
+    /// </summary>
+    internal CompiledQuery? Compile(SelectStmt stmt)
+    {
+        if (stmt.Compounds.Length > 0)
+            throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
+
+        if (stmt.First is not SelectCore core)
+            return null;
+
+        long? limit = EvaluateLimitOffset(stmt.Limit);
+        long? offset = EvaluateLimitOffset(stmt.Offset);
+        NormalizeLimitOffset(ref limit, ref offset);
+
+        var logical = BuildLogicalPlan(core);
+        logical = HeuristicOptimizer.Optimize(logical);
+
+        return new CompiledQuery(logical, stmt.OrderBy, limit, offset);
+    }
+
+    /// <summary>
+    /// Builds a physical plan from a previously compiled query and a transaction.
+    /// </summary>
+    internal IDbEnumerator Execute(CompiledQuery compiled, ReadOnlyTransaction tx)
+    {
+        compiled.IncrementExecutionCount();
+        return BuildFromCompiled(compiled.Plan, compiled.OrderBy, compiled.Limit, compiled.Offset, tx);
     }
 
     private static long? EvaluateLimitOffset(SqlExpr? expr)
@@ -44,18 +104,21 @@ public sealed class QueryPlanner
         return value.IsNull ? null : value.AsInteger();
     }
 
+    private static void NormalizeLimitOffset(ref long? limit, ref long? offset)
+    {
+        if (limit < 0) limit = null;
+        if (offset is null or <= 0) offset = null;
+    }
+
     private static IDbEnumerator WrapWithLimit(IDbEnumerator source, long? limit, long? offset)
     {
         if (limit is null && offset is null) return source;
         return new LimitEnumerator(source, limit ?? long.MaxValue, offset ?? 0);
     }
 
-    private IDbEnumerator PlanSelectCore(SelectCore core, OrderingTerm[]? orderBy,
+    private IDbEnumerator BuildFromCompiled(LogicalPlan logical, OrderingTerm[]? orderBy,
         long? limit, long? offset, ReadOnlyTransaction tx)
     {
-        var logical = BuildLogicalPlan(core);
-        logical = HeuristicOptimizer.Optimize(logical);
-
         // No ORDER BY — use the existing fast path
         if (orderBy is not { Length: > 0 })
             return WrapWithLimit(BuildPhysical(logical, tx), limit, offset);

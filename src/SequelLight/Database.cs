@@ -18,13 +18,15 @@ namespace SequelLight;
 public sealed class Database : IAsyncDisposable
 {
     private readonly LsmStore _store;
+    private readonly QueryCache _queryCache;
     private bool _schemaDirty;
 
-    internal Database(LsmStore store, string directory)
+    internal Database(LsmStore store, string directory, int queryCacheCapacity = 256)
     {
         _store = store;
         Directory = directory;
         Schema = new DatabaseSchema();
+        _queryCache = new QueryCache(queryCacheCapacity);
     }
 
     public string Directory { get; }
@@ -52,6 +54,8 @@ public sealed class Database : IAsyncDisposable
         var changes = Schema.Apply(stmt);
         if (changes.Length == 0)
             return 0;
+
+        _queryCache.Clear();
 
         var rootTable = Schema.RootTable;
 
@@ -104,6 +108,7 @@ public sealed class Database : IAsyncDisposable
             return;
 
         _schemaDirty = false;
+        _queryCache.Clear();
         await LoadSchemaAsync().ConfigureAwait(false);
     }
 
@@ -355,16 +360,34 @@ public sealed class Database : IAsyncDisposable
 
     internal async ValueTask<SequelLightDataReader> ExecuteReaderAsync(string sql, ReadOnlyTransaction? transaction)
     {
-        var stmt = SqlParser.Parse(sql);
-        if (stmt is not SelectStmt select)
-            throw new NotSupportedException("Only SELECT is supported for ExecuteReader.");
-
         // If no explicit transaction, create a read-only one (owned by the reader)
         var tx = transaction ?? _store.BeginReadOnly();
         bool ownsTx = transaction is null;
 
         var planner = new QueryPlanner(Schema);
-        var enumerator = planner.Plan(select, tx);
+        IDbEnumerator enumerator;
+
+        if (_queryCache.TryGet(sql, out var compiled))
+        {
+            enumerator = planner.Execute(compiled, tx);
+        }
+        else
+        {
+            var stmt = SqlParser.Parse(sql);
+            if (stmt is not SelectStmt select)
+                throw new NotSupportedException("Only SELECT is supported for ExecuteReader.");
+
+            compiled = planner.Compile(select);
+            if (compiled is not null)
+            {
+                _queryCache.Add(sql, compiled);
+                enumerator = planner.Execute(compiled, tx);
+            }
+            else
+            {
+                enumerator = planner.Plan(select, tx);
+            }
+        }
 
         return new SequelLightDataReader(enumerator, ownsTx ? tx : null);
     }
@@ -393,13 +416,13 @@ public sealed class DatabasePool
     /// If no database is open for that path, one is created and opened in a thread-safe manner.
     /// The caller must call <see cref="ReleaseAsync"/> when done.
     /// </summary>
-    internal async ValueTask<Database> AcquireAsync(string directory)
+    internal async ValueTask<Database> AcquireAsync(string directory, int queryCacheCapacity = 256)
     {
         var fullPath = Path.GetFullPath(directory);
 
         while (true)
         {
-            var slot = _databases.GetOrAdd(fullPath, static path => new DatabaseSlot(path));
+            var slot = _databases.GetOrAdd(fullPath, path => new DatabaseSlot(path, queryCacheCapacity));
             var acquired = slot.Acquire();
 
             if (acquired <= 0)
@@ -448,13 +471,15 @@ public sealed class DatabasePool
     private sealed class DatabaseSlot
     {
         private readonly string _directory;
+        private readonly int _queryCacheCapacity;
         private readonly TaskCompletionSource<Database> _initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _refCount;
         private int _initializing;
 
-        public DatabaseSlot(string directory)
+        public DatabaseSlot(string directory, int queryCacheCapacity)
         {
             _directory = directory;
+            _queryCacheCapacity = queryCacheCapacity;
         }
 
         /// <summary>
@@ -480,7 +505,7 @@ public sealed class DatabasePool
                 try
                 {
                     var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = _directory }).ConfigureAwait(false);
-                    var db = new Database(store, _directory);
+                    var db = new Database(store, _directory, _queryCacheCapacity);
                     await db.LoadSchemaAsync().ConfigureAwait(false);
                     _initialized.TrySetResult(db);
                 }

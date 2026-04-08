@@ -2348,3 +2348,171 @@ public class LimitTests : TempDirTest
         Assert.Equal(2, rows.Count);
     }
 }
+
+public class QueryCacheTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    [Fact]
+    public async Task CachedQuery_ReturnsSameResults()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // First execution — cache miss
+        cmd.CommandText = "SELECT * FROM t";
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        var rows1 = new List<(long, string)>();
+        while (await reader1.ReadAsync())
+            rows1.Add((reader1.GetInt64(0), reader1.GetString(1)));
+
+        // Second execution — cache hit
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+        var rows2 = new List<(long, string)>();
+        while (await reader2.ReadAsync())
+            rows2.Add((reader2.GetInt64(0), reader2.GetString(1)));
+
+        Assert.Equal(rows1, rows2);
+    }
+
+    [Fact]
+    public async Task CachedQuery_DifferentQueries()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id FROM t";
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader1.ReadAsync())
+            ids.Add(reader1.GetInt64(0));
+
+        cmd.CommandText = "SELECT name FROM t";
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+        var names = new List<string>();
+        while (await reader2.ReadAsync())
+            names.Add(reader2.GetString(0));
+
+        Assert.Equal(2, ids.Count);
+        Assert.Equal(2, names.Count);
+        Assert.Equal("alice", names[0]);
+    }
+
+    [Fact]
+    public async Task Cache_InvalidatedOnSchemaChange()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 10)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Execute to populate cache
+        cmd.CommandText = "SELECT * FROM t";
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            Assert.True(await reader.ReadAsync());
+        }
+
+        // Schema change — add a column
+        cmd.CommandText = "ALTER TABLE t ADD COLUMN name TEXT";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Insert a row with the new column
+        cmd.CommandText = "INSERT INTO t VALUES (2, 20, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Re-execute — should use updated schema (cache was cleared)
+        cmd.CommandText = "SELECT * FROM t";
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+
+        Assert.Equal(3, reader2.FieldCount);
+        Assert.True(await reader2.ReadAsync());
+    }
+
+    [Fact]
+    public async Task CachedQuery_WithLimitAndOrderBy()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        const string query = "SELECT name FROM t ORDER BY name ASC LIMIT 2";
+
+        // First execution
+        cmd.CommandText = query;
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        var rows1 = new List<string>();
+        while (await reader1.ReadAsync())
+            rows1.Add(reader1.GetString(0));
+
+        // Second execution (cached)
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+        var rows2 = new List<string>();
+        while (await reader2.ReadAsync())
+            rows2.Add(reader2.GetString(0));
+
+        Assert.Equal(new[] { "alice", "bob" }, rows1);
+        Assert.Equal(rows1, rows2);
+    }
+
+    [Fact]
+    public async Task CachedQuery_ReflectsNewData()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "INSERT INTO t VALUES (1, 10)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // First execution — populates cache
+        cmd.CommandText = "SELECT * FROM t";
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        int count1 = 0;
+        while (await reader1.ReadAsync()) count1++;
+        Assert.Equal(1, count1);
+
+        // Insert more data (no schema change, cache NOT cleared)
+        cmd.CommandText = "INSERT INTO t VALUES (2, 20), (3, 30)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Second execution — cached plan, but new transaction snapshot sees new data
+        cmd.CommandText = "SELECT * FROM t";
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+        int count2 = 0;
+        while (await reader2.ReadAsync()) count2++;
+        Assert.Equal(3, count2);
+    }
+
+    [Fact]
+    public void ConnectionString_ParsesQueryCacheSize()
+    {
+        Assert.Equal(64, SequelLightConnection.ParseQueryCacheSize("Data Source=/tmp/db;Query Cache Size=64"));
+        Assert.Equal(0, SequelLightConnection.ParseQueryCacheSize("Data Source=/tmp/db;Query Cache Size=0"));
+        Assert.Equal(256, SequelLightConnection.ParseQueryCacheSize("Data Source=/tmp/db"));
+        Assert.Equal(256, SequelLightConnection.ParseQueryCacheSize(""));
+    }
+}

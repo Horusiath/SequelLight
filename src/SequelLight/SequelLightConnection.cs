@@ -11,6 +11,7 @@ public sealed class SequelLightConnection : DbConnection
 {
     private string _connectionString = string.Empty;
     private string _directory = string.Empty;
+    private int _queryCacheSize = 256;
     private Database? _database;
     private ConnectionState _state = ConnectionState.Closed;
 
@@ -33,6 +34,7 @@ public sealed class SequelLightConnection : DbConnection
                 throw new InvalidOperationException("Cannot change connection string while connection is open.");
             _connectionString = value ?? string.Empty;
             _directory = ParseDirectory(_connectionString);
+            _queryCacheSize = ParseQueryCacheSize(_connectionString);
         }
     }
 
@@ -52,7 +54,7 @@ public sealed class SequelLightConnection : DbConnection
         _state = ConnectionState.Connecting;
         try
         {
-            _database = await DatabasePool.Shared.AcquireAsync(_directory).ConfigureAwait(false);
+            _database = await DatabasePool.Shared.AcquireAsync(_directory, _queryCacheSize).ConfigureAwait(false);
             _state = ConnectionState.Open;
         }
         catch
@@ -158,5 +160,32 @@ public sealed class SequelLightConnection : DbConnection
         }
 
         return string.Empty;
+    }
+
+    /// <summary>
+    /// Parses the query cache size from a connection string.
+    /// Supports "Query Cache Size=N". Defaults to 256 if not specified.
+    /// </summary>
+    internal static int ParseQueryCacheSize(string connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+            return 256;
+
+        foreach (var part in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = part.AsSpan().Trim();
+            var eqIdx = trimmed.IndexOf('=');
+            if (eqIdx < 0) continue;
+
+            var key = trimmed[..eqIdx].Trim();
+            var value = trimmed[(eqIdx + 1)..].Trim();
+
+            if (key.Equals("Query Cache Size", StringComparison.OrdinalIgnoreCase))
+            {
+                return int.TryParse(value, out int size) ? Math.Max(0, size) : 256;
+            }
+        }
+
+        return 256;
     }
 }
