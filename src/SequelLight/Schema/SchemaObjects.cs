@@ -322,11 +322,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
     public byte[] EncodeRowKey(DbValue[] row)
     {
         EnsureEncodingMetadata();
-        var indices = _pkColumnIndices!;
-        var pkValues = new DbValue[indices.Length];
-        for (int i = 0; i < indices.Length; i++)
-            pkValues[i] = row[indices[i]];
-        return RowKeyEncoder.Encode(Oid, pkValues, _pkColumnTypes!);
+        return RowKeyEncoder.Encode(Oid, row, _pkColumnIndices!, _pkColumnTypes!);
     }
 
     /// <summary>

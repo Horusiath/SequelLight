@@ -49,6 +49,38 @@ public static class RowKeyEncoder
         }
     }
 
+    /// <summary>
+    /// Encodes a row key by gathering PK columns from a full row via index mapping.
+    /// Avoids allocating a temporary DbValue[] for PK values.
+    /// </summary>
+    public static byte[] Encode(Oid oid, DbValue[] row, ReadOnlySpan<int> pkColumnIndices, ReadOnlySpan<DbType> pkTypes)
+    {
+        int size = OidSize;
+        for (int i = 0; i < pkColumnIndices.Length; i++)
+            size += ColumnKeySize(row[pkColumnIndices[i]], pkTypes[i]);
+
+        byte[]? rented = null;
+        Span<byte> buf = size <= StackAllocLimit
+            ? stackalloc byte[size]
+            : (rented = ArrayPool<byte>.Shared.Rent(size));
+
+        try
+        {
+            BinaryPrimitives.WriteUInt32BigEndian(buf, oid.Value);
+            int offset = OidSize;
+
+            for (int i = 0; i < pkColumnIndices.Length; i++)
+                offset += EncodeColumn(buf[offset..], row[pkColumnIndices[i]], pkTypes[i]);
+
+            return buf[..offset].ToArray();
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
     public static byte[] EncodeTablePrefix(Oid oid)
     {
         var result = new byte[OidSize];
