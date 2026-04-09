@@ -152,86 +152,86 @@ public class ExprEvaluatorBenchmarks
     // ---- Literals ----
 
     [Benchmark(Description = "Expr: integer literal")]
-    public DbValue IntegerLiteral() => ExprEvaluator.Evaluate(_intLiteral, _row, _projection);
+    public DbValue IntegerLiteral() => ExprEvaluator.EvaluateSync(_intLiteral, _row, _projection);
 
     [Benchmark(Description = "Expr: real literal")]
-    public DbValue RealLiteral() => ExprEvaluator.Evaluate(_realLiteral, _row, _projection);
+    public DbValue RealLiteral() => ExprEvaluator.EvaluateSync(_realLiteral, _row, _projection);
 
     [Benchmark(Description = "Expr: string literal")]
-    public DbValue StringLiteral() => ExprEvaluator.Evaluate(_stringLiteral, _row, _projection);
+    public DbValue StringLiteral() => ExprEvaluator.EvaluateSync(_stringLiteral, _row, _projection);
 
     // ---- Column references ----
 
     [Benchmark(Description = "Expr: column ref (unqualified)")]
-    public DbValue ColumnRef() => ExprEvaluator.Evaluate(_columnRef, _row, _projection);
+    public DbValue ColumnRef() => ExprEvaluator.EvaluateSync(_columnRef, _row, _projection);
 
     [Benchmark(Description = "Expr: column ref (qualified)")]
-    public DbValue QualifiedColumnRef() => ExprEvaluator.Evaluate(_qualifiedColumnRef, _row, _projection);
+    public DbValue QualifiedColumnRef() => ExprEvaluator.EvaluateSync(_qualifiedColumnRef, _row, _projection);
 
     // ---- Arithmetic ----
 
     [Benchmark(Description = "Expr: int + int")]
-    public DbValue IntAdd() => ExprEvaluator.Evaluate(_intAdd, _row, _projection);
+    public DbValue IntAdd() => ExprEvaluator.EvaluateSync(_intAdd, _row, _projection);
 
     [Benchmark(Description = "Expr: real * real")]
-    public DbValue RealMultiply() => ExprEvaluator.Evaluate(_realMultiply, _row, _projection);
+    public DbValue RealMultiply() => ExprEvaluator.EvaluateSync(_realMultiply, _row, _projection);
 
     [Benchmark(Description = "Expr: int + real (promotion)")]
-    public DbValue MixedTypeArithmetic() => ExprEvaluator.Evaluate(_mixedTypeArithmetic, _row, _projection);
+    public DbValue MixedTypeArithmetic() => ExprEvaluator.EvaluateSync(_mixedTypeArithmetic, _row, _projection);
 
     // ---- Comparison ----
 
     [Benchmark(Description = "Expr: int > int")]
-    public DbValue IntCompare() => ExprEvaluator.Evaluate(_intCompare, _row, _projection);
+    public DbValue IntCompare() => ExprEvaluator.EvaluateSync(_intCompare, _row, _projection);
 
     // ---- Unary ----
 
     [Benchmark(Description = "Expr: unary minus")]
-    public DbValue UnaryMinus() => ExprEvaluator.Evaluate(_unaryMinus, _row, _projection);
+    public DbValue UnaryMinus() => ExprEvaluator.EvaluateSync(_unaryMinus, _row, _projection);
 
     [Benchmark(Description = "Expr: NOT")]
-    public DbValue UnaryNot() => ExprEvaluator.Evaluate(_unaryNot, _row, _projection);
+    public DbValue UnaryNot() => ExprEvaluator.EvaluateSync(_unaryNot, _row, _projection);
 
     // ---- Logical ----
 
     [Benchmark(Description = "Expr: AND (2 comparisons)")]
-    public DbValue And() => ExprEvaluator.Evaluate(_andExpr, _row, _projection);
+    public DbValue And() => ExprEvaluator.EvaluateSync(_andExpr, _row, _projection);
 
     [Benchmark(Description = "Expr: OR (2 comparisons)")]
-    public DbValue Or() => ExprEvaluator.Evaluate(_orExpr, _row, _projection);
+    public DbValue Or() => ExprEvaluator.EvaluateSync(_orExpr, _row, _projection);
 
     // ---- Range / Null ----
 
     [Benchmark(Description = "Expr: BETWEEN")]
-    public DbValue Between() => ExprEvaluator.Evaluate(_betweenExpr, _row, _projection);
+    public DbValue Between() => ExprEvaluator.EvaluateSync(_betweenExpr, _row, _projection);
 
     [Benchmark(Description = "Expr: IS NULL")]
-    public DbValue IsNull() => ExprEvaluator.Evaluate(_isNullExpr, _row, _projection);
+    public DbValue IsNull() => ExprEvaluator.EvaluateSync(_isNullExpr, _row, _projection);
 
     [Benchmark(Description = "Expr: NOTNULL")]
-    public DbValue NullTest() => ExprEvaluator.Evaluate(_nullTestExpr, _row, _projection);
+    public DbValue NullTest() => ExprEvaluator.EvaluateSync(_nullTestExpr, _row, _projection);
 
     // ---- Type conversions ----
 
     [Benchmark(Description = "Expr: CAST int→real")]
-    public DbValue CastIntToReal() => ExprEvaluator.Evaluate(_castIntToReal, _row, _projection);
+    public DbValue CastIntToReal() => ExprEvaluator.EvaluateSync(_castIntToReal, _row, _projection);
 
     [Benchmark(Description = "Expr: CAST real→int")]
-    public DbValue CastRealToInt() => ExprEvaluator.Evaluate(_castRealToInt, _row, _projection);
+    public DbValue CastRealToInt() => ExprEvaluator.EvaluateSync(_castRealToInt, _row, _projection);
 
     [Benchmark(Description = "Expr: CAST int→text")]
-    public DbValue CastIntToText() => ExprEvaluator.Evaluate(_castIntToText, _row, _projection);
+    public DbValue CastIntToText() => ExprEvaluator.EvaluateSync(_castIntToText, _row, _projection);
 
     // ---- String ----
 
     [Benchmark(Description = "Expr: string concat")]
-    public DbValue StringConcat() => ExprEvaluator.Evaluate(_stringConcat, _row, _projection);
+    public DbValue StringConcat() => ExprEvaluator.EvaluateSync(_stringConcat, _row, _projection);
 
     // ---- Complex expressions ----
 
     [Benchmark(Description = "Expr: deep arithmetic (5 ops)")]
-    public DbValue DeepArithmetic() => ExprEvaluator.Evaluate(_deepArithmetic, _row, _projection);
+    public DbValue DeepArithmetic() => ExprEvaluator.EvaluateSync(_deepArithmetic, _row, _projection);
 
     [Benchmark(Description = "Expr: compound predicate (4 AND)")]
-    public DbValue CompoundPredicate() => ExprEvaluator.Evaluate(_complexPredicate, _row, _projection);
+    public DbValue CompoundPredicate() => ExprEvaluator.EvaluateSync(_complexPredicate, _row, _projection);
 }

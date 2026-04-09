@@ -48,7 +48,7 @@ internal static class TriggerExecutor
                 if (whenProjection is null)
                     (whenProjection, whenRow) = BuildWhenContext(table, oldRow, newRow);
 
-                var result = ExprEvaluator.Evaluate(trigger.When, whenRow!, whenProjection);
+                var result = ExprEvaluator.EvaluateSync(trigger.When, whenRow!, whenProjection);
                 if (!DbValueComparer.IsTrue(result))
                     continue; // WHEN is false, skip this trigger
             }

@@ -156,7 +156,7 @@ public sealed class NestedLoopJoin : IDbEnumerator
 
             if (_condition is not null)
             {
-                var result = ExprEvaluator.Evaluate(_condition, Current, Projection);
+                var result = ExprEvaluator.EvaluateSync(_condition, Current, Projection);
                 if (!DbValueComparer.IsTrue(result))
                     continue;
             }

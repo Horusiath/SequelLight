@@ -26,7 +26,7 @@ public sealed class Filter : IDbEnumerator
 
     public ValueTask<bool> NextAsync(CancellationToken ct = default)
     {
-        // Sync fast path — avoids async state machine when source completes synchronously
+        // Sync fast path — avoids async state machine when source and evaluate complete synchronously
         while (true)
         {
             var task = _source.NextAsync(ct);
@@ -35,9 +35,32 @@ public sealed class Filter : IDbEnumerator
             if (!task.Result)
                 return new ValueTask<bool>(false);
 
-            var result = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
-            if (DbValueComparer.IsTrue(result))
+            var evalTask = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
+            if (!evalTask.IsCompletedSuccessfully)
+                return NextAsyncEvalSlow(evalTask, ct);
+            if (DbValueComparer.IsTrue(evalTask.Result))
                 return new ValueTask<bool>(true);
+        }
+    }
+
+    private async ValueTask<bool> NextAsyncEvalSlow(ValueTask<DbValue> evalPending, CancellationToken ct)
+    {
+        var result = await evalPending.ConfigureAwait(false);
+        if (DbValueComparer.IsTrue(result))
+            return true;
+
+        // Continue with normal loop
+        while (true)
+        {
+            if (!await _source.NextAsync(ct).ConfigureAwait(false))
+                return false;
+
+            var evalTask = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
+            var evalResult = evalTask.IsCompletedSuccessfully
+                ? evalTask.Result
+                : await evalTask.ConfigureAwait(false);
+            if (DbValueComparer.IsTrue(evalResult))
+                return true;
         }
     }
 
@@ -48,7 +71,10 @@ public sealed class Filter : IDbEnumerator
             if (!await pending.ConfigureAwait(false))
                 return false;
 
-            var result = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
+            var evalTask = ExprEvaluator.Evaluate(_predicate, _source.Current, Projection);
+            var result = evalTask.IsCompletedSuccessfully
+                ? evalTask.Result
+                : await evalTask.ConfigureAwait(false);
             if (DbValueComparer.IsTrue(result))
                 return true;
 

@@ -75,7 +75,7 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
 
             if (_having is not null)
             {
-                var result = ExprEvaluator.Evaluate(_having, Current, Projection);
+                var result = ExprEvaluator.EvaluateSync(_having, Current, Projection);
                 if (!DbValueComparer.IsTrue(result))
                 {
                     _bucketIndex++;
@@ -125,7 +125,7 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
 
                 if (desc.FilterWhere is not null)
                 {
-                    var filterResult = ExprEvaluator.Evaluate(desc.FilterWhere, srcRow, sourceProjection);
+                    var filterResult = ExprEvaluator.EvaluateSync(desc.FilterWhere, srcRow, sourceProjection);
                     if (!DbValueComparer.IsTrue(filterResult))
                         continue;
                 }
@@ -138,7 +138,7 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
 
                 var args = new DbValue[desc.ArgExprs.Length];
                 for (int i = 0; i < desc.ArgExprs.Length; i++)
-                    args[i] = ExprEvaluator.Evaluate(desc.ArgExprs[i], srcRow, sourceProjection);
+                    args[i] = ExprEvaluator.EvaluateSync(desc.ArgExprs[i], srcRow, sourceProjection);
 
                 if (distinctSets?[a] is not null)
                 {

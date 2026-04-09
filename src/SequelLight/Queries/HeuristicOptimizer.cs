@@ -247,7 +247,7 @@ public static class HeuristicOptimizer
     {
         try
         {
-            var value = ExprEvaluator.Evaluate(expr, Array.Empty<DbValue>(), EmptyProjection);
+            var value = ExprEvaluator.EvaluateSync(expr, Array.Empty<DbValue>(), EmptyProjection);
             return new ResolvedLiteralExpr(value);
         }
         catch

@@ -470,7 +470,7 @@ public class ExprEvaluatorTests
     [Fact]
     public void Evaluate_Integer_Literal()
     {
-        var result = ExprEvaluator.Evaluate(
+        var result = ExprEvaluator.EvaluateSync(
             new LiteralExpr(LiteralKind.Integer, "42"),
             Array.Empty<DbValue>(),
             new Projection(Array.Empty<string>()));
@@ -480,7 +480,7 @@ public class ExprEvaluatorTests
     [Fact]
     public void Evaluate_String_Literal()
     {
-        var result = ExprEvaluator.Evaluate(
+        var result = ExprEvaluator.EvaluateSync(
             new LiteralExpr(LiteralKind.String, "hello"),
             Array.Empty<DbValue>(),
             new Projection(Array.Empty<string>()));
@@ -492,7 +492,7 @@ public class ExprEvaluatorTests
     {
         var projection = new Projection(["x", "y"]);
         var row = new DbValue[] { DbValue.Integer(10), DbValue.Integer(20) };
-        var result = ExprEvaluator.Evaluate(
+        var result = ExprEvaluator.EvaluateSync(
             new ColumnRefExpr(null, null, "y"), row, projection);
         Assert.Equal(20L, result.AsInteger());
     }
@@ -506,7 +506,7 @@ public class ExprEvaluatorTests
             new ColumnRefExpr(null, null, "x"),
             BinaryOp.Add,
             new LiteralExpr(LiteralKind.Integer, "5"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(15L, result.AsInteger());
     }
 
@@ -519,7 +519,7 @@ public class ExprEvaluatorTests
             new ColumnRefExpr(null, null, "x"),
             BinaryOp.Equal,
             new LiteralExpr(LiteralKind.Integer, "10"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -532,7 +532,7 @@ public class ExprEvaluatorTests
             new LiteralExpr(LiteralKind.False, "FALSE"),
             BinaryOp.And,
             new LiteralExpr(LiteralKind.True, "TRUE"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(0L, result.AsInteger());
     }
 
@@ -545,7 +545,7 @@ public class ExprEvaluatorTests
             new LiteralExpr(LiteralKind.True, "TRUE"),
             BinaryOp.Or,
             new LiteralExpr(LiteralKind.False, "FALSE"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -559,7 +559,7 @@ public class ExprEvaluatorTests
             false,
             new LiteralExpr(LiteralKind.Integer, "1"),
             new LiteralExpr(LiteralKind.Integer, "10"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -573,7 +573,7 @@ public class ExprEvaluatorTests
             true,
             new LiteralExpr(LiteralKind.Integer, "1"),
             new LiteralExpr(LiteralKind.Integer, "10"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -586,7 +586,7 @@ public class ExprEvaluatorTests
             new ColumnRefExpr(null, null, "x"),
             false, false,
             new LiteralExpr(LiteralKind.Null, "NULL"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -598,7 +598,7 @@ public class ExprEvaluatorTests
         var expr = new NullTestExpr(
             new ColumnRefExpr(null, null, "x"),
             false); // ISNULL
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -610,7 +610,7 @@ public class ExprEvaluatorTests
         var expr = new NullTestExpr(
             new ColumnRefExpr(null, null, "x"),
             true); // NOTNULL
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(1L, result.AsInteger());
     }
 
@@ -622,7 +622,7 @@ public class ExprEvaluatorTests
         var expr = new CastExpr(
             new LiteralExpr(LiteralKind.Integer, "42"),
             new TypeName("REAL", null));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(42.0, result.AsReal());
     }
 
@@ -632,14 +632,14 @@ public class ExprEvaluatorTests
         var projection = new Projection(Array.Empty<string>());
         var row = Array.Empty<DbValue>();
         var expr = new UnaryExpr(UnaryOp.Minus, new LiteralExpr(LiteralKind.Integer, "7"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(-7L, result.AsInteger());
     }
 
     [Fact]
     public void Evaluate_Real_Literal_With_Decimal_Point()
     {
-        var result = ExprEvaluator.Evaluate(
+        var result = ExprEvaluator.EvaluateSync(
             new LiteralExpr(LiteralKind.Real, "3.14"),
             Array.Empty<DbValue>(),
             new Projection(Array.Empty<string>()));
@@ -655,7 +655,7 @@ public class ExprEvaluatorTests
             new ColumnRefExpr(null, null, "x"),
             BinaryOp.Multiply,
             new LiteralExpr(LiteralKind.Real, "1.5"));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(3.75, result.AsReal());
     }
 
@@ -667,7 +667,7 @@ public class ExprEvaluatorTests
         var expr = new CastExpr(
             new ColumnRefExpr(null, null, "s"),
             new TypeName("REAL", null));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         Assert.Equal(9.99, result.AsReal());
     }
 
@@ -679,7 +679,7 @@ public class ExprEvaluatorTests
         var expr = new CastExpr(
             new LiteralExpr(LiteralKind.Real, "3.14"),
             new TypeName("TEXT", null));
-        var result = ExprEvaluator.Evaluate(expr, row, projection);
+        var result = ExprEvaluator.EvaluateSync(expr, row, projection);
         var text = System.Text.Encoding.UTF8.GetString(result.AsText().Span);
         Assert.Contains(".", text);
         Assert.Equal(3.14, double.Parse(text, System.Globalization.CultureInfo.InvariantCulture));

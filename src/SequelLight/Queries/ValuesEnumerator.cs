@@ -36,7 +36,7 @@ internal sealed class ValuesEnumerator : IDbEnumerator
 
             int offset = r * _columnCount;
             for (int c = 0; c < _columnCount; c++)
-                _values[offset + c] = ExprEvaluator.Evaluate(row[c], emptyRow, emptyProjection);
+                _values[offset + c] = ExprEvaluator.EvaluateSync(row[c], emptyRow, emptyProjection);
         }
 
         var names = new QualifiedName[_columnCount];

@@ -449,14 +449,14 @@ public sealed class Database : IAsyncDisposable
 
                                 if (upsertWhere is not null)
                                 {
-                                    var whereResult = ExprEvaluator.Evaluate(upsertWhere, combinedRow, upsertProjection);
+                                    var whereResult = ExprEvaluator.EvaluateSync(upsertWhere, combinedRow, upsertProjection);
                                     if (!DbValueComparer.IsTrue(whereResult))
                                         continue;
                                 }
 
                                 for (int i = 0; i < upsertSetExprs.Length; i++)
                                 {
-                                    var newVal = ExprEvaluator.Evaluate(upsertSetExprs[i], combinedRow, upsertProjection);
+                                    var newVal = ExprEvaluator.EvaluateSync(upsertSetExprs[i], combinedRow, upsertProjection);
                                     existingRow[upsertSetIndices[i]] = newVal;
                                 }
 
@@ -572,13 +572,13 @@ public sealed class Database : IAsyncDisposable
         if (stmt.Limit is not null)
         {
             var resolved = planner.ResolveBindParametersFromDict(stmt.Limit);
-            var lv = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            var lv = ExprEvaluator.EvaluateSync(resolved, Array.Empty<DbValue>(), scanProjection);
             limit = lv.IsNull ? null : lv.AsInteger();
         }
         if (stmt.Offset is not null)
         {
             var resolved = planner.ResolveBindParametersFromDict(stmt.Offset);
-            var ov = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            var ov = ExprEvaluator.EvaluateSync(resolved, Array.Empty<DbValue>(), scanProjection);
             offset = ov.IsNull ? null : ov.AsInteger();
         }
 
@@ -619,7 +619,7 @@ public sealed class Database : IAsyncDisposable
 
                 for (int i = 0; i < resolvedSetExprs.Length; i++)
                 {
-                    var newValue = ExprEvaluator.Evaluate(resolvedSetExprs[i], row, scanProjection);
+                    var newValue = ExprEvaluator.EvaluateSync(resolvedSetExprs[i], row, scanProjection);
                     row[setColumnIndices[i]] = newValue;
                 }
 
@@ -682,13 +682,13 @@ public sealed class Database : IAsyncDisposable
         if (stmt.Limit is not null)
         {
             var resolved = planner.ResolveBindParametersFromDict(stmt.Limit);
-            var lv = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            var lv = ExprEvaluator.EvaluateSync(resolved, Array.Empty<DbValue>(), scanProjection);
             limit = lv.IsNull ? null : lv.AsInteger();
         }
         if (stmt.Offset is not null)
         {
             var resolved = planner.ResolveBindParametersFromDict(stmt.Offset);
-            var ov = ExprEvaluator.Evaluate(resolved, Array.Empty<DbValue>(), scanProjection);
+            var ov = ExprEvaluator.EvaluateSync(resolved, Array.Empty<DbValue>(), scanProjection);
             offset = ov.IsNull ? null : ov.AsInteger();
         }
 

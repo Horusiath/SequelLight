@@ -115,7 +115,7 @@ internal sealed class SortGroupByEnumerator : IDbEnumerator
             // Apply HAVING
             if (_having is not null)
             {
-                var result = ExprEvaluator.Evaluate(_having, Current, Projection);
+                var result = ExprEvaluator.EvaluateSync(_having, Current, Projection);
                 if (!DbValueComparer.IsTrue(result))
                     continue; // rejected, try next group
             }
@@ -179,7 +179,7 @@ internal sealed class SortGroupByEnumerator : IDbEnumerator
 
             if (desc.FilterWhere is not null)
             {
-                var filterResult = ExprEvaluator.Evaluate(desc.FilterWhere, srcRow, sourceProjection);
+                var filterResult = ExprEvaluator.EvaluateSync(desc.FilterWhere, srcRow, sourceProjection);
                 if (!DbValueComparer.IsTrue(filterResult))
                     continue;
             }
@@ -192,7 +192,7 @@ internal sealed class SortGroupByEnumerator : IDbEnumerator
 
             var args = new DbValue[desc.ArgExprs.Length];
             for (int i = 0; i < desc.ArgExprs.Length; i++)
-                args[i] = ExprEvaluator.Evaluate(desc.ArgExprs[i], srcRow, sourceProjection);
+                args[i] = ExprEvaluator.EvaluateSync(desc.ArgExprs[i], srcRow, sourceProjection);
 
             if (_distinctSets?[a] is not null)
             {
