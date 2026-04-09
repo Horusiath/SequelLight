@@ -99,6 +99,9 @@ public sealed class ConcurrentSkipList
     /// Looks up <paramref name="key"/>. Returns true if found.
     /// </summary>
     public bool TryGetValue(byte[] key, out MemEntry entry)
+        => TryGetValue(key.AsSpan(), out entry);
+
+    public bool TryGetValue(ReadOnlySpan<byte> key, out MemEntry entry)
     {
         var node = _head;
         for (int level = _height - 1; level >= 0; level--)

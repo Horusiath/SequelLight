@@ -175,12 +175,12 @@ Below are some recent runs:
 
 | Method                                            | RowCount | Mean        | Error     | StdDev    | Median      | Min         | Max         | Ratio | RatioSD | Gen0       | Gen1      | Allocated   | Alloc Ratio |
 |-------------------------------------------------- |--------- |------------:|----------:|----------:|------------:|------------:|------------:|------:|--------:|-----------:|----------:|------------:|------------:|
-| 'Full scan WHERE category = 0 (no index)'         | 10000    |   1.7442 ms | 1.9005 ms | 0.9940 ms |   1.6924 ms |   0.7886 ms |   3.2458 ms |  1.33 |    1.04 |          - |         - |    403728 B |       1.000 |
-| 'Index scan WHERE category = 0 (indexed)'         | 10000    |   1.4300 ms | 1.6165 ms | 1.0692 ms |   0.9799 ms |   0.4349 ms |   3.1218 ms |  1.09 |    1.03 |          - |         - |    404832 B |       1.003 |
-| 'SQLite: Full scan WHERE category = 0 (no index)' | 10000    |   0.3558 ms | 0.0332 ms | 0.0198 ms |   0.3491 ms |   0.3297 ms |   0.3903 ms |  0.27 |    0.14 |          - |         - |       704 B |       0.002 |
-| 'SQLite: Index scan WHERE category = 0 (indexed)' | 10000    |   0.4030 ms | 0.0473 ms | 0.0248 ms |   0.4110 ms |   0.3516 ms |   0.4286 ms |  0.31 |    0.16 |          - |         - |       704 B |       0.002 |
+| 'Full scan WHERE category = 0 (no index)'         | 10000    |   3.3453 ms | 4.0630 ms | 2.6874 ms |   1.9408 ms |   0.8457 ms |   8.2624 ms |  1.62 |    1.76 |          - |         - |    403728 B |       1.000 |
+| 'Index scan WHERE category = 0 (indexed)'         | 10000    |   1.4516 ms | 0.0809 ms | 0.0482 ms |   1.4341 ms |   1.3952 ms |   1.5258 ms |  0.70 |    0.43 |          - |         - |      5024 B |       0.012 |
+| 'SQLite: Full scan WHERE category = 0 (no index)' | 10000    |   0.4020 ms | 0.0460 ms | 0.0274 ms |   0.4043 ms |   0.3646 ms |   0.4586 ms |  0.19 |    0.12 |          - |         - |       704 B |       0.002 |
+| 'SQLite: Index scan WHERE category = 0 (indexed)' | 10000    |   0.4490 ms | 0.0381 ms | 0.0226 ms |   0.4602 ms |   0.4055 ms |   0.4700 ms |  0.22 |    0.13 |          - |         - |       704 B |       0.002 |
 |                                                   |          |             |           |           |             |             |             |       |         |            |           |             |             |
-| 'Full scan WHERE category = 0 (no index)'         | 1000000  | 145.2435 ms | 2.9791 ms | 1.9705 ms | 145.6573 ms | 141.6600 ms | 147.7391 ms |  1.00 |    0.02 | 12000.0000 | 4000.0000 | 107384184 B |       1.000 |
-| 'Index scan WHERE category = 0 (indexed)'         | 1000000  | 130.5289 ms | 1.1586 ms | 0.6895 ms | 130.6151 ms | 129.6042 ms | 131.8922 ms |  0.90 |    0.01 |  6000.0000 |         - |  55502104 B |       0.517 |
-| 'SQLite: Full scan WHERE category = 0 (no index)' | 1000000  |  33.5016 ms | 0.3072 ms | 0.1828 ms |  33.5007 ms |  33.2583 ms |  33.7857 ms |  0.23 |    0.00 |          - |         - |       704 B |       0.000 |
-| 'SQLite: Index scan WHERE category = 0 (indexed)' | 1000000  |  42.6785 ms | 0.2802 ms | 0.1853 ms |  42.6847 ms |  42.3720 ms |  43.0336 ms |  0.29 |    0.00 |          - |         - |       704 B |       0.000 |
+| 'Full scan WHERE category = 0 (no index)'         | 1000000  | 154.4453 ms | 4.2487 ms | 2.8102 ms | 153.5470 ms | 150.6820 ms | 159.4208 ms |  1.00 |    0.02 | 12000.0000 | 4000.0000 | 107373152 B |       1.000 |
+| 'Index scan WHERE category = 0 (indexed)'         | 1000000  | 130.6253 ms | 1.2780 ms | 0.8453 ms | 130.7837 ms | 129.2083 ms | 131.9021 ms |  0.85 |    0.02 |  1000.0000 |         - |  15500224 B |       0.144 |
+| 'SQLite: Full scan WHERE category = 0 (no index)' | 1000000  |  34.1383 ms | 0.3830 ms | 0.2533 ms |  34.0956 ms |  33.7925 ms |  34.5532 ms |  0.22 |    0.00 |          - |         - |       704 B |       0.000 |
+| 'SQLite: Index scan WHERE category = 0 (indexed)' | 1000000  |  42.9709 ms | 0.3580 ms | 0.2368 ms |  42.9394 ms |  42.5754 ms |  43.4068 ms |  0.28 |    0.01 |          - |         - |       704 B |       0.000 |

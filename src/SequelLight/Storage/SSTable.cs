@@ -459,13 +459,18 @@ public sealed class SSTableReader : IAsyncDisposable
     /// inline within the target block. Stops as soon as the key is found or passed.
     /// No full-block materialization.
     /// </summary>
-    public async ValueTask<(byte[]? Value, bool Found)> GetAsync(byte[] key)
+    public ValueTask<(byte[]? Value, bool Found)> GetAsync(byte[] key)
+        => GetAsync(key.AsMemory());
+
+    public async ValueTask<(byte[]? Value, bool Found)> GetAsync(ReadOnlyMemory<byte> key)
     {
+        var keySpan = key.Span;
+
         // Bloom filter fast-reject: if the filter says "definitely not here", skip I/O entirely
-        if (_bloom is not null && !_bloom.MayContain(key))
+        if (_bloom is not null && !_bloom.MayContain(keySpan))
             return (null, false);
 
-        int blockIdx = FindBlock(key);
+        int blockIdx = FindBlock(keySpan);
         if (blockIdx < 0) return (null, false);
 
         var idx = _index[blockIdx];
@@ -474,7 +479,7 @@ public sealed class SSTableReader : IAsyncDisposable
         if (_blockCache is not null && _blockCache.TryGet(_filePath, idx.Offset, out var lease))
         {
             using (lease)
-                return FindInBlock(lease.Span, key);
+                return FindInBlock(lease.Span, keySpan);
         }
 
         // Cache miss: read from disk
@@ -487,7 +492,7 @@ public sealed class SSTableReader : IAsyncDisposable
             // Populate cache for future lookups
             _blockCache?.Insert(_filePath, idx.Offset, span);
 
-            return FindInBlock(span, key);
+            return FindInBlock(span, key.Span);
         }
         finally
         {
@@ -500,7 +505,7 @@ public sealed class SSTableReader : IAsyncDisposable
     /// Returns immediately on match or overshoot. Reconstructs keys into a reusable
     /// buffer (stackalloc for small keys, ArrayPool for large) to avoid per-entry allocations.
     /// </summary>
-    private static (byte[]? Value, bool Found) FindInBlock(ReadOnlySpan<byte> block, byte[] targetKey)
+    private static (byte[]? Value, bool Found) FindInBlock(ReadOnlySpan<byte> block, ReadOnlySpan<byte> targetKey)
     {
         int offset = 0;
         // Reusable key buffer: stackalloc for typical keys, rent for oversized
@@ -634,7 +639,7 @@ public sealed class SSTableReader : IAsyncDisposable
     /// <summary>
     /// Binary search for the block whose firstKey is the largest key &lt;= the given key.
     /// </summary>
-    private int FindBlock(byte[] key)
+    private int FindBlock(ReadOnlySpan<byte> key)
     {
         int lo = 0, hi = _index.Length - 1;
         int result = -1;

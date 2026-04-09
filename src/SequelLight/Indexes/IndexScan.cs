@@ -32,6 +32,11 @@ internal sealed class IndexScan : IDbEnumerator
 
     private const int OidSize = 4;
 
+    // Reusable table key buffer: [table_oid:4][pk_bytes...]
+    // Oid portion written once in constructor; PK portion overwritten each row.
+    private readonly byte[] _tableKeyBuf;
+    private int _lastTableKeyLen;
+
     internal IndexSchema Index => _index;
     internal TableSchema Table => _table;
 
@@ -94,6 +99,10 @@ internal sealed class IndexScan : IDbEnumerator
         _pkBuf = new DbValue[pkCount];
         _valueBuf = new DbValue[valCount];
         Current = new DbValue[_columnCount];
+
+        // Preallocate table key buffer: oid(4) + max pk bytes (8 per integer PK col + slack for variable)
+        _tableKeyBuf = new byte[OidSize + pkCount * 16];
+        BinaryPrimitives.WriteUInt32BigEndian(_tableKeyBuf, table.Oid.Value);
     }
 
     public async ValueTask<bool> NextAsync(CancellationToken ct = default)
@@ -133,15 +142,30 @@ internal sealed class IndexScan : IDbEnumerator
             // Extract PK suffix from index key using stored offset — zero parse
             var indexValue = _cursor.CurrentValue.Span;
             var pkSuffix = IndexKeyEncoder.ExtractPkSuffix(indexKey, indexValue);
-            var tableKey = IndexKeyEncoder.BuildTableKey(_table.Oid, pkSuffix);
 
-            // Bookmark lookup
-            var rowValue = await _tx.GetAsync(tableKey).ConfigureAwait(false);
+            // Build table key in reusable buffer — zero allocation
+            int tableKeyLen = OidSize + pkSuffix.Length;
+            byte[] tableKeyBuf;
+            if (tableKeyLen <= _tableKeyBuf.Length)
+            {
+                pkSuffix.CopyTo(_tableKeyBuf.AsSpan(OidSize));
+                tableKeyBuf = _tableKeyBuf;
+            }
+            else
+            {
+                // Fallback for unexpectedly large keys (variable-length PK)
+                tableKeyBuf = IndexKeyEncoder.BuildTableKey(_table.Oid, pkSuffix);
+                tableKeyLen = tableKeyBuf.Length;
+            }
+
+            // Bookmark lookup using ReadOnlyMemory — no key allocation
+            var tableKeyMem = tableKeyBuf.AsMemory(0, tableKeyLen);
+            var rowValue = await _tx.GetAsync(tableKeyMem).ConfigureAwait(false);
             if (rowValue is null)
                 continue;
 
             // Decode PK columns from table key
-            RowKeyEncoder.Decode(tableKey, out _, _pkBuf, _pkColumnTypes);
+            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumnTypes);
 
             // Decode value columns — zero-copy: text/blob reference the returned byte[]
             RowValueEncoder.Decode((ReadOnlyMemory<byte>)rowValue, _valueBuf, _valueColumns);

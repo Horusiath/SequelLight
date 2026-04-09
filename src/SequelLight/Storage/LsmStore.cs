@@ -167,13 +167,18 @@ public sealed class LsmStore : IAsyncDisposable
 
     internal async ValueTask<(byte[]? Value, bool Found)> GetFromSSTAsync(
         byte[] key, ImmutableList<SSTableInfo> sstables)
+        => await GetFromSSTAsync(key.AsMemory(), sstables).ConfigureAwait(false);
+
+    internal async ValueTask<(byte[]? Value, bool Found)> GetFromSSTAsync(
+        ReadOnlyMemory<byte> key, ImmutableList<SSTableInfo> sstables)
     {
         // Search from newest to oldest
         for (int i = sstables.Count - 1; i >= 0; i--)
         {
             var info = sstables[i];
-            if (KeyComparer.Instance.Compare(key, info.MinKey) < 0 ||
-                KeyComparer.Instance.Compare(key, info.MaxKey) > 0)
+            // Re-extract span each iteration (can't hold across await)
+            if (key.Span.SequenceCompareTo(info.MinKey) < 0 ||
+                key.Span.SequenceCompareTo(info.MaxKey) > 0)
                 continue;
 
             var reader = info.Reader;
@@ -426,10 +431,13 @@ public class ReadOnlyTransaction : IDisposable, IAsyncDisposable
     }
 
     public virtual async ValueTask<byte[]?> GetAsync(byte[] key)
+        => await GetAsync(key.AsMemory()).ConfigureAwait(false);
+
+    public virtual async ValueTask<byte[]?> GetAsync(ReadOnlyMemory<byte> key)
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
 
-        if (Snapshot.TryGetValue(key, out var entry))
+        if (Snapshot.TryGetValue(key.Span, out var entry))
             return entry.IsTombstone ? null : entry.Value;
 
         var (value, found) = await Store.GetFromSSTAsync(key, SSTables).ConfigureAwait(false);
@@ -527,12 +535,30 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
     }
 
     public override async ValueTask<byte[]?> GetAsync(byte[] key)
+        => await GetAsync(key.AsMemory()).ConfigureAwait(false);
+
+    public override async ValueTask<byte[]?> GetAsync(ReadOnlyMemory<byte> key)
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
 
         // Check local writes first (read-your-own-writes)
-        if (_localWrites.TryGetValue(key, out var local))
-            return local.IsTombstone ? null : local.Value;
+        // SortedDictionary requires byte[] — extract if backed by an array
+        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(key, out var segment)
+            && segment.Offset == 0 && segment.Count == segment.Array!.Length)
+        {
+            if (_localWrites.TryGetValue(segment.Array, out var local))
+                return local.IsTombstone ? null : local.Value;
+        }
+        else
+        {
+            // Fallback: linear scan of local writes (rare path — only for non-array-backed memory)
+            foreach (var kv in _localWrites)
+            {
+                int cmp = kv.Key.AsSpan().SequenceCompareTo(key.Span);
+                if (cmp == 0) return kv.Value.IsTombstone ? null : kv.Value.Value;
+                if (cmp > 0) break;
+            }
+        }
 
         return await base.GetAsync(key).ConfigureAwait(false);
     }
