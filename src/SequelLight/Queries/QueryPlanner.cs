@@ -694,8 +694,24 @@ public sealed class QueryPlanner
 
     private IDbEnumerator BuildGroupBy(GroupByPlan plan, ReadOnlyTransaction tx)
     {
-        // Build child with order tracking for strategy selection
-        var (child, providedOrder) = BuildPhysicalWithOrder(plan.Source, tx);
+        // Prefer index-only scan for aggregates over filtered table scans.
+        // This avoids bookmark lookups into the main table when the index key
+        // covers all columns needed by the aggregate expressions, GROUP BY keys,
+        // and HAVING clause.
+        IDbEnumerator child;
+        SortKey[] providedOrder;
+        if (plan.Source is FilterPlan aggFilter && aggFilter.Source is ScanPlan aggScan && aggScan.Table.IndexCount > 0)
+        {
+            var aggResult = TryBuildIndexOnlyScanForAggregate(aggScan, aggFilter, plan, tx);
+            if (aggResult is not null)
+                (child, providedOrder) = aggResult.Value;
+            else
+                (child, providedOrder) = BuildPhysicalWithOrder(plan.Source, tx);
+        }
+        else
+        {
+            (child, providedOrder) = BuildPhysicalWithOrder(plan.Source, tx);
+        }
         var sourceProjection = child.Projection;
 
         // Resolve GROUP BY expressions to source ordinals
@@ -1251,6 +1267,185 @@ public sealed class QueryPlanner
             remapped.Add(new SortKey(outputIdx, sk.Order));
         }
         return remapped.ToArray();
+    }
+
+    /// <summary>
+    /// Tries to build an IndexOnlyScan as the child of an aggregate (GroupByPlan).
+    /// Collects required columns from aggregate args, GROUP BY keys, HAVING, and
+    /// the WHERE predicate, then checks whether any index covers them all.
+    /// </summary>
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildIndexOnlyScanForAggregate(
+        ScanPlan scan, FilterPlan filter, GroupByPlan groupByPlan, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        if (indexes.Count == 0) return null;
+
+        // Collect required column names from aggregate arguments, GROUP BY, and HAVING.
+        var requiredColumns = new List<string>();
+        foreach (var col in groupByPlan.Columns)
+        {
+            if (col is ExprResultColumn erc)
+            {
+                // For aggregate function calls, collect columns from their arguments (not the call itself).
+                // COUNT(*) has IsStar=true and no arguments, contributing zero columns.
+                if (erc.Expression is FunctionCallExpr func &&
+                    FunctionRegistry.IsAggregate(func.Name, func.IsStar ? 0 : func.Arguments.Length))
+                {
+                    foreach (var arg in func.Arguments)
+                        if (!CollectColumnNames(arg, requiredColumns))
+                            return null;
+                }
+                else
+                {
+                    if (!CollectColumnNames(erc.Expression, requiredColumns))
+                        return null;
+                }
+            }
+        }
+        if (groupByPlan.GroupByExprs is { Length: > 0 })
+        {
+            foreach (var gbe in groupByPlan.GroupByExprs)
+                if (!CollectColumnNames(gbe, requiredColumns))
+                    return null;
+        }
+        if (groupByPlan.Having is not null)
+        {
+            if (!CollectColumnNames(groupByPlan.Having, requiredColumns))
+                return null;
+        }
+        // Also collect columns from the filter predicate (residual predicates need them).
+        if (!CollectColumnNames(filter.Predicate, requiredColumns))
+            return null;
+
+        // Build table scan projection for column resolution
+        var scanNames = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            scanNames[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(scanNames);
+
+        // Split filter predicate
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+
+        foreach (var index in indexes)
+        {
+            index.EnsureEncodingMetadata(table);
+            var idxCols = index.ResolvedColumnIndices!;
+            var idxTypes = index.ResolvedColumnTypes!;
+            var pkIndices = table.PkColumnIndices;
+            var pkTypes = table.PkColumnTypes;
+
+            // Build set of column names in the index key
+            var coveredSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < idxCols.Length; i++)
+                coveredSet.Add(table.Columns[idxCols[i]].Name);
+            for (int i = 0; i < pkIndices.Length; i++)
+                coveredSet.Add(table.Columns[pkIndices[i]].Name);
+
+            // Check coverage
+            bool allCovered = true;
+            foreach (var name in requiredColumns)
+                if (!coveredSet.Contains(name)) { allCovered = false; break; }
+            if (!allCovered) continue;
+
+            // Match leading equality predicates (same logic as TryBuildIndexScan)
+            var seekValues = new DbValue[idxCols.Length];
+            int matched = 0;
+            var usedConjuncts = new HashSet<int>();
+
+            for (int ic = 0; ic < idxCols.Length; ic++)
+            {
+                bool found = false;
+                for (int ci = 0; ci < conjuncts.Count; ci++)
+                {
+                    if (usedConjuncts.Contains(ci)) continue;
+                    if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
+                    {
+                        seekValues[matched] = value;
+                        usedConjuncts.Add(ci);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+                matched++;
+            }
+
+            if (matched == 0) continue;
+
+            // Build seek prefix
+            var prefixTypes = new DbType[matched];
+            for (int i = 0; i < matched; i++)
+                prefixTypes[i] = idxTypes[i];
+            var seekPrefix = IndexKeyEncoder.EncodeSeekPrefix(index.Oid, seekValues.AsSpan(0, matched), prefixTypes);
+
+            // Build key types array: [indexed_types..., pk_types...]
+            var allKeyTypes = new DbType[idxTypes.Length + pkTypes.Length];
+            Array.Copy(idxTypes, 0, allKeyTypes, 0, idxTypes.Length);
+            Array.Copy(pkTypes, 0, allKeyTypes, idxTypes.Length, pkTypes.Length);
+
+            // Build column name → key position map
+            var keyColNames = new string[allKeyTypes.Length];
+            for (int i = 0; i < idxCols.Length; i++)
+                keyColNames[i] = table.Columns[idxCols[i]].Name;
+            for (int i = 0; i < pkIndices.Length; i++)
+                keyColNames[idxTypes.Length + i] = table.Columns[pkIndices[i]].Name;
+
+            // Build output projection from the unique set of required columns.
+            // Deduplicate: a column referenced in both GROUP BY and an aggregate arg
+            // should appear once in the output.
+            var outputNames = new List<QualifiedName>();
+            var outputMap = new List<int>();
+            var addedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var name in requiredColumns)
+            {
+                if (!addedColumns.Add(name)) continue;
+                int keyPos = Array.FindIndex(keyColNames, n => string.Equals(n, name, StringComparison.OrdinalIgnoreCase));
+                if (keyPos < 0) goto nextIndex; // shouldn't happen after coverage check
+                outputNames.Add(new QualifiedName(null, name));
+                outputMap.Add(keyPos);
+            }
+
+            // For COUNT(*) with no GROUP BY / aggregate args, the output may be empty.
+            // The aggregate layer doesn't read any columns, but IndexOnlyScan needs
+            // at least a valid projection. Output the PK column as a dummy.
+            if (outputNames.Count == 0)
+            {
+                outputNames.Add(new QualifiedName(null, table.Columns[pkIndices[0]].Name));
+                outputMap.Add(idxTypes.Length); // first PK position in key
+            }
+
+            var outputMapArray = outputMap.ToArray();
+            var indexOnlyProjection = new Projection(outputNames.ToArray());
+            var cursor = tx.CreateCursor();
+            IDbEnumerator result = new IndexOnlyScan(
+                cursor, seekPrefix, null, index.Oid.Value, index.Name, table.Name,
+                allKeyTypes, outputMapArray, indexOnlyProjection);
+
+            // Extract sort order and remap to output projection ordinals
+            var fullSortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
+            var remappedKeys = RemapIndexOnlySortKeys(fullSortKeys, idxCols, pkIndices, outputMapArray);
+
+            // Apply residual filter if needed
+            if (usedConjuncts.Count < conjuncts.Count)
+            {
+                var residuals = new List<SqlExpr>();
+                for (int i = 0; i < conjuncts.Count; i++)
+                    if (!usedConjuncts.Contains(i))
+                        residuals.Add(conjuncts[i]);
+                var residual = HeuristicOptimizer.CombineAnd(residuals);
+                var resolved = ResolveColumns(residual, result.Projection);
+                result = new Filter(result, resolved);
+            }
+
+            return (result, remappedKeys);
+
+            nextIndex:;
+        }
+
+        return null;
     }
 
     private static bool CollectColumnNames(SqlExpr expr, List<string> names)
