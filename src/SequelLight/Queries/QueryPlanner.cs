@@ -1,5 +1,6 @@
 using SequelLight.Data;
 using SequelLight.Functions;
+using SequelLight.Indexes;
 using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
 using SequelLight.Storage;
@@ -1099,18 +1100,62 @@ public sealed class QueryPlanner
 
     private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder) BuildJoinWithOrder(JoinPlan join, ReadOnlyTransaction tx)
     {
+        // Build left side first — needed for all strategies
         var (left, leftOrder) = BuildPhysicalWithOrder(join.Left, tx);
-        var (right, rightOrder) = BuildPhysicalWithOrder(join.Right, tx);
-
-        // Build combined qualified projection
         string leftAlias = GetPlanAlias(join.Left);
         string rightAlias = GetPlanAlias(join.Right);
-        var qualifiedLeft = QualifyProjection(left.Projection, leftAlias);
-        var qualifiedRight = QualifyProjection(right.Projection, rightAlias);
-        left = WrapWithQualifiedProjection(left, qualifiedLeft);
-        right = WrapWithQualifiedProjection(right, qualifiedRight);
-
+        left = WrapWithQualifiedProjection(left, QualifyProjection(left.Projection, leftAlias));
         int leftWidth = left.Projection.ColumnCount;
+
+        // Try Index Nested Loop Join before building the right physical plan.
+        // This avoids creating a right-side cursor we'd immediately discard.
+        if (join.Condition is not null
+            && join.Kind is not JoinKind.Cross and not JoinKind.Comma
+            && TryGetScanTable(join.Right) is { } rightTable
+            && rightTable.IndexCount > 0)
+        {
+            // Build a temporary combined projection for condition resolution
+            var rightNames = new QualifiedName[rightTable.Columns.Length];
+            for (int i = 0; i < rightTable.Columns.Length; i++)
+                rightNames[i] = new QualifiedName(rightAlias, rightTable.Columns[i].Name);
+
+            var tempCombined = new QualifiedName[leftWidth + rightNames.Length];
+            for (int i = 0; i < leftWidth; i++)
+                tempCombined[i] = left.Projection.GetQualifiedName(i);
+            for (int i = 0; i < rightNames.Length; i++)
+                tempCombined[leftWidth + i] = rightNames[i];
+
+            var combinedProjection = new Projection(tempCombined);
+            var resolved = ResolveColumns(join.Condition, combinedProjection);
+
+            if (TryExtractEquiJoinKeys(resolved, leftWidth,
+                out var lKeys, out var rKeys, out var inljResidual))
+            {
+                var inlj = TryMatchIndexForINLJ(rightTable, left, lKeys, rKeys, join.Kind, tx);
+                if (inlj is not null)
+                {
+                    IDbEnumerator result = inlj;
+
+                    // If predicate pushdown placed conditions on the right table,
+                    // resolve and apply them as a residual filter on the INLJ output.
+                    if (join.Right is FilterPlan rightFilter)
+                    {
+                        var rightPred = ResolveColumns(rightFilter.Predicate, combinedProjection);
+                        inljResidual = inljResidual is not null
+                            ? HeuristicOptimizer.CombineAnd(new List<SqlExpr> { inljResidual, rightPred })
+                            : rightPred;
+                    }
+
+                    if (inljResidual is not null)
+                        result = new Filter(result, inljResidual);
+                    return (result, leftOrder);
+                }
+            }
+        }
+
+        // Build right side for non-INLJ strategies
+        var (right, rightOrder) = BuildPhysicalWithOrder(join.Right, tx);
+        right = WrapWithQualifiedProjection(right, QualifyProjection(right.Projection, rightAlias));
 
         // Resolve column references in ON condition against combined projection
         SqlExpr? condition = join.Condition;
@@ -1157,6 +1202,72 @@ public sealed class QueryPlanner
 
         // Fallback to NestedLoopJoin
         return (new NestedLoopJoin(left, right, condition, join.Kind), Array.Empty<SortKey>());
+    }
+
+    /// <summary>
+    /// Extracts the TableSchema from a logical plan if it's a plain ScanPlan
+    /// (possibly wrapped in a FilterPlan after predicate pushdown).
+    /// Returns null if the plan shape doesn't qualify for INLJ.
+    /// </summary>
+    private static TableSchema? TryGetScanTable(LogicalPlan plan) => plan switch
+    {
+        ScanPlan scan => scan.Table,
+        FilterPlan { Source: ScanPlan scan } => scan.Table,
+        _ => null
+    };
+
+    /// <summary>
+    /// Tries to find an index on the right table whose leading columns match the
+    /// right-side join key columns. If found, returns an IndexNestedLoopJoin operator.
+    /// The join key columns can be in any order — they are reordered to match the index.
+    /// </summary>
+    private IndexNestedLoopJoin? TryMatchIndexForINLJ(
+        TableSchema rightTable,
+        IDbEnumerator left,
+        int[] leftKeyIndices,
+        int[] rightKeyIndices,
+        JoinKind kind,
+        ReadOnlyTransaction tx)
+    {
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(rightTable.Oid, indexes);
+
+        foreach (var index in indexes)
+        {
+            index.EnsureEncodingMetadata(rightTable);
+            var idxCols = index.ResolvedColumnIndices!;
+
+            // We need at least as many index columns as join keys
+            if (idxCols.Length < rightKeyIndices.Length)
+                continue;
+
+            // Try to match each right join key column to a leading index column.
+            // Build reordered left key ordinals to match index column order.
+            var reorderedLeftKeys = new int[rightKeyIndices.Length];
+            bool allMatched = true;
+
+            for (int ic = 0; ic < rightKeyIndices.Length; ic++)
+            {
+                bool found = false;
+                for (int jk = 0; jk < rightKeyIndices.Length; jk++)
+                {
+                    if (rightKeyIndices[jk] == idxCols[ic])
+                    {
+                        reorderedLeftKeys[ic] = leftKeyIndices[jk];
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { allMatched = false; break; }
+            }
+
+            if (!allMatched)
+                continue;
+
+            return new IndexNestedLoopJoin(left, reorderedLeftKeys, index, rightTable, tx, kind);
+        }
+
+        return null;
     }
 
     private static bool TryExtractEquiJoinKeys(

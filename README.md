@@ -9,14 +9,13 @@ A (vibe-coded) C# implementation of an embedded SQL database (parser using the S
 - Scalar and Aggregate functions.
 - TRIGGER on before/after insert/update/delete.
 - INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT, UPDATE.
-- Basic secondary index support:
-    - Index Scan
-    - Index Only Scan
 - Heuristics used to optimise query plan:
     - Nested loop join
     - Merge join
     - Hash join
     - Index scan
+    - Index Only Scan
+    - Index Nested Loop join
     - Push down predicates
     - Push down projections
     - Constant folding (including scalar and aggregate functions)

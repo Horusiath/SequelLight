@@ -332,3 +332,174 @@ public class IndexTests : TempDirTest
             Assert.Contains(row, withIndex);
     }
 }
+
+public class IndexNestedLoopJoinTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    private static async Task Exec(SequelLightConnection conn, string sql)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task INLJ_InnerJoin_ReturnsCorrectRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, product TEXT)");
+        await Exec(conn, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cust_id ON customers(id)");
+
+        await Exec(conn, "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')");
+        await Exec(conn, "INSERT INTO orders VALUES (10, 1, 'widget'), (11, 1, 'gadget'), (12, 2, 'thing')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT orders.product, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Product, string Name)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("widget", "alice"), rows);
+        Assert.Contains(("gadget", "alice"), rows);
+        Assert.Contains(("thing", "bob"), rows);
+    }
+
+    [Fact]
+    public async Task INLJ_LeftJoin_IncludesUnmatchedLeft()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, product TEXT)");
+        await Exec(conn, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cust_id ON customers(id)");
+
+        await Exec(conn, "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')");
+        await Exec(conn, "INSERT INTO orders VALUES (10, 1, 'widget'), (11, 3, 'gadget'), (12, 2, 'thing')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT orders.product, customers.name FROM orders LEFT JOIN customers ON orders.customer_id = customers.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Product, object? Name)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("widget", (object?)"alice"), rows);
+        Assert.Contains(("thing", (object?)"bob"), rows);
+        Assert.Contains(("gadget", (object?)null), rows);
+    }
+
+    [Fact]
+    public async Task INLJ_NonUniqueIndex_MultipleMatches()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE parents (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER, info TEXT)");
+        await Exec(conn, "CREATE INDEX idx_child_parent ON children(parent_id)");
+
+        await Exec(conn, "INSERT INTO parents VALUES (1, 'p1'), (2, 'p2')");
+        await Exec(conn, "INSERT INTO children VALUES (10, 1, 'c1a'), (11, 1, 'c1b'), (12, 2, 'c2a')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT parents.val, children.info FROM parents INNER JOIN children ON parents.id = children.parent_id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Val, string Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Contains(("p1", "c1a"), rows);
+        Assert.Contains(("p1", "c1b"), rows);
+        Assert.Contains(("p2", "c2a"), rows);
+    }
+
+    [Fact]
+    public async Task INLJ_Explain_ShowsIndexNestedLoopJoin()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, product TEXT)");
+        await Exec(conn, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cust_id ON customers(id)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT orders.product, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+
+        Assert.Contains(details, d => d.Contains("INDEX NESTED LOOP JOIN"));
+        Assert.Contains(details, d => d.Contains("idx_cust_id"));
+    }
+
+    [Fact]
+    public async Task INLJ_EmptyLeftSide_ReturnsNoRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER)");
+        await Exec(conn, "CREATE TABLE b (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_b_id ON b(id)");
+
+        await Exec(conn, "INSERT INTO b VALUES (1, 'x'), (2, 'y')");
+        // a is empty
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT a.fk, b.val FROM a INNER JOIN b ON a.fk = b.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task INLJ_NoMatchingRightRows_InnerJoinReturnsEmpty()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER)");
+        await Exec(conn, "CREATE TABLE b (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_b_id ON b(id)");
+
+        await Exec(conn, "INSERT INTO a VALUES (1, 99)");
+        await Exec(conn, "INSERT INTO b VALUES (1, 'x'), (2, 'y')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT a.fk, b.val FROM a INNER JOIN b ON a.fk = b.id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task INLJ_WithResidualFilter()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER)");
+        await Exec(conn, "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cust_id ON customers(id)");
+
+        await Exec(conn, "INSERT INTO customers VALUES (1, 'alice'), (2, 'bob')");
+        await Exec(conn, "INSERT INTO orders VALUES (10, 1, 100), (11, 2, 200), (12, 1, 300)");
+
+        // Join with residual condition: amount > 150
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT orders.amount, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id AND orders.amount > 150";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long Amount, string Name)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains((200L, "bob"), rows);
+        Assert.Contains((300L, "alice"), rows);
+    }
+}

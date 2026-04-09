@@ -59,6 +59,11 @@ internal static class PlanFormatter
                 Visit(join.Right, id, rows);
                 break;
 
+            case Indexes.IndexNestedLoopJoin inlj:
+                rows.Add((id, parentId, $"INDEX NESTED LOOP JOIN ({FormatJoinKind(inlj.Kind)}) USING {inlj.Index.Name} ON {inlj.Table.Name}"));
+                Visit(inlj.Left, id, rows);
+                break;
+
             case NestedLoopJoin join:
                 rows.Add((id, parentId, FormatNestedLoopJoin(join)));
                 Visit(join.Left, id, rows);
