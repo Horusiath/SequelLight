@@ -411,6 +411,16 @@ public sealed class TableSchema : IEquatable<TableSchema>
         if (value.IsNull)
             return DbValue.Null;
 
+        if (TypeAffinity.IsDateAffinity(column.TypeName))
+        {
+            if (value.Type.IsInteger()) return value;
+            if (value.Type == DbType.Float64) return DbValue.Integer((long)value.AsReal());
+            if (value.Type == DbType.Text)
+                return DbValue.Integer(DateTimeHelper.ParseToTicks(value.AsText().Span));
+            throw new InvalidOperationException(
+                $"Cannot convert {value.Type} value to date/time for column '{column.Name}'.");
+        }
+
         var affinity = TypeAffinity.Resolve(column.TypeName);
 
         if (affinity.IsInteger())

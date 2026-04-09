@@ -50,6 +50,16 @@ public static class FunctionRegistry
             ["format"] = new(ScalarFunctions.Printf, 1, int.MaxValue, true),
             ["like"] = new(ScalarFunctions.Like, 2, 2, true),
             ["glob"] = new(ScalarFunctions.Glob, 2, 2, true),
+            // Date/time functions
+            ["date"] = new(DateFunctions.Date, 1, 1, true),
+            ["time"] = new(DateFunctions.Time, 1, 1, true),
+            ["datetime"] = new(DateFunctions.DateTime, 1, 1, true),
+            ["year"] = new(DateFunctions.Year, 1, 1, true),
+            ["month"] = new(DateFunctions.Month, 1, 1, true),
+            ["day"] = new(DateFunctions.Day, 1, 1, true),
+            ["hour"] = new(DateFunctions.Hour, 1, 1, true),
+            ["minute"] = new(DateFunctions.Minute, 1, 1, true),
+            ["second"] = new(DateFunctions.Second, 1, 1, true),
         };
         Scalars = scalars.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
 

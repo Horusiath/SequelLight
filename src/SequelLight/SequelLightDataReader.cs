@@ -76,7 +76,7 @@ public sealed class SequelLightDataReader : DbDataReader
     public override string GetString(int ordinal) => Encoding.UTF8.GetString(GetDbValue(ordinal).AsText().Span);
     public override decimal GetDecimal(int ordinal) => (decimal)GetDbValue(ordinal).AsReal();
     public override char GetChar(int ordinal) => GetString(ordinal)[0];
-    public override DateTime GetDateTime(int ordinal) => throw new NotSupportedException();
+    public override DateTime GetDateTime(int ordinal) => Data.DateTimeHelper.TicksToDateTime(GetDbValue(ordinal).AsInteger());
     public override Guid GetGuid(int ordinal) => throw new NotSupportedException();
     public override bool IsDBNull(int ordinal) => GetDbValue(ordinal).IsNull;
 

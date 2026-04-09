@@ -119,6 +119,9 @@ public static class ExprEvaluator
             LiteralKind.Real => DbValue.Real(double.Parse(lit.Value, CultureInfo.InvariantCulture)),
             LiteralKind.String => DbValue.Text(Encoding.UTF8.GetBytes(lit.Value)),
             LiteralKind.Blob => DbValue.Blob(Convert.FromHexString(lit.Value)),
+            LiteralKind.CurrentDate => DbValue.Integer(DateTime.UtcNow.Date.Ticks),
+            LiteralKind.CurrentTimestamp => DbValue.Integer(DateTime.UtcNow.Ticks),
+            LiteralKind.CurrentTime => DbValue.Text(Encoding.UTF8.GetBytes(DateTime.UtcNow.ToString("HH:mm:ss", CultureInfo.InvariantCulture))),
             _ => throw new NotSupportedException($"Literal kind '{lit.Kind}' is not supported.")
         };
     }
@@ -402,6 +405,15 @@ public static class ExprEvaluator
     private static DbValue ApplyCast(DbValue operand, string typeName)
     {
         if (operand.IsNull) return DbValue.Null;
+
+        if (TypeAffinity.IsDateAffinity(typeName))
+        {
+            if (operand.Type.IsInteger()) return DbValue.Integer(operand.AsInteger());
+            if (operand.Type == DbType.Float64) return DbValue.Integer((long)operand.AsReal());
+            if (operand.Type == DbType.Text)
+                return DbValue.Integer(DateTimeHelper.ParseToTicks(operand.AsText().Span));
+            throw new InvalidOperationException($"Cannot cast {operand.Type} to {typeName}.");
+        }
 
         var targetType = TypeAffinity.Resolve(typeName);
         if (targetType.IsInteger())

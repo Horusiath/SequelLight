@@ -53,6 +53,10 @@ public static class TypeAffinity
 
         if (Contains(upper, "BOOL"))
             return DbType.UInt8;
+        if (Contains(upper, "DATETIME") || Contains(upper, "TIMESTAMP"))
+            return DbType.Int64;
+        if (Contains(upper, "DATE") && !Contains(upper, "UP"))
+            return DbType.Int64;
         if (Contains(upper, "TINY") && Contains(upper, "INT"))
             return DbType.Int8;
         if (Contains(upper, "SMALL") && Contains(upper, "INT"))
@@ -67,6 +71,14 @@ public static class TypeAffinity
             return DbType.Float64;
 
         return DbType.Int64; // NUMERIC affinity
+    }
+
+    public static bool IsDateAffinity(string? typeName)
+    {
+        if (typeName is null) return false;
+        var span = typeName.AsSpan();
+        return Contains(span, "DATETIME") || Contains(span, "TIMESTAMP")
+            || (Contains(span, "DATE") && !Contains(span, "UP"));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
