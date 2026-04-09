@@ -2813,3 +2813,155 @@ public class NestedLimitTests : TempDirTest
         Assert.Equal([4L, 5L], ids);
     }
 }
+
+public class ExistsTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    private static async Task Exec(SequelLightConnection conn, string sql)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task SelectExists_ReturnsOne_WhenRowsExist()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM t WHERE id = 1)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task SelectExists_ReturnsZero_WhenNoRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM t WHERE id = 99)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(0L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task SelectNotExists_ReturnsOne_WhenNoRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT NOT EXISTS(SELECT 1 FROM t WHERE id = 99)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task WhereExists_FiltersRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE TABLE b (id INTEGER PRIMARY KEY, val INTEGER)");
+        await Exec(conn, "INSERT INTO a VALUES (1, 'keep'), (2, 'also_keep')");
+        await Exec(conn, "INSERT INTO b VALUES (1, 42)");
+
+        // b has rows → EXISTS is true → all a rows returned
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM a WHERE EXISTS(SELECT 1 FROM b WHERE val = 42)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var names = new List<string>();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+
+        Assert.Equal(2, names.Count);
+        Assert.Contains("keep", names);
+        Assert.Contains("also_keep", names);
+    }
+
+    [Fact]
+    public async Task WhereExists_FiltersAllRows_WhenSubqueryEmpty()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)");
+        await Exec(conn, "CREATE TABLE b (id INTEGER PRIMARY KEY, val INTEGER)");
+        await Exec(conn, "INSERT INTO a VALUES (1, 'x'), (2, 'y')");
+        // b is empty
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM a WHERE EXISTS(SELECT 1 FROM b)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Exists_WithIndexedColumn()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cat ON t(category)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS(SELECT category FROM t WHERE category = 10)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task Exists_OnEmptyTable_ReturnsFalse()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS(SELECT 1 FROM t)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(0L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task ScalarSubquery_ReturnsValue()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 42)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT (SELECT val FROM t WHERE id = 1)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(42L, reader.GetInt64(0));
+    }
+
+    [Fact]
+    public async Task ScalarSubquery_ReturnsNull_WhenNoRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT (SELECT val FROM t WHERE id = 99)";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.IsDBNull(0));
+    }
+}

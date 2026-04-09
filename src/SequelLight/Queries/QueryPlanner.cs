@@ -559,7 +559,7 @@ public sealed class QueryPlanner
                         return indexResult;
                 }
                 var child = BuildPhysical(filter.Source, tx);
-                var resolved = ResolveColumns(filter.Predicate, child.Projection);
+                var resolved = ResolveColumns(filter.Predicate, child.Projection, tx);
                 return new Filter(child, resolved);
             }
 
@@ -573,7 +573,7 @@ public sealed class QueryPlanner
                         return indexOnly;
                 }
                 var child = BuildPhysical(project.Source, tx);
-                var selectors = ResolveSelectors(project.Columns, child.Projection);
+                var selectors = ResolveSelectors(project.Columns, child.Projection, tx);
                 return IsIdentityProjection(selectors, child.Projection)
                     ? child
                     : new Select(child, selectors);
@@ -1230,7 +1230,7 @@ public sealed class QueryPlanner
                 tempCombined[leftWidth + i] = rightNames[i];
 
             var combinedProjection = new Projection(tempCombined);
-            var resolved = ResolveColumns(join.Condition, combinedProjection);
+            var resolved = ResolveColumns(join.Condition, combinedProjection, tx);
 
             if (TryExtractEquiJoinKeys(resolved, leftWidth,
                 out var lKeys, out var rKeys, out var inljResidual))
@@ -1271,7 +1271,7 @@ public sealed class QueryPlanner
                 combinedNames[i] = left.Projection.GetQualifiedName(i);
             for (int i = 0; i < right.Projection.ColumnCount; i++)
                 combinedNames[leftWidth + i] = right.Projection.GetQualifiedName(i);
-            condition = ResolveColumns(condition, new Projection(combinedNames));
+            condition = ResolveColumns(condition, new Projection(combinedNames), tx);
         }
 
         // Try equi-join strategies (MergeJoin or HashJoin)
@@ -1516,6 +1516,16 @@ public sealed class QueryPlanner
     /// Eliminates per-row dictionary lookups, string allocations, and numeric parsing.
     /// </summary>
     internal SqlExpr ResolveColumns(SqlExpr expr, Projection projection)
+        => ResolveColumns(expr, projection, null);
+
+    /// <summary>
+    /// Walks an expression tree and replaces <see cref="ColumnRefExpr"/> with
+    /// <see cref="ResolvedColumnExpr"/> (ordinal lookup) and <see cref="LiteralExpr"/> with
+    /// <see cref="ResolvedLiteralExpr"/> (pre-parsed DbValue).
+    /// When <paramref name="tx"/> is provided, <see cref="SubqueryExpr"/> nodes (EXISTS, NOT EXISTS,
+    /// scalar) are evaluated at plan-build time and replaced with literal results.
+    /// </summary>
+    internal SqlExpr ResolveColumns(SqlExpr expr, Projection projection, ReadOnlyTransaction? tx)
     {
         return expr switch
         {
@@ -1525,40 +1535,131 @@ public sealed class QueryPlanner
                 _parameterValues?[p.Ordinal] ?? throw new InvalidOperationException("No parameter values provided.")),
             ResolvedColumnExpr => expr,
             ResolvedLiteralExpr => expr,
-            UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection) },
+            SubqueryExpr sub when tx is not null => EvaluateSubqueryExpr(sub, tx),
+            UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection, tx) },
             BinaryExpr binary => binary with
             {
-                Left = ResolveColumns(binary.Left, projection),
-                Right = ResolveColumns(binary.Right, projection),
+                Left = ResolveColumns(binary.Left, projection, tx),
+                Right = ResolveColumns(binary.Right, projection, tx),
             },
             IsExpr isExpr => isExpr with
             {
-                Left = ResolveColumns(isExpr.Left, projection),
-                Right = ResolveColumns(isExpr.Right, projection),
+                Left = ResolveColumns(isExpr.Left, projection, tx),
+                Right = ResolveColumns(isExpr.Right, projection, tx),
             },
-            NullTestExpr nullTest => nullTest with { Operand = ResolveColumns(nullTest.Operand, projection) },
+            NullTestExpr nullTest => nullTest with { Operand = ResolveColumns(nullTest.Operand, projection, tx) },
             BetweenExpr between => between with
             {
-                Operand = ResolveColumns(between.Operand, projection),
-                Low = ResolveColumns(between.Low, projection),
-                High = ResolveColumns(between.High, projection),
+                Operand = ResolveColumns(between.Operand, projection, tx),
+                Low = ResolveColumns(between.Low, projection, tx),
+                High = ResolveColumns(between.High, projection, tx),
             },
-            CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
-            FunctionCallExpr func => ResolveFunctionColumns(func, projection),
+            CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection, tx) },
+            FunctionCallExpr func => ResolveFunctionColumns(func, projection, tx),
             _ => expr,
         };
     }
 
-    private FunctionCallExpr ResolveFunctionColumns(FunctionCallExpr func, Projection projection)
+    /// <summary>
+    /// Evaluates a SubqueryExpr (EXISTS, NOT EXISTS, or Scalar) at plan-build time.
+    /// The inner query is compiled, optimized, and executed; the result replaces
+    /// the expression with a <see cref="ResolvedLiteralExpr"/>.
+    /// </summary>
+    private ResolvedLiteralExpr EvaluateSubqueryExpr(SubqueryExpr sub, ReadOnlyTransaction tx)
+    {
+        return sub.Kind switch
+        {
+            SubqueryKind.Exists => new ResolvedLiteralExpr(EvaluateExists(sub.Query, tx, negate: false)),
+            SubqueryKind.NotExists => new ResolvedLiteralExpr(EvaluateExists(sub.Query, tx, negate: true)),
+            SubqueryKind.Scalar => new ResolvedLiteralExpr(EvaluateScalar(sub.Query, tx)),
+            _ => throw new NotSupportedException($"Subquery kind '{sub.Kind}' is not supported.")
+        };
+    }
+
+    /// <summary>
+    /// Evaluates an EXISTS/NOT EXISTS subquery: builds and executes the inner query
+    /// with LIMIT 1 and a minimal projection to maximize IndexOnlyScan eligibility.
+    /// Returns integer 1 (true) or 0 (false).
+    /// </summary>
+    private DbValue EvaluateExists(SelectStmt stmt, ReadOnlyTransaction tx, bool negate)
+    {
+        if (stmt.First is not SelectCore core)
+            throw new NotSupportedException("EXISTS requires a SELECT query.");
+
+        // Rewrite projection to only the columns referenced in WHERE — enables IndexOnlyScan
+        var rewritten = core;
+        if (core.Where is not null)
+        {
+            var whereColumns = new List<string>();
+            CollectColumnNames(core.Where, whereColumns);
+            if (whereColumns.Count > 0)
+            {
+                var minimalCols = new ResultColumn[whereColumns.Count];
+                for (int i = 0; i < whereColumns.Count; i++)
+                    minimalCols[i] = new ExprResultColumn(new ColumnRefExpr(null, null, whereColumns[i]), null);
+                rewritten = core with { Columns = minimalCols, Distinct = false };
+            }
+        }
+
+        var logical = BuildLogicalPlan(rewritten);
+        // LIMIT 1 — stop after first row
+        logical = new LimitPlan(
+            new ResolvedLiteralExpr(DbValue.Integer(1)),
+            new ResolvedLiteralExpr(DbValue.Integer(0)),
+            logical);
+        logical = HeuristicOptimizer.Optimize(logical);
+
+        var enumerator = BuildPhysical(logical, tx);
+        try
+        {
+            var hasRow = enumerator.NextAsync().AsTask().GetAwaiter().GetResult();
+            var result = negate ? !hasRow : hasRow;
+            return DbValue.Integer(result ? 1 : 0);
+        }
+        finally
+        {
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>
+    /// Evaluates a scalar subquery: returns the first column of the first row,
+    /// or NULL if the subquery returns no rows.
+    /// </summary>
+    private DbValue EvaluateScalar(SelectStmt stmt, ReadOnlyTransaction tx)
+    {
+        if (stmt.First is not SelectCore core)
+            throw new NotSupportedException("Scalar subquery requires a SELECT query.");
+
+        var logical = BuildLogicalPlan(core);
+        logical = new LimitPlan(
+            new ResolvedLiteralExpr(DbValue.Integer(1)),
+            new ResolvedLiteralExpr(DbValue.Integer(0)),
+            logical);
+        logical = HeuristicOptimizer.Optimize(logical);
+
+        var enumerator = BuildPhysical(logical, tx);
+        try
+        {
+            var hasRow = enumerator.NextAsync().AsTask().GetAwaiter().GetResult();
+            return hasRow ? enumerator.Current[0] : default;
+        }
+        finally
+        {
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    private FunctionCallExpr ResolveFunctionColumns(FunctionCallExpr func, Projection projection, ReadOnlyTransaction? tx = null)
     {
         var args = new SqlExpr[func.Arguments.Length];
         bool changed = false;
         for (int i = 0; i < func.Arguments.Length; i++)
         {
-            args[i] = ResolveColumns(func.Arguments[i], projection);
+            args[i] = ResolveColumns(func.Arguments[i], projection, tx);
             if (!ReferenceEquals(args[i], func.Arguments[i])) changed = true;
         }
-        var filter = func.FilterWhere is not null ? ResolveColumns(func.FilterWhere, projection) : null;
+        var filter = func.FilterWhere is not null ? ResolveColumns(func.FilterWhere, projection, tx) : null;
         if (!changed && ReferenceEquals(filter, func.FilterWhere)) return func;
         return func with { Arguments = args, FilterWhere = filter };
     }
@@ -1600,7 +1701,7 @@ public sealed class QueryPlanner
         return true;
     }
 
-    private Selector[] ResolveSelectors(ResultColumn[] columns, Projection sourceProjection)
+    private Selector[] ResolveSelectors(ResultColumn[] columns, Projection sourceProjection, ReadOnlyTransaction? tx = null)
     {
         // Pre-count output columns to allocate exact array
         int count = 0;
@@ -1637,7 +1738,7 @@ public sealed class QueryPlanner
                     break;
 
                 case ExprResultColumn exprCol:
-                    result[pos++] = ResolveExprSelector(exprCol, sourceProjection);
+                    result[pos++] = ResolveExprSelector(exprCol, sourceProjection, tx);
                     break;
             }
         }
@@ -1681,7 +1782,7 @@ public sealed class QueryPlanner
                         return indexResult.Value;
                 }
                 var (child, childOrder) = BuildPhysicalWithOrder(filter.Source, tx);
-                var resolved = ResolveColumns(filter.Predicate, child.Projection);
+                var resolved = ResolveColumns(filter.Predicate, child.Projection, tx);
                 return (new Filter(child, resolved), childOrder);
             }
 
@@ -1695,7 +1796,7 @@ public sealed class QueryPlanner
                         return indexOnly.Value;
                 }
                 var (child, childOrder) = BuildPhysicalWithOrder(project.Source, tx);
-                var selectors = ResolveSelectors(project.Columns, child.Projection);
+                var selectors = ResolveSelectors(project.Columns, child.Projection, tx);
                 var remapped = RemapSortKeys(childOrder, selectors);
                 var enumerator = IsIdentityProjection(selectors, child.Projection)
                     ? child
@@ -1831,7 +1932,7 @@ public sealed class QueryPlanner
         return new SortEnumerator(source, ordinals, orders, maxRows);
     }
 
-    private Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection)
+    private Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection, ReadOnlyTransaction? tx = null)
     {
         // Optimize simple column references
         if (exprCol.Expression is ColumnRefExpr colRef)
@@ -1858,7 +1959,7 @@ public sealed class QueryPlanner
 
         // General expression — resolve column refs, then use computed selector
         var computedName = new QualifiedName(null, exprCol.Alias ?? exprCol.Expression.ToString()!);
-        var resolved = ResolveColumns(exprCol.Expression, sourceProjection);
+        var resolved = ResolveColumns(exprCol.Expression, sourceProjection, tx);
         var projection = sourceProjection;
         return Selector.Computed(computedName, values =>
             new ValueTask<DbValue>(ExprEvaluator.Evaluate(resolved, values, projection)));
