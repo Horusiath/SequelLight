@@ -145,6 +145,104 @@ public class SelectTests : TempDirTest
         Assert.True(await reader.ReadAsync());
         Assert.Equal(15L, reader.GetInt64(0));
     }
+
+    [Fact]
+    public async Task Select_TableAlias_QualifiedColumn()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO employees VALUES (1, 'alice'), (2, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT e.name FROM employees AS e";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var names = new List<string>();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+
+        Assert.Equal(new[] { "alice", "bob" }, names);
+    }
+
+    [Fact]
+    public async Task Select_TableAlias_Without_AS()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO employees VALUES (1, 'alice')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT e.name FROM employees e";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("alice", reader.GetString(0));
+    }
+
+    [Fact]
+    public async Task Select_TableAlias_In_Where()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO employees VALUES (1, 'alice'), (2, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT e.name FROM employees AS e WHERE e.id = 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("bob", reader.GetString(0));
+    }
+
+    [Fact]
+    public async Task Select_TableAlias_In_Join()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO orders VALUES (10, 1, 'widget'), (11, 2, 'gadget')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT u.name, o.product FROM users AS u INNER JOIN orders AS o ON u.id = o.user_id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Name, string Product)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(("alice", "widget"), rows);
+        Assert.Contains(("bob", "gadget"), rows);
+    }
+
+    [Fact]
+    public async Task Select_TableAlias_In_OrderBy()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO employees VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT e.name FROM employees AS e ORDER BY e.name";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var names = new List<string>();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+
+        Assert.Equal(new[] { "alice", "bob", "charlie" }, names);
+    }
 }
 
 public class FilterTests : TempDirTest
