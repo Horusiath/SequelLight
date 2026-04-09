@@ -190,7 +190,18 @@ public sealed class TableScan : IDbEnumerator
         RowKeyEncoder.Decode(key, out _, _pkBuf, _pkColumnTypes);
 
         // Decode value columns
-        RowValueEncoder.Decode(_cursor.CurrentValue.Span, _valueBuf, _valueColumns);
+        var valueSpan = _cursor.CurrentValue.Span;
+        ushort storedSlotCount = RowValueEncoder.ReadSlotCount(valueSpan);
+        RowValueEncoder.Decode(valueSpan, _valueBuf, _valueColumns);
+
+        // Fill defaults for columns absent from the stored row (added after the row was written).
+        // A column is absent when its SeqNo >= storedSlotCount — distinct from an explicit NULL
+        // where the slot exists but offset == 0.
+        for (int i = 0; i < _valueColumns.Length; i++)
+        {
+            if (_valueBuf[i].IsNull && _valueColumns[i].SeqNo >= storedSlotCount && _valueColumns[i].DefaultValue is { } def)
+                _valueBuf[i] = Database.EvaluateDefault(def, _valueColumns[i]);
+        }
 
         // Assemble full row in column order — reuse Current buffer
         for (int i = 0; i < _pkColumnIndices.Length; i++)

@@ -167,6 +167,18 @@ public static class RowValueEncoder
         return result;
     }
 
+    /// <summary>
+    /// Reads the slot count (number of SeqNo slots) stored at the beginning of an encoded value buffer.
+    /// Returns 0 for empty buffers. Used to distinguish "column absent from row" (seqNo &gt;= slotCount)
+    /// from "column explicitly stored as null" (seqNo &lt; slotCount but offset == 0).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ushort ReadSlotCount(ReadOnlySpan<byte> src)
+    {
+        if (src.IsEmpty) return 0;
+        return BinaryPrimitives.ReadUInt16LittleEndian(src);
+    }
+
     public static void Decode(ReadOnlySpan<byte> src, Span<DbValue> values, ColumnSchema[] columns)
     {
         values.Clear();

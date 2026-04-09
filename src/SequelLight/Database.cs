@@ -99,6 +99,28 @@ public sealed class Database : IAsyncDisposable
 
     private async ValueTask<int> ExecuteDdlAsync(SqlStmt stmt, ReadOnlyTransaction? transaction)
     {
+        // Reject ADD COLUMN NOT NULL without DEFAULT on a non-empty table — existing rows
+        // would violate the constraint and there is no value to fill them with.
+        if (stmt is AlterTableStmt { Action: AddColumnAction addCol })
+        {
+            bool isNotNull = false;
+            bool hasDefault = false;
+            foreach (var c in addCol.Column.Constraints)
+            {
+                if (c is NotNullColumnConstraint) isNotNull = true;
+                if (c is DefaultColumnConstraint) hasDefault = true;
+            }
+
+            if (isNotNull && !hasDefault)
+            {
+                var tableName = ((AlterTableStmt)stmt).Table;
+                var table = Schema.GetTable(tableName);
+                if (table is not null && await HasAnyRowsAsync(transaction, table).ConfigureAwait(false))
+                    throw new InvalidOperationException(
+                        $"Cannot add NOT NULL column '{addCol.Column.Name}' without a DEFAULT value to non-empty table '{tableName}'.");
+            }
+        }
+
         var changes = Schema.Apply(stmt);
         if (changes.Length == 0)
             return 0;
@@ -838,7 +860,7 @@ public sealed class Database : IAsyncDisposable
     /// Evaluates a column default expression into a <see cref="DbValue"/>
     /// compatible with the target column's type affinity.
     /// </summary>
-    private static DbValue EvaluateDefault(SqlExpr expr, ColumnSchema column)
+    internal static DbValue EvaluateDefault(SqlExpr expr, ColumnSchema column)
     {
         if (expr is not LiteralExpr literal)
             throw new NotSupportedException($"Only literal default expressions are supported, got {expr.GetType().Name}.");
@@ -860,6 +882,40 @@ public sealed class Database : IAsyncDisposable
             _ => throw new InvalidOperationException(
                 $"Cannot convert {literal.Kind} literal to {affinity} for column '{column.Name}'.")
         };
+    }
+
+    /// <summary>
+    /// Returns true if the table contains at least one non-tombstone row.
+    /// Uses the provided transaction when available, otherwise opens a temporary read-only snapshot.
+    /// </summary>
+    private async ValueTask<bool> HasAnyRowsAsync(ReadOnlyTransaction? transaction, TableSchema table)
+    {
+        var prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
+        ReadOnlyTransaction? tempTx = null;
+        try
+        {
+            var tx = transaction ?? (tempTx = _store.BeginReadOnly());
+            await using var cursor = tx.CreateCursor();
+            if (!await cursor.SeekAsync(prefix).ConfigureAwait(false))
+                return false;
+
+            while (cursor.IsValid)
+            {
+                var key = cursor.CurrentKey.Span;
+                if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != table.Oid.Value)
+                    return false;
+                if (!cursor.IsTombstone)
+                    return true;
+                if (!await cursor.MoveNextAsync().ConfigureAwait(false))
+                    return false;
+            }
+
+            return false;
+        }
+        finally
+        {
+            if (tempTx is not null) await tempTx.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     internal async ValueTask<object?> ExecuteScalarAsync(string sql, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction)
