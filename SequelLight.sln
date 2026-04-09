@@ -10,6 +10,9 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SequelLight.Cli", "src\SequelLight.Cli\SequelLight.Cli.csproj", "{5384E4EF-303D-4DA1-B883-4D53204C30EE}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+	ProjectSection(SolutionItems) = preProject
+		tests\northwind.sql = tests\northwind.sql
+	EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SequelLight.Tests", "tests\SequelLight.Tests\SequelLight.Tests.csproj", "{74C59AEF-296F-4E77-83CC-DF865664D841}"
 EndProject

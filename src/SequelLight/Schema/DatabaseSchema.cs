@@ -49,7 +49,9 @@ public sealed class DatabaseSchema
     // ---- Name-based lookup ----
 
     public TableSchema? GetTable(string name) =>
-        _tableNames.TryGetValue(name, out var oid) ? _tables[oid] : null;
+        _tableNames.TryGetValue(name, out var oid) ? _tables[oid]
+        : string.Equals(name, RootTable.Name, StringComparison.OrdinalIgnoreCase) ? RootTable
+        : null;
 
     public IndexSchema? GetIndex(string name) =>
         _indexNames.TryGetValue(name, out var oid) ? _indexes[oid] : null;

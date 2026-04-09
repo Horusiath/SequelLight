@@ -234,6 +234,20 @@ public sealed class Database : IAsyncDisposable
         // Set autoincrement to max(oid) so future allocations start at max+1
         if (entries.Count > 0)
             rootTable.Columns[0].SetAutoIncrement((long)entries[^1].Oid.Value);
+        else
+            await SeedRootTableAsync(rootTable).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Inserts the <c>__schema</c> table's own definition as the first row (oid=0)
+    /// when the database is freshly created.
+    /// </summary>
+    private async ValueTask SeedRootTableAsync(TableSchema rootTable)
+    {
+        var change = SchemaChange.Insert(rootTable.Oid, ObjectType.Table, rootTable.Name, rootTable.ToString());
+        await using var tx = _store.BeginReadWrite();
+        ApplySchemaChanges(tx, rootTable, [change]);
+        await tx.CommitAsync().ConfigureAwait(false);
     }
 
     private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)

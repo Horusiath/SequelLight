@@ -50,6 +50,12 @@ while (!cts.IsCancellationRequested)
         if (dotCmd.Equals(".quit", StringComparison.OrdinalIgnoreCase))
             break;
 
+        if (dotCmd.Equals(".schema", StringComparison.OrdinalIgnoreCase))
+        {
+            await PrintSchemaAsync(connection, cts.Token);
+            continue;
+        }
+
         AnsiConsole.MarkupLine($"[red]Unknown command: {Markup.Escape(dotCmd)}[/]");
         continue;
     }
@@ -71,6 +77,35 @@ while (!cts.IsCancellationRequested)
 }
 
 AnsiConsole.MarkupLine("[grey]Bye.[/]");
+
+static async Task PrintSchemaAsync(SequelLightConnection connection, CancellationToken ct)
+{
+    try
+    {
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT definition FROM __schema ORDER BY oid;";
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        bool any = false;
+        while (await reader.ReadAsync(ct))
+        {
+            if (reader.IsDBNull(0))
+                continue;
+            var definition = reader.GetString(0);
+            AnsiConsole.MarkupLine($"[blue]{Markup.Escape(definition)}[/];");
+            any = true;
+        }
+
+        if (!any)
+            AnsiConsole.MarkupLine("[grey]No schema objects.[/]");
+
+        AnsiConsole.WriteLine();
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+    }
+}
 
 static async Task ExecuteAsync(SequelLightConnection connection, string sql, CancellationToken ct)
 {
