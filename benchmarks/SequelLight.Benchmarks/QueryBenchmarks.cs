@@ -2332,24 +2332,34 @@ public class GroupByBenchmarks
 
 // ---------------------------------------------------------------------------
 //  Index scan benchmarks
-//  Compares full table scan vs index scan for WHERE on a column matching 20%
-//  of rows, against SQLite baselines with the same index.
+//  Two selectivity levels to show when indexes help vs hurt:
+//  - Low selectivity (0.1%): 1000 categories, WHERE category = 42 → ~0.1% of rows.
+//    Index should be dramatically faster.
+//  - High selectivity (20%): 5 categories, WHERE category = 0 → 20% of rows.
+//    Index is comparable or worse than a full scan (demonstrates crossover).
 // ---------------------------------------------------------------------------
 
 [Config(typeof(QueryBenchmarkConfig))]
 [MemoryDiagnoser]
 public class IndexScanBenchmarks
 {
-    // Two tables: one without index, one with index on category.
-    // category has 5 distinct values (0..4), so WHERE category = 0 hits 20% of rows.
-
     private string _tempDir = null!;
-    private Database _dbNoIdx = null!;
-    private Database _dbIdx = null!;
-    private LsmStore _storeNoIdx = null!;
-    private LsmStore _storeIdx = null!;
-    private SqliteConnection _sqliteNoIdx = null!;
-    private SqliteConnection _sqliteIdx = null!;
+
+    // Low selectivity (0.1%): 1000 categories
+    private Database _dbLowNoIdx = null!;
+    private Database _dbLowIdx = null!;
+    private LsmStore _storeLowNoIdx = null!;
+    private LsmStore _storeLowIdx = null!;
+    private SqliteConnection _sqliteLowNoIdx = null!;
+    private SqliteConnection _sqliteLowIdx = null!;
+
+    // High selectivity (20%): 5 categories
+    private Database _dbHighNoIdx = null!;
+    private Database _dbHighIdx = null!;
+    private LsmStore _storeHighNoIdx = null!;
+    private LsmStore _storeHighIdx = null!;
+    private SqliteConnection _sqliteHighNoIdx = null!;
+    private SqliteConnection _sqliteHighIdx = null!;
 
     [Params(10_000, 1_000_000)]
     public int RowCount;
@@ -2358,42 +2368,30 @@ public class IndexScanBenchmarks
     public void IterationSetup()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_idxscan_bench_" + Guid.NewGuid().ToString("N"));
-        var dirNoIdx = Path.Combine(_tempDir, "noidx");
-        var dirIdx = Path.Combine(_tempDir, "idx");
-        Directory.CreateDirectory(dirNoIdx);
-        Directory.CreateDirectory(dirIdx);
 
-        // ---- SequelLight: no-index DB ----
-        _storeNoIdx = LsmStore.OpenAsync(new LsmStoreOptions { Directory = dirNoIdx }).AsTask().GetAwaiter().GetResult();
-        _dbNoIdx = new Database(_storeNoIdx, dirNoIdx);
-        _dbNoIdx.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
-        _dbNoIdx.ExecuteNonQueryAsync("CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)", null, null)
-            .AsTask().GetAwaiter().GetResult();
-        SeedSequelLight(_storeNoIdx, _dbNoIdx);
+        // Low selectivity: 1000 categories → 0.1% per category
+        (_storeLowNoIdx, _dbLowNoIdx) = SetupSequelLight("low_noidx", 1000, createIndex: false);
+        (_storeLowIdx, _dbLowIdx) = SetupSequelLight("low_idx", 1000, createIndex: true);
+        _sqliteLowNoIdx = SetupSqlite("low_noidx", 1000, createIndex: false);
+        _sqliteLowIdx = SetupSqlite("low_idx", 1000, createIndex: true);
 
-        // ---- SequelLight: indexed DB ----
-        _storeIdx = LsmStore.OpenAsync(new LsmStoreOptions { Directory = dirIdx }).AsTask().GetAwaiter().GetResult();
-        _dbIdx = new Database(_storeIdx, dirIdx);
-        _dbIdx.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
-        _dbIdx.ExecuteNonQueryAsync("CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)", null, null)
-            .AsTask().GetAwaiter().GetResult();
-        SeedSequelLight(_storeIdx, _dbIdx);
-        _dbIdx.ExecuteNonQueryAsync("CREATE INDEX idx_category ON t(category)", null, null)
-            .AsTask().GetAwaiter().GetResult();
-
-        // ---- SQLite: no-index DB ----
-        _sqliteNoIdx = new SqliteConnection($"Data Source={Path.Combine(dirNoIdx, "sqlite.db")}");
-        _sqliteNoIdx.Open();
-        SetupSqlite(_sqliteNoIdx, createIndex: false);
-
-        // ---- SQLite: indexed DB ----
-        _sqliteIdx = new SqliteConnection($"Data Source={Path.Combine(dirIdx, "sqlite.db")}");
-        _sqliteIdx.Open();
-        SetupSqlite(_sqliteIdx, createIndex: true);
+        // High selectivity: 5 categories → 20% per category
+        (_storeHighNoIdx, _dbHighNoIdx) = SetupSequelLight("high_noidx", 5, createIndex: false);
+        (_storeHighIdx, _dbHighIdx) = SetupSequelLight("high_idx", 5, createIndex: true);
+        _sqliteHighNoIdx = SetupSqlite("high_noidx", 5, createIndex: false);
+        _sqliteHighIdx = SetupSqlite("high_idx", 5, createIndex: true);
     }
 
-    private void SeedSequelLight(LsmStore store, Database db)
+    private (LsmStore, Database) SetupSequelLight(string subDir, int categoryCount, bool createIndex)
     {
+        var dir = Path.Combine(_tempDir, subDir);
+        Directory.CreateDirectory(dir);
+        var store = LsmStore.OpenAsync(new LsmStoreOptions { Directory = dir }).AsTask().GetAwaiter().GetResult();
+        var db = new Database(store, dir);
+        db.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+        db.ExecuteNonQueryAsync("CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+
         var tx = store.BeginReadWrite();
         var table = db.Schema.GetTable("t")!;
         for (int i = 0; i < RowCount; i++)
@@ -2401,7 +2399,7 @@ public class IndexScanBenchmarks
             var row = new DbValue[]
             {
                 DbValue.Integer(i),
-                DbValue.Integer(i % 5),           // 5 categories → 20% per category
+                DbValue.Integer(i % categoryCount),
                 DbValue.Integer(i * 7 % 10000),
                 DbValue.Text(Encoding.UTF8.GetBytes($"item_{i:D8}")),
             };
@@ -2409,10 +2407,21 @@ public class IndexScanBenchmarks
         }
         tx.CommitAsync().AsTask().GetAwaiter().GetResult();
         tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        if (createIndex)
+            db.ExecuteNonQueryAsync("CREATE INDEX idx_category ON t(category)", null, null)
+                .AsTask().GetAwaiter().GetResult();
+
+        return (store, db);
     }
 
-    private void SetupSqlite(SqliteConnection conn, bool createIndex)
+    private SqliteConnection SetupSqlite(string subDir, int categoryCount, bool createIndex)
     {
+        var dir = Path.Combine(_tempDir, subDir);
+        Directory.CreateDirectory(dir);
+        var conn = new SqliteConnection($"Data Source={Path.Combine(dir, "sqlite.db")}");
+        conn.Open();
+
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)";
@@ -2431,7 +2440,7 @@ public class IndexScanBenchmarks
             for (int i = 0; i < RowCount; i++)
             {
                 pId.Value = (long)i;
-                pCat.Value = (long)(i % 5);
+                pCat.Value = (long)(i % categoryCount);
                 pVal.Value = (long)(i * 7 % 10000);
                 pName.Value = $"item_{i:D8}";
                 cmd.ExecuteNonQuery();
@@ -2445,46 +2454,100 @@ public class IndexScanBenchmarks
             cmd.CommandText = "CREATE INDEX idx_category ON t(category)";
             cmd.ExecuteNonQuery();
         }
+
+        return conn;
     }
 
     [IterationCleanup]
     public void IterationCleanup()
     {
-        _sqliteNoIdx.Dispose();
-        _sqliteIdx.Dispose();
-        _dbNoIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        _dbIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _sqliteLowNoIdx.Dispose();
+        _sqliteLowIdx.Dispose();
+        _sqliteHighNoIdx.Dispose();
+        _sqliteHighIdx.Dispose();
+        _dbLowNoIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _dbLowIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _dbHighNoIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _dbHighIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
         try { Directory.Delete(_tempDir, recursive: true); } catch { }
     }
 
-    // ---- SequelLight ----
+    // ====================================================================
+    //  Low selectivity (0.1%): WHERE category = 42  with 1000 categories
+    //  At 1M rows → ~1000 matching rows. Index should be much faster.
+    // ====================================================================
 
-    [Benchmark(Baseline = true, Description = "Full scan WHERE category = 0 (no index)")]
-    public async Task<int> FullScan_NoIndex()
+    [Benchmark(Baseline = true, Description = "0.1% — Full scan (no index)")]
+    public async Task<int> Low_FullScan()
     {
-        var reader = await _dbNoIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        var reader = await _dbLowNoIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 42", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
         return count;
     }
 
-    [Benchmark(Description = "Index scan WHERE category = 0 (indexed)")]
-    public async Task<int> IndexScan_Indexed()
+    [Benchmark(Description = "0.1% — Index scan")]
+    public async Task<int> Low_IndexScan()
     {
-        var reader = await _dbIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        var reader = await _dbLowIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 42", null, null);
         int count = 0;
         while (await reader.ReadAsync()) count++;
         await reader.CloseAsync();
         return count;
     }
 
-    // ---- SQLite ----
-
-    [Benchmark(Description = "SQLite: Full scan WHERE category = 0 (no index)")]
-    public int Sqlite_FullScan_NoIndex()
+    [Benchmark(Description = "0.1% — SQLite full scan (no index)")]
+    public int Low_Sqlite_FullScan()
     {
-        using var cmd = _sqliteNoIdx.CreateCommand();
+        using var cmd = _sqliteLowNoIdx.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 42";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "0.1% — SQLite index scan")]
+    public int Low_Sqlite_IndexScan()
+    {
+        using var cmd = _sqliteLowIdx.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 42";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    // ====================================================================
+    //  High selectivity (20%): WHERE category = 0  with 5 categories
+    //  At 1M rows → ~200k matching rows. Index is comparable or worse.
+    // ====================================================================
+
+    [Benchmark(Description = "20% — Full scan (no index)")]
+    public async Task<int> High_FullScan()
+    {
+        var reader = await _dbHighNoIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "20% — Index scan")]
+    public async Task<int> High_IndexScan()
+    {
+        var reader = await _dbHighIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "20% — SQLite full scan (no index)")]
+    public int High_Sqlite_FullScan()
+    {
+        using var cmd = _sqliteHighNoIdx.CreateCommand();
         cmd.CommandText = "SELECT * FROM t WHERE category = 0";
         using var reader = cmd.ExecuteReader();
         int count = 0;
@@ -2492,10 +2555,10 @@ public class IndexScanBenchmarks
         return count;
     }
 
-    [Benchmark(Description = "SQLite: Index scan WHERE category = 0 (indexed)")]
-    public int Sqlite_IndexScan_Indexed()
+    [Benchmark(Description = "20% — SQLite index scan")]
+    public int High_Sqlite_IndexScan()
     {
-        using var cmd = _sqliteIdx.CreateCommand();
+        using var cmd = _sqliteHighIdx.CreateCommand();
         cmd.CommandText = "SELECT * FROM t WHERE category = 0";
         using var reader = cmd.ExecuteReader();
         int count = 0;
