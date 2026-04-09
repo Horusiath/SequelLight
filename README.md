@@ -7,7 +7,11 @@ A (vibe-coded) C# implementation of an embedded SQL database (parser using the S
 - Primary Key support for indexing.
 - SELECT, JOINs, WHERE, ORDER BY, GROUP BY/HAVIN, LIMIT/OFFSET.
 - Scalar and Aggregate functions.
+- TRIGGER on before/after insert/update/delete.
 - INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT, UPDATE.
+- Basic secondary index support:
+    - Index Scan
+    - Index Only Scan
 - Heuristics used to optimise query plan:
     - Nested loop join
     - Merge join

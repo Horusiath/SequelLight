@@ -171,7 +171,7 @@ public static class RowKeyEncoder
         return pos;
     }
 
-    private static int DecodeColumn(ReadOnlySpan<byte> src, DbType type, out DbValue value)
+    internal static int DecodeColumn(ReadOnlySpan<byte> src, DbType type, out DbValue value)
     {
         if (type.IsInteger())
         {

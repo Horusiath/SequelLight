@@ -564,6 +564,13 @@ public sealed class QueryPlanner
 
             case ProjectPlan project:
             {
+                // Try index-only scan when projecting over a filtered table scan
+                if (project.Source is FilterPlan fp && fp.Source is ScanPlan sp && sp.Table.IndexCount > 0)
+                {
+                    var indexOnly = TryBuildIndexOnlyScan(sp, fp, project, tx);
+                    if (indexOnly is not null)
+                        return indexOnly;
+                }
                 var child = BuildPhysical(project.Source, tx);
                 var selectors = ResolveSelectors(project.Columns, child.Projection);
                 return IsIdentityProjection(selectors, child.Projection)
@@ -916,6 +923,165 @@ public sealed class QueryPlanner
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Tries to build an IndexOnlyScan for a ProjectPlan → FilterPlan → ScanPlan pattern.
+    /// Returns null if no index can satisfy the query without a table lookup.
+    /// </summary>
+    private IDbEnumerator? TryBuildIndexOnlyScan(ScanPlan scan, FilterPlan filter,
+        ProjectPlan project, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        if (indexes.Count == 0) return null;
+
+        // Collect required columns from projection
+        var requiredColumns = new List<string>();
+        foreach (var col in project.Columns)
+        {
+            switch (col)
+            {
+                case StarResultColumn or TableStarResultColumn:
+                    return null; // SELECT * → can't do index-only
+                case ExprResultColumn erc:
+                    if (!CollectColumnNames(erc.Expression, requiredColumns))
+                        return null;
+                    break;
+            }
+        }
+        // Also collect columns from the filter predicate (residual predicates need them)
+        if (!CollectColumnNames(filter.Predicate, requiredColumns))
+            return null;
+
+        // Build table scan projection for column resolution
+        var scanNames = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            scanNames[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(scanNames);
+
+        // Split filter predicate
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+
+        foreach (var index in indexes)
+        {
+            index.EnsureEncodingMetadata(table);
+            var idxCols = index.ResolvedColumnIndices!;
+            var idxTypes = index.ResolvedColumnTypes!;
+            var pkIndices = table.PkColumnIndices;
+            var pkTypes = table.PkColumnTypes;
+
+            // Build set of column names in the index key
+            var coveredSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < idxCols.Length; i++)
+                coveredSet.Add(table.Columns[idxCols[i]].Name);
+            for (int i = 0; i < pkIndices.Length; i++)
+                coveredSet.Add(table.Columns[pkIndices[i]].Name);
+
+            // Check coverage
+            bool allCovered = true;
+            foreach (var name in requiredColumns)
+                if (!coveredSet.Contains(name)) { allCovered = false; break; }
+            if (!allCovered) continue;
+
+            // Match leading equality predicates (same logic as TryBuildIndexScan)
+            var seekValues = new DbValue[idxCols.Length];
+            int matched = 0;
+            var usedConjuncts = new HashSet<int>();
+
+            for (int ic = 0; ic < idxCols.Length; ic++)
+            {
+                bool found = false;
+                for (int ci = 0; ci < conjuncts.Count; ci++)
+                {
+                    if (usedConjuncts.Contains(ci)) continue;
+                    if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
+                    {
+                        seekValues[matched] = value;
+                        usedConjuncts.Add(ci);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+                matched++;
+            }
+
+            if (matched == 0) continue;
+
+            // Build seek prefix
+            var prefixTypes = new DbType[matched];
+            for (int i = 0; i < matched; i++)
+                prefixTypes[i] = idxTypes[i];
+            var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(index.Oid, seekValues.AsSpan(0, matched), prefixTypes);
+
+            // Build key types array: [indexed_types..., pk_types...]
+            var allKeyTypes = new DbType[idxTypes.Length + pkTypes.Length];
+            Array.Copy(idxTypes, 0, allKeyTypes, 0, idxTypes.Length);
+            Array.Copy(pkTypes, 0, allKeyTypes, idxTypes.Length, pkTypes.Length);
+
+            // Build column name → key position map
+            var keyColNames = new string[allKeyTypes.Length];
+            for (int i = 0; i < idxCols.Length; i++)
+                keyColNames[i] = table.Columns[idxCols[i]].Name;
+            for (int i = 0; i < pkIndices.Length; i++)
+                keyColNames[idxTypes.Length + i] = table.Columns[pkIndices[i]].Name;
+
+            // Build output projection from SELECT columns
+            var outputNames = new List<QualifiedName>();
+            var outputMap = new List<int>();
+
+            foreach (var col in project.Columns)
+            {
+                if (col is not ExprResultColumn erc || erc.Expression is not ColumnRefExpr colRef)
+                    return null;
+                outputNames.Add(new QualifiedName(null, erc.Alias ?? colRef.Column));
+                int keyPos = Array.FindIndex(keyColNames, n => string.Equals(n, colRef.Column, StringComparison.OrdinalIgnoreCase));
+                if (keyPos < 0) return null;
+                outputMap.Add(keyPos);
+            }
+
+            var indexOnlyProjection = new Projection(outputNames.ToArray());
+            var cursor = tx.CreateCursor();
+            IDbEnumerator result = new Indexes.IndexOnlyScan(
+                cursor, seekPrefix, null, index.Oid.Value, index.Name, table.Name,
+                allKeyTypes, outputMap.ToArray(), indexOnlyProjection);
+
+            // Apply residual filter if needed
+            if (usedConjuncts.Count < conjuncts.Count)
+            {
+                var residuals = new List<SqlExpr>();
+                for (int i = 0; i < conjuncts.Count; i++)
+                    if (!usedConjuncts.Contains(i))
+                        residuals.Add(conjuncts[i]);
+                var residual = HeuristicOptimizer.CombineAnd(residuals);
+                var resolved = ResolveColumns(residual, result.Projection);
+                result = new Filter(result, resolved);
+            }
+
+            return result;
+        }
+
+        return null;
+    }
+
+    private static bool CollectColumnNames(SqlExpr expr, List<string> names)
+    {
+        switch (expr)
+        {
+            case ColumnRefExpr col:
+                names.Add(col.Column);
+                return true;
+            case BinaryExpr b:
+                return CollectColumnNames(b.Left, names) && CollectColumnNames(b.Right, names);
+            case UnaryExpr u:
+                return CollectColumnNames(u.Operand, names);
+            case LiteralExpr or ResolvedLiteralExpr:
+                return true;
+            default:
+                return false; // Complex expression we can't analyze
+        }
     }
 
     private static string FormatFunctionName(SqlExpr expr) => expr switch

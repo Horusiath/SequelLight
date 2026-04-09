@@ -29,6 +29,10 @@ internal static class PlanFormatter
                 rows.Add((id, parentId, FormatScan(scan)));
                 break;
 
+            case Indexes.IndexOnlyScan idxOnly:
+                rows.Add((id, parentId, $"INDEX ONLY SCAN {idxOnly.IndexName} ON {idxOnly.TableName}"));
+                break;
+
             case Indexes.IndexScan idxScan:
                 rows.Add((id, parentId, $"INDEX SCAN {idxScan.Index.Name} ON {idxScan.Table.Name}"));
                 break;

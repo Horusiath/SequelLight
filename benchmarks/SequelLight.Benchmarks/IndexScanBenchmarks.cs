@@ -203,6 +203,29 @@ public class IndexScanBenchmarks
         return count;
     }
 
+    // ---- Index-only scan: SELECT only PK + indexed column (no table lookup) ----
+
+    [Benchmark(Description = "0.1% — Index-only scan (id, category)")]
+    public async Task<int> Low_IndexOnlyScan()
+    {
+        var reader = await _dbLowIdx.ExecuteReaderAsync("SELECT id, category FROM t WHERE category = 42", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "0.1% — SQLite index-only scan (id, category)")]
+    public int Low_Sqlite_IndexOnlyScan()
+    {
+        using var cmd = _sqliteLowIdx.CreateCommand();
+        cmd.CommandText = "SELECT id, category FROM t WHERE category = 42";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
     // ====================================================================
     //  High selectivity (20%): WHERE category = 0  with 5 categories
     //  At 1M rows → ~200k matching rows. Index is comparable or worse.

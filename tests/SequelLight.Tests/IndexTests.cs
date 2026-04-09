@@ -222,4 +222,113 @@ public class IndexTests : TempDirTest
         Assert.Equal(2L, reader.GetInt64(0));
         Assert.False(await reader.ReadAsync());
     }
+
+    // ---- Index-Only Scan tests ----
+
+    [Fact]
+    public async Task IndexOnlyScan_SelectIndexedAndPK()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, val INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_cat ON t(category)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30)");
+
+        // SELECT only id (PK) and category (indexed) — fully covered by index key
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, category FROM t WHERE category = 'a'";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<(long Id, string Cat)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(2, rows.Count);
+        Assert.Contains(rows, r => r.Id == 1 && r.Cat == "a");
+        Assert.Contains(rows, r => r.Id == 3 && r.Cat == "a");
+    }
+
+    [Fact]
+    public async Task IndexOnlyScan_SelectStar_FallsBackToIndexScan()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, val INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_cat ON t(category)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a', 10)");
+
+        // SELECT * needs val column which isn't in the index → should NOT be index-only
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE category = 'a'";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+
+        Assert.Contains(details, d => d.Contains("INDEX SCAN"));
+        Assert.DoesNotContain(details, d => d.Contains("INDEX ONLY SCAN"));
+    }
+
+    [Fact]
+    public async Task IndexOnlyScan_CompositeIndex()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_ab ON t(a, b)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 10, 'x'), (2, 1, 20, 'y'), (3, 2, 10, 'z')");
+
+        // SELECT a, b, id — all in index key → index-only
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT a, b, id FROM t WHERE a = 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<(long A, long B, long Id)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2)));
+
+        Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public async Task Explain_ShowsIndexOnlyScan()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, val INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_cat ON t(category)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT id, category FROM t WHERE category = 'a'";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+
+        Assert.Contains(details, d => d.Contains("INDEX ONLY SCAN idx_cat"));
+    }
+
+    [Fact]
+    public async Task IndexOnlyScan_MatchesRegularScanResults()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'a')");
+
+        // Query without index (full scan)
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, category FROM t WHERE category = 'a'";
+        await using var reader1 = await cmd.ExecuteReaderAsync();
+        var noIndex = new List<(long, string)>();
+        while (await reader1.ReadAsync())
+            noIndex.Add((reader1.GetInt64(0), reader1.GetString(1)));
+
+        // Add index → should use index-only scan
+        await Exec(conn, "CREATE INDEX idx_cat ON t(category)");
+
+        cmd.CommandText = "SELECT id, category FROM t WHERE category = 'a'";
+        await using var reader2 = await cmd.ExecuteReaderAsync();
+        var withIndex = new List<(long, string)>();
+        while (await reader2.ReadAsync())
+            withIndex.Add((reader2.GetInt64(0), reader2.GetString(1)));
+
+        // Results should be identical
+        Assert.Equal(noIndex.Count, withIndex.Count);
+        foreach (var row in noIndex)
+            Assert.Contains(row, withIndex);
+    }
 }
