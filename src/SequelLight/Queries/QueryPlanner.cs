@@ -51,9 +51,6 @@ public sealed class QueryPlanner
     /// </summary>
     public IDbEnumerator Plan(SelectStmt stmt, ReadOnlyTransaction tx)
     {
-        if (stmt.Compounds.Length > 0)
-            throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
-
         var compiled = Compile(stmt);
         if (compiled is not null)
             return Execute(compiled, tx);
@@ -89,13 +86,18 @@ public sealed class QueryPlanner
     /// </summary>
     internal CompiledQuery? Compile(SelectStmt stmt)
     {
+        LogicalPlan logical;
+
         if (stmt.Compounds.Length > 0)
-            throw new NotSupportedException("UNION/INTERSECT/EXCEPT is not supported.");
-
-        if (stmt.First is not SelectCore core)
-            return null;
-
-        var logical = BuildLogicalPlan(core);
+        {
+            logical = BuildCompoundPlan(stmt);
+        }
+        else
+        {
+            if (stmt.First is not SelectCore core)
+                return null;
+            logical = BuildLogicalPlan(core);
+        }
 
         // Wrap with LimitPlan if LIMIT/OFFSET are present
         if (stmt.Limit is not null || stmt.Offset is not null)
@@ -284,6 +286,20 @@ public sealed class QueryPlanner
                     && ReferenceEquals(having, agg.Having) && ReferenceEquals(groupByExprs, agg.GroupByExprs)
                     ? plan : new GroupByPlan(groupByExprs, columns, having, source);
             }
+            case CompoundPlan compound:
+            {
+                LogicalPlan[]? resolved = null;
+                for (int i = 0; i < compound.Sources.Length; i++)
+                {
+                    var s = ResolveParameterOrdinals(compound.Sources[i], paramMap);
+                    if (!ReferenceEquals(s, compound.Sources[i]))
+                    {
+                        resolved ??= (LogicalPlan[])compound.Sources.Clone();
+                        resolved[i] = s;
+                    }
+                }
+                return resolved is not null ? new CompoundPlan(compound.Op, resolved) : plan;
+            }
             case LimitPlan limit:
             {
                 var source = ResolveParameterOrdinals(limit.Source, paramMap);
@@ -398,11 +414,15 @@ public sealed class QueryPlanner
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
-        // Peel off the top-level ProjectPlan (always present from BuildLogicalPlan)
+        // CompoundPlan or other non-ProjectPlan with ORDER BY
         if (logical is not ProjectPlan topProject)
         {
             var result = BuildPhysical(logical, tx);
             if (distinct) result = new DistinctEnumerator(result);
+            long maxRows = 0;
+            if (limitPlan is not null)
+                maxRows = EvaluateLimitForTopN(limitPlan);
+            result = BuildSortEnumerator(result, orderBy, maxRows);
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
@@ -478,6 +498,73 @@ public sealed class QueryPlanner
         if (core.Distinct)
             source = new DistinctPlan(source);
         return source;
+    }
+
+    /// <summary>
+    /// Builds a logical plan from a compound SELECT statement (UNION, UNION ALL, etc.).
+    /// Consecutive same-operator compounds collapse into one CompoundPlan with N sources.
+    /// Mixed operators nest correctly.
+    /// </summary>
+    private LogicalPlan BuildCompoundPlan(SelectStmt stmt)
+    {
+        if (stmt.First is not SelectCore firstCore)
+            throw new NotSupportedException("VALUES in compound queries is not supported.");
+
+        LogicalPlan current = BuildLogicalPlan(firstCore);
+
+        int i = 0;
+        while (i < stmt.Compounds.Length)
+        {
+            var op = stmt.Compounds[i].Op;
+            var sources = new List<LogicalPlan> { current };
+
+            // Group consecutive compounds with the same operator
+            while (i < stmt.Compounds.Length && stmt.Compounds[i].Op == op)
+            {
+                if (stmt.Compounds[i].Body is not SelectCore core)
+                    throw new NotSupportedException("VALUES in compound queries is not supported.");
+                sources.Add(BuildLogicalPlan(core));
+                i++;
+            }
+
+            current = new CompoundPlan(op, sources.ToArray());
+        }
+
+        return current;
+    }
+
+    /// <summary>
+    /// Builds the physical operator tree for a CompoundPlan.
+    /// Uses ParallelUnionEnumerator for 2+ sources, wraps with DistinctEnumerator for UNION (non-ALL).
+    /// </summary>
+    private IDbEnumerator BuildCompoundPhysical(CompoundPlan compound, ReadOnlyTransaction tx)
+    {
+        var sources = new IDbEnumerator[compound.Sources.Length];
+        sources[0] = BuildPhysical(compound.Sources[0], tx);
+        int expectedWidth = sources[0].Projection.ColumnCount;
+
+        for (int i = 1; i < compound.Sources.Length; i++)
+        {
+            sources[i] = BuildPhysical(compound.Sources[i], tx);
+            if (sources[i].Projection.ColumnCount != expectedWidth)
+                throw new InvalidOperationException(
+                    $"SELECTs in compound query have different column counts: {expectedWidth} vs {sources[i].Projection.ColumnCount}");
+        }
+
+        // Use first source's projection (SQL standard: column names from first SELECT)
+        var projection = sources[0].Projection;
+
+        IDbEnumerator result;
+        if (sources.Length >= 2)
+            result = new ParallelUnionEnumerator(sources, projection);
+        else
+            result = sources[0];
+
+        // UNION (not ALL) needs deduplication at this compound boundary
+        if (compound.Op == CompoundOp.Union)
+            result = new DistinctEnumerator(result);
+
+        return result;
     }
 
     private static bool ContainsAggregate(ResultColumn[] columns)
@@ -590,6 +677,9 @@ public sealed class QueryPlanner
 
             case GroupByPlan agg:
                 return BuildGroupBy(agg, tx);
+
+            case CompoundPlan compound:
+                return BuildCompoundPhysical(compound, tx);
 
             case LimitPlan limit:
             {
@@ -1939,6 +2029,9 @@ public sealed class QueryPlanner
 
             case GroupByPlan agg:
                 return (BuildGroupBy(agg, tx), Array.Empty<SortKey>());
+
+            case CompoundPlan:
+                return (BuildPhysical(plan, tx), Array.Empty<SortKey>());
 
             case LimitPlan limit:
             {

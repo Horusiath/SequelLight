@@ -90,6 +90,18 @@ public sealed class GroupByPlan : LogicalPlan
     }
 }
 
+public sealed class CompoundPlan : LogicalPlan
+{
+    public CompoundOp Op { get; }
+    public LogicalPlan[] Sources { get; }
+
+    public CompoundPlan(CompoundOp op, LogicalPlan[] sources)
+    {
+        Op = op;
+        Sources = sources;
+    }
+}
+
 public sealed class LimitPlan : LogicalPlan
 {
     public SqlExpr Limit { get; }

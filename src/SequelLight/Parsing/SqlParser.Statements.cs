@@ -362,7 +362,9 @@ public sealed partial class SqlParser
                  && _current.Kind != TokenKind.Not && _current.Kind != TokenKind.On
                  && _current.Kind != TokenKind.Using && _current.Kind != TokenKind.Where
                  && _current.Kind != TokenKind.Group && _current.Kind != TokenKind.Order
-                 && _current.Kind != TokenKind.Limit && _current.Kind != TokenKind.Set)
+                 && _current.Kind != TokenKind.Limit && _current.Kind != TokenKind.Set
+                 && _current.Kind != TokenKind.Union && _current.Kind != TokenKind.Intersect
+                 && _current.Kind != TokenKind.Except)
             alias = ParseNameExcludingJoins();
 
         IndexHint? hint = null;

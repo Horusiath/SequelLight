@@ -14,6 +14,25 @@ public static class HeuristicOptimizer
 {
     private static readonly Projection EmptyProjection = new(Array.Empty<QualifiedName>());
 
+    /// <summary>
+    /// Applies an optimizer rule to each source in a CompoundPlan.
+    /// Returns null if no sources changed (structural sharing), or the new array if any did.
+    /// </summary>
+    private static LogicalPlan[]? OptimizeSources(LogicalPlan[] sources, Func<LogicalPlan, LogicalPlan> rule)
+    {
+        LogicalPlan[]? result = null;
+        for (int i = 0; i < sources.Length; i++)
+        {
+            var optimized = rule(sources[i]);
+            if (!ReferenceEquals(optimized, sources[i]))
+            {
+                result ??= (LogicalPlan[])sources.Clone();
+                result[i] = optimized;
+            }
+        }
+        return result;
+    }
+
     public static LogicalPlan Optimize(LogicalPlan plan)
     {
         plan = FoldConstantsInPlan(plan);
@@ -63,6 +82,11 @@ public static class HeuristicOptimizer
                 var columns = FoldResultColumns(agg.Columns);
                 var having = agg.Having is not null ? FoldConstants(agg.Having) : null;
                 return new GroupByPlan(agg.GroupByExprs, columns, having, source);
+            }
+            case CompoundPlan compound:
+            {
+                var sources = OptimizeSources(compound.Sources, FoldConstantsInPlan);
+                return sources is not null ? new CompoundPlan(compound.Op, sources) : plan;
             }
             case LimitPlan limit:
             {
@@ -317,6 +341,11 @@ public static class HeuristicOptimizer
                     }
                 }
                 return new GroupByPlan(agg.GroupByExprs, agg.Columns, having, source);
+            }
+            case CompoundPlan compound:
+            {
+                var sources = OptimizeSources(compound.Sources, PushDownPredicates);
+                return sources is not null ? new CompoundPlan(compound.Op, sources) : plan;
             }
             case LimitPlan limit:
             {
@@ -611,6 +640,19 @@ public static class HeuristicOptimizer
                 return new ProjectPlan(project.Columns, source);
             }
 
+            case CompoundPlan compound:
+            {
+                // Projection pushdown into each participant independently
+                var newSources = new LogicalPlan[compound.Sources.Length];
+                bool changed = false;
+                for (int i = 0; i < compound.Sources.Length; i++)
+                {
+                    newSources[i] = PushProjectionsInto(compound.Sources[i], required, allColumnsNeeded);
+                    if (!ReferenceEquals(newSources[i], compound.Sources[i])) changed = true;
+                }
+                return changed ? new CompoundPlan(compound.Op, newSources) : plan;
+            }
+
             case LimitPlan limit:
             {
                 var source = PushProjectionsInto(limit.Source, required, allColumnsNeeded);
@@ -722,6 +764,8 @@ public static class HeuristicOptimizer
                 return project.Columns.Length;
             case JoinPlan join:
                 return CountAvailableColumns(join.Left) + CountAvailableColumns(join.Right);
+            case CompoundPlan compound:
+                return compound.Sources.Length > 0 ? CountAvailableColumns(compound.Sources[0]) : 0;
             case LimitPlan limit:
                 return CountAvailableColumns(limit.Source);
             default:
@@ -842,6 +886,11 @@ public static class HeuristicOptimizer
             {
                 var source = EliminateRedundantDistinct(agg.Source);
                 return ReferenceEquals(source, agg.Source) ? plan : new GroupByPlan(agg.GroupByExprs, agg.Columns, agg.Having, source);
+            }
+            case CompoundPlan compound:
+            {
+                var sources = OptimizeSources(compound.Sources, EliminateRedundantDistinct);
+                return sources is not null ? new CompoundPlan(compound.Op, sources) : plan;
             }
             case LimitPlan limit:
             {

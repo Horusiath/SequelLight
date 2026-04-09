@@ -95,6 +95,18 @@ internal static class PlanFormatter
                 Visit(sgb.Source, id, rows);
                 break;
 
+            case ParallelUnionEnumerator union:
+                rows.Add((id, parentId, $"PARALLEL UNION ALL ({union.Sources.Length} branches)"));
+                foreach (var source in union.Sources)
+                    Visit(source, id, rows);
+                break;
+
+            case ConcatEnumerator concat:
+                rows.Add((id, parentId, $"UNION ALL ({concat.Sources.Length} branches)"));
+                foreach (var source in concat.Sources)
+                    Visit(source, id, rows);
+                break;
+
             case DualEnumerator:
                 rows.Add((id, parentId, "CONSTANT ROW"));
                 break;
