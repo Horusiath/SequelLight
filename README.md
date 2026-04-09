@@ -5,7 +5,7 @@ A (vibe-coded) C# implementation of an embedded SQL database (parser using the S
 - A native ADO.NET compatible API.
 - Schema DDL (uses strict schema) for tables.
 - Primary Key support for indexing.
-- SELECT, JOINs, WHERE, ORDER BY, GROUP BY/HAVIN, LIMIT/OFFSET.
+- SELECT, JOINs, WHERE, ORDER BY, GROUP BY/HAVIN, LIMIT/OFFSET, EXISTS, UNION/UNION ALL (with parallelism).
 - Scalar and Aggregate functions.
 - TRIGGER on before/after insert/update/delete.
 - INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT, UPDATE.
@@ -225,3 +225,17 @@ AMD Ryzen 9 3950X 3.49GHz, 1 CPU, 32 logical and 16 physical cores
 | 'HashJoin: LEFT JOIN (20→50K, no index)'  | 50000      | 10.8505 ms | 0.2784 ms | 0.1842 ms | 10.8406 ms | 10.6465 ms | 11.2257 ms |  5.35 |    0.15 | 7289896 B |    9,394.20 |
 | 'SQLite: INNER JOIN (20→50K, indexed)'    | 50000      |  2.0289 ms | 0.0734 ms | 0.0486 ms |  2.0294 ms |  1.9578 ms |  2.0975 ms |  1.00 |    0.03 |     776 B |        1.00 |
 | 'SQLite: LEFT JOIN (20→50K, indexed)'     | 50000      |  2.1028 ms | 0.1481 ms | 0.0980 ms |  2.0827 ms |  1.9956 ms |  2.2946 ms |  1.04 |    0.05 |     776 B |        1.00 |
+
+### UNION / UNION ALL benchmarks
+
+| Method                                        | RowsPerTable | Mean       | Error     | StdDev    | Median     | Min        | Max        | Ratio | RatioSD | Gen0      | Gen1      | Gen2      | Allocated  | Alloc Ratio |
+|---------------------------------------------- |------------- |-----------:|----------:|----------:|-----------:|-----------:|-----------:|------:|--------:|----------:|----------:|----------:|-----------:|------------:|
+| 'UNION ALL (4 tables, parallel)'              | 1000         |  2.8968 ms | 1.7677 ms | 1.0519 ms |  2.2759 ms |  2.0776 ms |  4.7289 ms |  3.82 |    1.37 |         - |         - |         - |   702304 B |      783.82 |
+| 'UNION (4 tables, dedup, distinct elements)'  | 1000         |  6.1087 ms | 2.6555 ms | 1.7565 ms |  6.5200 ms |  2.1499 ms |  8.4572 ms |  8.06 |    2.34 |         - |         - |         - |  1685920 B |    1,881.61 |
+| 'SQLite: UNION ALL (4 tables)'                | 1000         |  0.7643 ms | 0.1174 ms | 0.0777 ms |  0.7113 ms |  0.6969 ms |  0.8705 ms |  1.01 |    0.14 |         - |         - |         - |      896 B |        1.00 |
+| 'SQLite: UNION (4 tables, distinct elements)' | 1000         |  1.7234 ms | 0.1493 ms | 0.0987 ms |  1.6974 ms |  1.6155 ms |  1.8849 ms |  2.28 |    0.25 |         - |         - |         - |      880 B |        0.98 |
+|                                               |              |            |           |           |            |            |            |       |         |           |           |           |            |             |
+| 'UNION ALL (4 tables, parallel)'              | 10000        | 21.7634 ms | 1.2654 ms | 0.7530 ms | 21.7637 ms | 20.5320 ms | 22.6883 ms |  4.64 |    0.18 |         - |         - |         - |  6896520 B |    8,132.69 |
+| 'UNION (4 tables, dedup, distinct elements)'  | 10000        | 60.8199 ms | 6.4049 ms | 4.2364 ms | 62.0805 ms | 50.5896 ms | 64.4322 ms | 12.96 |    0.90 | 2000.0000 | 1000.0000 | 1000.0000 | 19039464 B |   22,452.20 |
+| 'SQLite: UNION ALL (4 tables)'                | 10000        |  4.6939 ms | 0.1861 ms | 0.0973 ms |  4.6970 ms |  4.5445 ms |  4.8269 ms |  1.00 |    0.03 |         - |         - |         - |      848 B |        1.00 |
+| 'SQLite: UNION (4 tables, distinct elements)' | 10000        | 13.6175 ms | 0.4173 ms | 0.2483 ms | 13.6317 ms | 13.1406 ms | 13.9477 ms |  2.90 |    0.08 |         - |         - |         - |      832 B |        0.98 |
