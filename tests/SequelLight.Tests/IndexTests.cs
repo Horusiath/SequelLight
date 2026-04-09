@@ -502,4 +502,66 @@ public class IndexNestedLoopJoinTests : TempDirTest
         Assert.Contains((200L, "bob"), rows);
         Assert.Contains((300L, "alice"), rows);
     }
+
+    /// <summary>
+    /// Regression test: a LEFT JOIN with a WHERE clause referencing the right
+    /// table must still emit unmatched left rows with NULL right columns.
+    ///
+    /// The optimizer's predicate pushdown moves the right-only WHERE predicate
+    /// into a FilterPlan on the right side of the join (even for LEFT JOIN —
+    /// a known optimizer limitation). Projection pushdown then wraps the scan,
+    /// producing FilterPlan(ProjectPlan(ScanPlan)).
+    ///
+    /// If TryGetScanTable recursively unwraps FilterPlan, INLJ is selected
+    /// and the right-side filter becomes a post-join residual. This breaks
+    /// LEFT JOIN semantics: left rows whose right matches are all eliminated
+    /// by the filter disappear instead of appearing with NULLs.
+    ///
+    /// The fix: TryGetScanTable only unwraps ProjectPlan (safe — just column
+    /// narrowing), keeping FilterPlan matching shallow. When the right side is
+    /// FilterPlan(ProjectPlan(ScanPlan)), INLJ is not selected and the planner
+    /// falls through to HashJoin, which handles the filter correctly.
+    /// </summary>
+    [Fact]
+    public async Task INLJ_LeftJoin_WithRightSideFilter_PreservesUnmatchedRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+
+        // Right table: events with a non-PK "category" column and a "status" column
+        await Exec(conn, "CREATE TABLE events (id INTEGER PRIMARY KEY, category INTEGER, status INTEGER, info TEXT)");
+        await Exec(conn, "CREATE INDEX idx_evt_cat ON events(category)");
+
+        // Left table: lookups
+        await Exec(conn, "CREATE TABLE lookups (id INTEGER PRIMARY KEY, category INTEGER, label TEXT)");
+
+        // Events: category 1 has only inactive events, category 2 has an active one
+        await Exec(conn, "INSERT INTO events VALUES (1, 1, 0, 'evt_inactive'), (2, 2, 1, 'evt_active')");
+
+        // Lookups: both categories
+        await Exec(conn, "INSERT INTO lookups VALUES (1, 1, 'lkp_one'), (2, 2, 'lkp_two')");
+
+        // LEFT JOIN + WHERE on right-side column.
+        // lookup category=1 matches events but the WHERE (status=1) filters them all out.
+        // That left row MUST still appear with NULL right columns.
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT lookups.label, events.info
+            FROM lookups
+            LEFT JOIN events ON lookups.category = events.category
+            WHERE events.status = 1 OR events.status IS NULL";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(string Label, object? Info)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+
+        // lkp_two matches evt_active (status=1)
+        Assert.Contains(("lkp_two", (object?)"evt_active"), rows);
+
+        // lkp_one: right-side match exists (evt_inactive) but status=0, so filtered out.
+        // LEFT JOIN must still emit this row with NULL right columns (status IS NULL passes).
+        Assert.Contains(("lkp_one", (object?)null), rows);
+
+        Assert.Equal(2, rows.Count);
+    }
 }

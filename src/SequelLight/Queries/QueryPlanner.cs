@@ -1109,8 +1109,16 @@ public sealed class QueryPlanner
 
         // Try Index Nested Loop Join before building the right physical plan.
         // This avoids creating a right-side cursor we'd immediately discard.
+        //
+        // When the right side has a FilterPlan (from predicate pushdown) and the
+        // join is LEFT/LEFT OUTER, we must NOT use INLJ: the filter would become
+        // a post-join residual, breaking null-emission semantics. For INNER joins
+        // a residual filter is always correct.
+        bool rightHasFilter = ExtractFilterPlan(join.Right) is not null;
+        bool isLeftJoin = join.Kind is JoinKind.Left or JoinKind.LeftOuter;
         if (join.Condition is not null
             && join.Kind is not JoinKind.Cross and not JoinKind.Comma
+            && !(rightHasFilter && isLeftJoin)
             && TryGetScanTable(join.Right) is { } rightTable
             && rightTable.IndexCount > 0)
         {
@@ -1207,14 +1215,19 @@ public sealed class QueryPlanner
 
     /// <summary>
     /// Extracts the TableSchema from a logical plan by unwrapping ProjectPlan
-    /// and FilterPlan nodes inserted by the optimizer. The INLJ replaces the
-    /// entire right side and builds its own projection from the raw table,
-    /// so these wrappers can be safely skipped.
+    /// nodes inserted by the optimizer's projection pushdown. ProjectPlan is
+    /// safe to skip — INLJ replaces the entire right side and builds its own
+    /// projection from the raw table.
+    ///
+    /// FilterPlan is matched shallowly (must directly wrap ScanPlan) to avoid
+    /// incorrect LEFT JOIN semantics: a right-side filter applied as a post-INLJ
+    /// residual would strip matched rows instead of suppressing them before the
+    /// join's null-emission logic.
     /// </summary>
     private static TableSchema? TryGetScanTable(LogicalPlan plan) => plan switch
     {
         ScanPlan scan => scan.Table,
-        FilterPlan filter => TryGetScanTable(filter.Source),
+        FilterPlan { Source: ScanPlan scan } => scan.Table,
         ProjectPlan project => TryGetScanTable(project.Source),
         _ => null
     };
