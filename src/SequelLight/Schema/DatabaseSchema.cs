@@ -283,6 +283,7 @@ public sealed class DatabaseSchema
         var index = new IndexSchema(oid, stmt.Index, tableOid, stmt.Table, stmt.Unique, stmt.Columns, stmt.Where);
         _indexes[oid] = index;
         _indexNames[stmt.Index] = oid;
+        _tables[tableOid].IndexCount++;
 
         return [SchemaChange.Insert(oid, ObjectType.Index, index.Name, index.ToString())];
     }
@@ -331,7 +332,7 @@ public sealed class DatabaseSchema
         bool removed = stmt.Kind switch
         {
             DropObjectKind.Table => DropTable(stmt.Name, changes),
-            DropObjectKind.Index => DropNamed(_indexes, _indexNames, stmt.Name, changes),
+            DropObjectKind.Index => DropIndex(stmt.Name, changes),
             DropObjectKind.View => DropNamed(_views, _viewNames, stmt.Name, changes),
             DropObjectKind.Trigger => DropTrigger(stmt.Name, changes),
             _ => throw new InvalidOperationException($"Unsupported drop kind: {stmt.Kind}")
@@ -351,6 +352,25 @@ public sealed class DatabaseSchema
         changes.Add(SchemaChange.Delete(oid));
         objects.Remove(oid);
         return true;
+    }
+
+    private bool DropIndex(string name, List<SchemaChange> changes)
+    {
+        if (!_indexNames.Remove(name, out var oid))
+            return false;
+        var index = _indexes[oid];
+        _indexes.Remove(oid);
+        changes.Add(SchemaChange.Delete(oid));
+        if (_tables.TryGetValue(index.TableOid, out var table))
+            table.IndexCount--;
+        return true;
+    }
+
+    internal void GetIndexesForTable(Oid tableOid, List<IndexSchema> result)
+    {
+        foreach (var index in _indexes.Values)
+            if (index.TableOid == tableOid)
+                result.Add(index);
     }
 
     private bool DropTrigger(string name, List<SchemaChange> changes)

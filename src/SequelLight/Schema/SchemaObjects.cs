@@ -269,6 +269,12 @@ public sealed class TableSchema : IEquatable<TableSchema>
     /// </summary>
     public int TriggerCount;
 
+    /// <summary>
+    /// Number of secondary indexes on this table. Maintained by DDL operations.
+    /// DML executors check this before doing any index maintenance work (zero-cost when 0).
+    /// </summary>
+    public int IndexCount;
+
     public int GetColumnIndex(string name)
     {
         for (int i = 0; i < Columns.Length; i++)
@@ -279,13 +285,16 @@ public sealed class TableSchema : IEquatable<TableSchema>
 
     // Encoding metadata — lazily initialized, invalidated when Columns reference changes.
     private ColumnSchema[]? _encodingColumns;
-    private int[]? _pkColumnIndices;
-    private DbType[]? _pkColumnTypes;
+    internal int[]? _pkColumnIndices;
+    internal DbType[]? _pkColumnTypes;
+
+    internal int[] PkColumnIndices { get { EnsureEncodingMetadata(); return _pkColumnIndices!; } }
+    internal DbType[] PkColumnTypes { get { EnsureEncodingMetadata(); return _pkColumnTypes!; } }
     private int[]? _valueColumnIndices;
     private ushort[]? _valueColumnSeqNos;
     private DbType[]? _valueColumnTypes;
 
-    private void EnsureEncodingMetadata()
+    internal void EnsureEncodingMetadata()
     {
         if (ReferenceEquals(_encodingColumns, Columns))
             return;
@@ -614,6 +623,27 @@ public sealed class IndexSchema : IEquatable<IndexSchema>
     public bool IsUnique { get; }
     public IndexedColumn[] Columns { get; }
     public SqlExpr? Where { get; }
+
+    // Lazily computed encoding metadata
+    internal int[]? ResolvedColumnIndices;
+    internal Data.DbType[]? ResolvedColumnTypes;
+
+    internal void EnsureEncodingMetadata(TableSchema table)
+    {
+        if (ResolvedColumnIndices is not null) return;
+
+        var indices = new int[Columns.Length];
+        var types = new Data.DbType[Columns.Length];
+        for (int i = 0; i < Columns.Length; i++)
+        {
+            if (Columns[i].Expression is not Parsing.Ast.ColumnRefExpr colRef)
+                throw new InvalidOperationException($"Index column must be a column reference, got {Columns[i].Expression.GetType().Name}.");
+            indices[i] = table.GetColumnIndex(colRef.Column);
+            types[i] = table.Columns[indices[i]].ResolvedType;
+        }
+        ResolvedColumnIndices = indices;
+        ResolvedColumnTypes = types;
+    }
 
     public bool Equals(IndexSchema? other) => other is not null && Oid == other.Oid;
     public override bool Equals(object? obj) => Equals(obj as IndexSchema);

@@ -550,6 +550,13 @@ public sealed class QueryPlanner
 
             case FilterPlan filter:
             {
+                // Try index scan when filtering a table scan
+                if (filter.Source is ScanPlan scanForIndex && scanForIndex.Table.IndexCount > 0)
+                {
+                    var indexResult = TryBuildIndexScan(scanForIndex, filter, tx);
+                    if (indexResult is not null)
+                        return indexResult;
+                }
                 var child = BuildPhysical(filter.Source, tx);
                 var resolved = ResolveColumns(filter.Predicate, child.Projection);
                 return new Filter(child, resolved);
@@ -796,6 +803,119 @@ public sealed class QueryPlanner
 
         desc = new AggregateDescriptor(agg, resolvedArgs, func.IsStar, func.Distinct, resolvedFilter);
         return true;
+    }
+
+    /// <summary>
+    /// Attempts to use a secondary index for a FilterPlan over a ScanPlan.
+    /// Returns an IndexScan (possibly wrapped with a residual Filter) or null if no index is usable.
+    /// </summary>
+    private IDbEnumerator? TryBuildIndexScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        if (indexes.Count == 0) return null;
+
+        // Build projection for the table scan (for resolving column references)
+        var names = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(names);
+
+        // Split predicate into conjuncts
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+
+        // Try each index for prefix match
+        foreach (var index in indexes)
+        {
+            index.EnsureEncodingMetadata(table);
+            var idxCols = index.ResolvedColumnIndices!;
+            var idxTypes = index.ResolvedColumnTypes!;
+
+            // Match leading equality predicates against index columns
+            var seekValues = new DbValue[idxCols.Length];
+            int matched = 0;
+            var usedConjuncts = new HashSet<int>();
+
+            for (int ic = 0; ic < idxCols.Length; ic++)
+            {
+                bool found = false;
+                for (int ci = 0; ci < conjuncts.Count; ci++)
+                {
+                    if (usedConjuncts.Contains(ci)) continue;
+
+                    if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
+                    {
+                        seekValues[matched] = value;
+                        usedConjuncts.Add(ci);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+                matched++;
+            }
+
+            if (matched == 0) continue; // No prefix match for this index
+
+            // Build seek prefix from matched values
+            var prefixValues = seekValues.AsSpan(0, matched);
+            var prefixTypes = new DbType[matched];
+            for (int i = 0; i < matched; i++)
+                prefixTypes[i] = idxTypes[i];
+            var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(index.Oid, prefixValues, prefixTypes);
+
+            // Build IndexScan
+            var cursor = tx.CreateCursor();
+            var indexScan = new Indexes.IndexScan(cursor, index, table, tx, seekPrefix, null);
+
+            // If there are residual conjuncts (not covered by the index), wrap with Filter
+            if (usedConjuncts.Count < conjuncts.Count)
+            {
+                var residuals = new List<SqlExpr>();
+                for (int i = 0; i < conjuncts.Count; i++)
+                    if (!usedConjuncts.Contains(i))
+                        residuals.Add(conjuncts[i]);
+                var residual = HeuristicOptimizer.CombineAnd(residuals);
+                var resolved = ResolveColumns(residual, indexScan.Projection);
+                return new Filter(indexScan, resolved);
+            }
+
+            return indexScan;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if an expression is of the form `column = constant` (or `constant = column`)
+    /// for the given column name, and extracts the constant value.
+    /// </summary>
+    private static bool TryExtractEquality(SqlExpr expr, string columnName, Projection projection, out DbValue value)
+    {
+        value = default;
+        if (expr is not BinaryExpr { Op: BinaryOp.Equal } eq)
+            return false;
+
+        // column = constant
+        if (eq.Left is ColumnRefExpr colL &&
+            string.Equals(colL.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            eq.Right is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = eq.Right is ResolvedLiteralExpr rl ? rl.Value : ExprEvaluator.EvaluateLiteral((LiteralExpr)eq.Right);
+            return true;
+        }
+
+        // constant = column
+        if (eq.Right is ColumnRefExpr colR &&
+            string.Equals(colR.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            eq.Left is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = eq.Left is ResolvedLiteralExpr rl2 ? rl2.Value : ExprEvaluator.EvaluateLiteral((LiteralExpr)eq.Left);
+            return true;
+        }
+
+        return false;
     }
 
     private static string FormatFunctionName(SqlExpr expr) => expr switch

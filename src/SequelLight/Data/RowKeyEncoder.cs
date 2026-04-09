@@ -100,7 +100,7 @@ public static class RowKeyEncoder
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int ColumnKeySize(DbValue value, DbType type)
+    internal static int ColumnKeySize(DbValue value, DbType type)
     {
         if (type.IsInteger() || type == DbType.Float64)
             return 8;
@@ -116,7 +116,7 @@ public static class RowKeyEncoder
         return data.Length + data.Count((byte)0x00) + 2;
     }
 
-    private static int EncodeColumn(Span<byte> dest, DbValue value, DbType type)
+    internal static int EncodeColumn(Span<byte> dest, DbValue value, DbType type)
     {
         if (type.IsInteger())
         {

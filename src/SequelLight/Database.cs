@@ -111,14 +111,26 @@ public sealed class Database : IAsyncDisposable
         {
             _schemaDirty = true;
             ApplySchemaChanges(rw, rootTable, changes);
+            if (stmt is CreateIndexStmt createIdx)
+                await PopulateNewIndexAsync(rw, createIdx).ConfigureAwait(false);
             return changes.Length;
         }
 
         // Auto-commit when no explicit transaction is provided
         await using var autoTx = _store.BeginReadWrite();
         ApplySchemaChanges(autoTx, rootTable, changes);
+        if (stmt is CreateIndexStmt createIdx2)
+            await PopulateNewIndexAsync(autoTx, createIdx2).ConfigureAwait(false);
         await autoTx.CommitAsync().ConfigureAwait(false);
         return changes.Length;
+    }
+
+    private async ValueTask PopulateNewIndexAsync(ReadWriteTransaction rw, CreateIndexStmt createIdx)
+    {
+        var table = Schema.GetTable(createIdx.Table);
+        var index = Schema.GetIndex(createIdx.Index);
+        if (table is null || index is null) return;
+        await Indexes.IndexMaintenance.PopulateAsync(rw, table, index).ConfigureAwait(false);
     }
 
     private static void ApplySchemaChanges(ReadWriteTransaction tx, TableSchema rootTable, SchemaChange[] changes)
@@ -333,6 +345,8 @@ public sealed class Database : IAsyncDisposable
                     }
 
                     rw.Put(key, table.EncodeRowValue(row));
+                    if (table.IndexCount > 0)
+                        Indexes.IndexMaintenance.InsertEntries(rw, Schema, table, row);
                     totalInserted++;
 
                     if (table.TriggerCount > 0)
@@ -465,6 +479,8 @@ public sealed class Database : IAsyncDisposable
                 }
 
                 rw.Put(key, table.EncodeRowValue(row));
+                if (table.IndexCount > 0)
+                    Indexes.IndexMaintenance.InsertEntries(rw, Schema, table, row);
                 totalInserted++;
 
                 if (table.TriggerCount > 0)
@@ -593,9 +609,9 @@ public sealed class Database : IAsyncDisposable
             int count = 0;
             foreach (var (oldKey, row) in matchedRows)
             {
-                // Snapshot old row before modification (only when triggers exist)
+                // Snapshot old row before modification (needed for triggers and index maintenance)
                 DbValue[]? oldRow = null;
-                if (table.TriggerCount > 0)
+                if (table.TriggerCount > 0 || table.IndexCount > 0)
                 {
                     oldRow = new DbValue[row.Length];
                     Array.Copy(row, oldRow, row.Length);
@@ -620,6 +636,8 @@ public sealed class Database : IAsyncDisposable
                 if (!oldKey.AsSpan().SequenceEqual(newKey))
                     rw.Delete(oldKey);
                 rw.Put(newKey, table.EncodeRowValue(row));
+                if (table.IndexCount > 0)
+                    Indexes.IndexMaintenance.UpdateEntries(rw, Schema, table, oldRow!, row);
                 count++;
 
                 if (table.TriggerCount > 0)
@@ -705,6 +723,8 @@ public sealed class Database : IAsyncDisposable
                         continue; // RAISE(IGNORE)
 
                     rw.Delete(key);
+                    if (table.IndexCount > 0)
+                        Indexes.IndexMaintenance.DeleteEntries(rw, Schema, table, row);
                     count++;
 
                     await TriggerExecutor.FireAsync(this, rw, table, TriggerTiming.After,
@@ -713,7 +733,26 @@ public sealed class Database : IAsyncDisposable
                 return count;
             }
 
-            // Fast path: no triggers — materialize keys only
+            if (table.IndexCount > 0)
+            {
+                // Index path: need full rows to delete index entries
+                var rowsToDelete2 = new List<(byte[] Key, DbValue[] Row)>();
+                while (await source.NextAsync().ConfigureAwait(false))
+                {
+                    var key = table.EncodeRowKey(source.Current);
+                    var row = new DbValue[table.Columns.Length];
+                    Array.Copy(source.Current, row, row.Length);
+                    rowsToDelete2.Add((key, row));
+                }
+                foreach (var (key, row) in rowsToDelete2)
+                {
+                    rw.Delete(key);
+                    Indexes.IndexMaintenance.DeleteEntries(rw, Schema, table, row);
+                }
+                return rowsToDelete2.Count;
+            }
+
+            // Fast path: no triggers, no indexes — materialize keys only
             var keysToDelete = new List<byte[]>();
             while (await source.NextAsync().ConfigureAwait(false))
                 keysToDelete.Add(table.EncodeRowKey(source.Current));

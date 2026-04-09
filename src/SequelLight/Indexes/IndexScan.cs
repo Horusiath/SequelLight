@@ -1,0 +1,160 @@
+using System.Buffers.Binary;
+using SequelLight.Data;
+using SequelLight.Queries;
+using SequelLight.Schema;
+using SequelLight.Storage;
+
+namespace SequelLight.Indexes;
+
+/// <summary>
+/// Scans an index prefix, performs bookmark lookups into the main table,
+/// and yields full rows. Used when the query planner determines an index
+/// can satisfy a WHERE clause more efficiently than a full table scan.
+/// </summary>
+internal sealed class IndexScan : IDbEnumerator
+{
+    private readonly Cursor _cursor;
+    private readonly IndexSchema _index;
+    private readonly TableSchema _table;
+    private readonly ReadOnlyTransaction _tx;
+    private readonly byte[] _seekPrefix;
+    private readonly byte[]? _upperBound;
+    private bool _seeked;
+
+    // Decode buffers (reused per row)
+    private readonly int _columnCount;
+    private readonly DbValue[] _pkBuf;
+    private readonly DbType[] _pkColumnTypes;
+    private readonly int[] _pkColumnIndices;
+    private readonly ColumnSchema[] _valueColumns;
+    private readonly int[] _valueColumnOutputIndices;
+
+    internal IndexSchema Index => _index;
+    internal TableSchema Table => _table;
+
+    public Projection Projection { get; }
+    public DbValue[] Current { get; }
+
+    public IndexScan(
+        Cursor cursor,
+        IndexSchema index,
+        TableSchema table,
+        ReadOnlyTransaction tx,
+        byte[] seekPrefix,
+        byte[]? upperBound)
+    {
+        _cursor = cursor;
+        _index = index;
+        _table = table;
+        _tx = tx;
+        _seekPrefix = seekPrefix;
+        _upperBound = upperBound;
+
+        _columnCount = table.Columns.Length;
+
+        // Build projection identical to TableScan
+        var names = new QualifiedName[_columnCount];
+        for (int i = 0; i < _columnCount; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        Projection = new Projection(names);
+
+        // Precompute PK and value column metadata
+        int pkCount = 0, valCount = 0;
+        for (int i = 0; i < _columnCount; i++)
+        {
+            if (table.Columns[i].IsPrimaryKey) pkCount++;
+            else valCount++;
+        }
+
+        _pkColumnIndices = new int[pkCount];
+        _pkColumnTypes = new DbType[pkCount];
+        _valueColumns = new ColumnSchema[valCount];
+        _valueColumnOutputIndices = new int[valCount];
+
+        int pk = 0, val = 0;
+        for (int i = 0; i < _columnCount; i++)
+        {
+            if (table.Columns[i].IsPrimaryKey)
+            {
+                _pkColumnIndices[pk] = i;
+                _pkColumnTypes[pk] = table.Columns[i].ResolvedType;
+                pk++;
+            }
+            else
+            {
+                _valueColumns[val] = table.Columns[i];
+                _valueColumnOutputIndices[val] = i;
+                val++;
+            }
+        }
+
+        _pkBuf = new DbValue[pkCount];
+        Current = new DbValue[_columnCount];
+    }
+
+    public async ValueTask<bool> NextAsync(CancellationToken ct = default)
+    {
+        while (true)
+        {
+            // Seek or advance
+            if (!_seeked)
+            {
+                _seeked = true;
+                if (!await _cursor.SeekAsync(_seekPrefix).ConfigureAwait(false))
+                    return false;
+            }
+            else
+            {
+                if (!await _cursor.MoveNextAsync().ConfigureAwait(false))
+                    return false;
+            }
+
+            if (!_cursor.IsValid)
+                return false;
+
+            var indexKey = _cursor.CurrentKey.Span;
+
+            // Check prefix still matches (index Oid)
+            if (indexKey.Length < 4 ||
+                BinaryPrimitives.ReadUInt32BigEndian(indexKey) != _index.Oid.Value)
+                return false;
+
+            // Check key is within seek prefix range
+            if (indexKey.Length < _seekPrefix.Length ||
+                !indexKey[.._seekPrefix.Length].SequenceEqual(_seekPrefix))
+                return false;
+
+            // Check upper bound (for range scans)
+            if (_upperBound is not null && indexKey.SequenceCompareTo(_upperBound) >= 0)
+                return false;
+
+            // Skip tombstones
+            if (_cursor.IsTombstone)
+                continue;
+
+            // Extract PK from index key using stored offset
+            var indexValue = _cursor.CurrentValue.Span;
+            var pkSuffix = IndexKeyEncoder.ExtractPkSuffix(indexKey, indexValue);
+            var tableKey = IndexKeyEncoder.BuildTableKey(_table.Oid, pkSuffix);
+
+            // Bookmark lookup: fetch full row from main table
+            var rowValue = await _tx.GetAsync(tableKey).ConfigureAwait(false);
+            if (rowValue is null)
+                continue; // Row was deleted but index entry not yet cleaned up
+
+            // Decode full row
+            RowKeyEncoder.Decode(tableKey, out _, _pkBuf, _pkColumnTypes);
+            var valueBuf = new DbValue[_valueColumns.Length];
+            RowValueEncoder.Decode(rowValue.AsSpan(), valueBuf, _valueColumns);
+
+            for (int i = 0; i < _pkColumnIndices.Length; i++)
+                Current[_pkColumnIndices[i]] = _pkBuf[i];
+            for (int i = 0; i < _valueColumnOutputIndices.Length; i++)
+                Current[_valueColumnOutputIndices[i]] = valueBuf[i];
+
+            return true;
+        }
+    }
+
+    public ValueTask DisposeAsync() => _cursor.DisposeAsync();
+}
