@@ -57,11 +57,12 @@ public static class HeuristicOptimizer
                 var source = FoldConstantsInPlan(distinct.Source);
                 return new DistinctPlan(source);
             }
-            case AggregatePlan agg:
+            case GroupByPlan agg:
             {
                 var source = FoldConstantsInPlan(agg.Source);
                 var columns = FoldResultColumns(agg.Columns);
-                return new AggregatePlan(columns, source);
+                var having = agg.Having is not null ? FoldConstants(agg.Having) : null;
+                return new GroupByPlan(agg.GroupByExprs, columns, having, source);
             }
             case LimitPlan limit:
             {
@@ -292,10 +293,30 @@ public static class HeuristicOptimizer
                 var source = PushDownPredicates(distinct.Source);
                 return new DistinctPlan(source);
             }
-            case AggregatePlan agg:
+            case GroupByPlan agg:
             {
                 var source = PushDownPredicates(agg.Source);
-                return new AggregatePlan(agg.Columns, source);
+                // Push non-aggregate HAVING conjuncts down to WHERE
+                var having = agg.Having;
+                if (having is not null && agg.GroupByExprs is { Length: > 0 })
+                {
+                    var conjuncts = SplitAnd(having);
+                    List<SqlExpr>? pushable = null;
+                    List<SqlExpr>? remaining = null;
+                    foreach (var c in conjuncts)
+                    {
+                        if (QueryPlanner.ContainsAggregateExpr(c))
+                            (remaining ??= new()).Add(c);
+                        else
+                            (pushable ??= new()).Add(c);
+                    }
+                    if (pushable is { Count: > 0 })
+                    {
+                        source = new FilterPlan(CombineAnd(pushable), source);
+                        having = remaining is { Count: > 0 } ? CombineAnd(remaining) : null;
+                    }
+                }
+                return new GroupByPlan(agg.GroupByExprs, agg.Columns, having, source);
             }
             case LimitPlan limit:
             {
@@ -817,10 +838,10 @@ public static class HeuristicOptimizer
                 return ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right)
                     ? plan : new JoinPlan(left, right, join.Kind, join.Condition);
             }
-            case AggregatePlan agg:
+            case GroupByPlan agg:
             {
                 var source = EliminateRedundantDistinct(agg.Source);
-                return ReferenceEquals(source, agg.Source) ? plan : new AggregatePlan(agg.Columns, source);
+                return ReferenceEquals(source, agg.Source) ? plan : new GroupByPlan(agg.GroupByExprs, agg.Columns, agg.Having, source);
             }
             case LimitPlan limit:
             {

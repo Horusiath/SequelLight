@@ -72,9 +72,14 @@ internal static class PlanFormatter
                 Visit(distinct.Source, id, rows);
                 break;
 
-            case AggregateEnumerator agg:
-                rows.Add((id, parentId, FormatAggregate(agg)));
-                Visit(agg.Source, id, rows);
+            case HashGroupByEnumerator hgb:
+                rows.Add((id, parentId, FormatGroupBy("HASH", hgb.GroupKeyOrdinals, hgb.AggregateDescs, hgb.Source.Projection)));
+                Visit(hgb.Source, id, rows);
+                break;
+
+            case SortGroupByEnumerator sgb:
+                rows.Add((id, parentId, FormatGroupBy("SORT", sgb.GroupKeyOrdinals, sgb.AggregateDescs, sgb.Source.Projection)));
+                Visit(sgb.Source, id, rows);
                 break;
 
             case DualEnumerator:
@@ -155,21 +160,40 @@ internal static class PlanFormatter
         return sb.ToString();
     }
 
-    private static string FormatAggregate(AggregateEnumerator agg)
+    private static string FormatGroupBy(string strategy, int[] groupKeyOrdinals,
+        AggregateDescriptor[] aggregates, Projection sourceProjection)
     {
-        var sb = new StringBuilder("AGGREGATE ");
-        for (int i = 0; i < agg.Aggregates.Length; i++)
+        var sb = new StringBuilder();
+        if (groupKeyOrdinals.Length > 0)
         {
-            if (i > 0) sb.Append(", ");
-            ref readonly var desc = ref agg.Aggregates[i];
-            if (desc.IsStar) sb.Append("count(*)");
-            else
+            sb.Append(strategy);
+            sb.Append(" GROUP BY ");
+            for (int i = 0; i < groupKeyOrdinals.Length; i++)
             {
-                sb.Append(desc.Function.GetType().Name.Replace("Aggregate", "").ToLowerInvariant());
-                sb.Append('(');
-                if (desc.Distinct) sb.Append("DISTINCT ");
-                sb.Append(string.Join(", ", desc.ArgExprs.Select(a => a.ToString())));
-                sb.Append(')');
+                if (i > 0) sb.Append(", ");
+                sb.Append(sourceProjection.GetName(groupKeyOrdinals[i]));
+            }
+        }
+        else
+        {
+            sb.Append("AGGREGATE");
+        }
+        if (aggregates.Length > 0)
+        {
+            sb.Append(groupKeyOrdinals.Length > 0 ? " — " : " ");
+            for (int i = 0; i < aggregates.Length; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                ref readonly var desc = ref aggregates[i];
+                if (desc.IsStar) sb.Append("count(*)");
+                else
+                {
+                    sb.Append(desc.Function.GetType().Name.Replace("Aggregate", "").ToLowerInvariant());
+                    sb.Append('(');
+                    if (desc.Distinct) sb.Append("DISTINCT ");
+                    sb.Append(string.Join(", ", desc.ArgExprs.Select(a => a.ToString())));
+                    sb.Append(')');
+                }
             }
         }
         return sb.ToString();

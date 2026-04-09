@@ -71,17 +71,21 @@ public sealed class DistinctPlan : LogicalPlan
 }
 
 /// <summary>
-/// Aggregate plan: materializes all source rows, computes aggregate functions,
-/// and emits a single summary row (without GROUP BY) or one row per group.
+/// Groups input rows by GROUP BY expressions and computes aggregate functions per group.
+/// When <see cref="GroupByExprs"/> is null, all rows form a single implicit group (plain aggregation).
 /// </summary>
-public sealed class AggregatePlan : LogicalPlan
+public sealed class GroupByPlan : LogicalPlan
 {
+    public SqlExpr[]? GroupByExprs { get; }
     public ResultColumn[] Columns { get; }
+    public SqlExpr? Having { get; }
     public LogicalPlan Source { get; }
 
-    public AggregatePlan(ResultColumn[] columns, LogicalPlan source)
+    public GroupByPlan(SqlExpr[]? groupByExprs, ResultColumn[] columns, SqlExpr? having, LogicalPlan source)
     {
+        GroupByExprs = groupByExprs;
         Columns = columns;
+        Having = having;
         Source = source;
     }
 }

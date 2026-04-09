@@ -1,4 +1,5 @@
 using SequelLight.Data;
+using SequelLight.Functions;
 using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
 using SequelLight.Storage;
@@ -261,12 +262,26 @@ public sealed class QueryPlanner
                 var source = ResolveParameterOrdinals(distinct.Source, paramMap);
                 return ReferenceEquals(source, distinct.Source) ? plan : new DistinctPlan(source);
             }
-            case AggregatePlan agg:
+            case GroupByPlan agg:
             {
                 var source = ResolveParameterOrdinals(agg.Source, paramMap);
                 var columns = ResolveParamColumns(agg.Columns, paramMap);
+                var having = agg.Having is not null ? ResolveParamExpr(agg.Having, paramMap) : null;
+                var groupByExprs = agg.GroupByExprs;
+                if (groupByExprs is not null)
+                {
+                    var resolved = new SqlExpr[groupByExprs.Length];
+                    bool gChanged = false;
+                    for (int i = 0; i < groupByExprs.Length; i++)
+                    {
+                        resolved[i] = ResolveParamExpr(groupByExprs[i], paramMap)!;
+                        if (!ReferenceEquals(resolved[i], groupByExprs[i])) gChanged = true;
+                    }
+                    if (gChanged) groupByExprs = resolved;
+                }
                 return ReferenceEquals(source, agg.Source) && ReferenceEquals(columns, agg.Columns)
-                    ? plan : new AggregatePlan(columns, source);
+                    && ReferenceEquals(having, agg.Having) && ReferenceEquals(groupByExprs, agg.GroupByExprs)
+                    ? plan : new GroupByPlan(groupByExprs, columns, having, source);
             }
             case LimitPlan limit:
             {
@@ -449,9 +464,14 @@ public sealed class QueryPlanner
         if (core.Where is not null)
             source = new FilterPlan(core.Where, source);
 
-        // Detect aggregate functions in SELECT columns
-        if (ContainsAggregate(core.Columns))
-            return new AggregatePlan(core.Columns, source);
+        // GROUP BY or aggregate functions → GroupByPlan
+        if (core.GroupBy is { Length: > 0 } || ContainsAggregate(core.Columns))
+        {
+            source = new GroupByPlan(core.GroupBy, core.Columns, core.Having, source);
+            if (core.Distinct)
+                source = new DistinctPlan(source);
+            return source;
+        }
 
         source = new ProjectPlan(core.Columns, source);
         if (core.Distinct)
@@ -469,7 +489,7 @@ public sealed class QueryPlanner
         return false;
     }
 
-    private static bool ContainsAggregateExpr(SqlExpr expr)
+    internal static bool ContainsAggregateExpr(SqlExpr expr)
     {
         return expr switch
         {
@@ -553,8 +573,8 @@ public sealed class QueryPlanner
                 return new DistinctEnumerator(child);
             }
 
-            case AggregatePlan agg:
-                return BuildAggregate(agg, tx);
+            case GroupByPlan agg:
+                return BuildGroupBy(agg, tx);
 
             case LimitPlan limit:
             {
@@ -567,14 +587,40 @@ public sealed class QueryPlanner
         }
     }
 
-    private AggregateEnumerator BuildAggregate(AggregatePlan plan, ReadOnlyTransaction tx)
+    private IDbEnumerator BuildGroupBy(GroupByPlan plan, ReadOnlyTransaction tx)
     {
-        var child = BuildPhysical(plan.Source, tx);
+        // Build child with order tracking for strategy selection
+        var (child, providedOrder) = BuildPhysicalWithOrder(plan.Source, tx);
         var sourceProjection = child.Projection;
 
+        // Resolve GROUP BY expressions to source ordinals
+        int[] groupKeyOrdinals;
+        if (plan.GroupByExprs is { Length: > 0 })
+        {
+            groupKeyOrdinals = new int[plan.GroupByExprs.Length];
+            for (int i = 0; i < plan.GroupByExprs.Length; i++)
+            {
+                var resolved = ResolveColumns(plan.GroupByExprs[i], sourceProjection);
+                if (resolved is ResolvedColumnExpr col)
+                    groupKeyOrdinals[i] = col.Ordinal;
+                else
+                    throw new NotSupportedException("GROUP BY expressions must resolve to column references.");
+            }
+        }
+        else
+        {
+            groupKeyOrdinals = Array.Empty<int>();
+        }
+
+        // Build output projection and maps
         var outputNames = new List<QualifiedName>();
         var aggregates = new List<AggregateDescriptor>();
-        var passThru = new List<int>(); // -1 = aggregate, >= 0 = source column index
+        var factories = new List<Func<IAggregateFunction>>();
+        var outputMap = new List<int>();        // >= 0: group key index, -1: aggregate, -2: pass-through
+        var passThruOrdinals = new List<int>(); // source ordinal for pass-through cols (indexed by output pos)
+
+        // Track which group key ordinal maps to which output slot
+        var groupKeySet = new HashSet<int>(groupKeyOrdinals);
 
         foreach (var col in plan.Columns)
         {
@@ -584,7 +630,9 @@ public sealed class QueryPlanner
                     for (int i = 0; i < sourceProjection.ColumnCount; i++)
                     {
                         outputNames.Add(sourceProjection.GetQualifiedName(i));
-                        passThru.Add(i);
+                        int gkIdx = Array.IndexOf(groupKeyOrdinals, i);
+                        outputMap.Add(gkIdx >= 0 ? gkIdx : -2);
+                        passThruOrdinals.Add(i);
                     }
                     break;
 
@@ -595,7 +643,9 @@ public sealed class QueryPlanner
                         if (qn.Table is not null && string.Equals(qn.Table, ts.Table, StringComparison.OrdinalIgnoreCase))
                         {
                             outputNames.Add(qn);
-                            passThru.Add(i);
+                            int gkIdx = Array.IndexOf(groupKeyOrdinals, i);
+                            outputMap.Add(gkIdx >= 0 ? gkIdx : -2);
+                            passThruOrdinals.Add(i);
                         }
                     }
                     break;
@@ -606,31 +656,122 @@ public sealed class QueryPlanner
                         var name = erc.Alias ?? FormatFunctionName(erc.Expression);
                         outputNames.Add(new QualifiedName(null, name));
                         aggregates.Add(desc);
-                        passThru.Add(-1); // aggregate slot
+                        factories.Add(() => Functions.FunctionRegistry.CreateAggregate(
+                            ((FunctionCallExpr)erc.Expression).Name));
+                        outputMap.Add(-1);
+                        passThruOrdinals.Add(-1);
+                    }
+                    else if (erc.Expression is ColumnRefExpr colRef &&
+                             sourceProjection.TryGetOrdinalByColumn(colRef.Column, out int srcOrd) &&
+                             groupKeySet.Contains(srcOrd))
+                    {
+                        // GROUP BY key column
+                        var name = new QualifiedName(null, erc.Alias ?? colRef.Column);
+                        outputNames.Add(name);
+                        outputMap.Add(Array.IndexOf(groupKeyOrdinals, srcOrd));
+                        passThruOrdinals.Add(srcOrd);
                     }
                     else
                     {
-                        // Non-aggregate column in aggregate query: pass through (arbitrary value)
+                        // Non-aggregate, non-group-key column: pass through (arbitrary)
                         var name = new QualifiedName(null, erc.Alias ?? erc.Expression.ToString()!);
                         outputNames.Add(name);
-                        if (erc.Expression is ColumnRefExpr colRef)
-                        {
-                            if (sourceProjection.TryGetOrdinalByColumn(colRef.Column, out int ord))
-                                passThru.Add(ord);
-                            else
-                                passThru.Add(0);
-                        }
+                        outputMap.Add(-2);
+                        if (erc.Expression is ColumnRefExpr cr &&
+                            sourceProjection.TryGetOrdinalByColumn(cr.Column, out int o))
+                            passThruOrdinals.Add(o);
                         else
-                        {
-                            passThru.Add(0);
-                        }
+                            passThruOrdinals.Add(0);
                     }
                     break;
             }
         }
 
-        var projection = new Projection(outputNames.ToArray());
-        return new AggregateEnumerator(child, aggregates.ToArray(), passThru.ToArray(), projection);
+        var outputProjection = new Projection(outputNames.ToArray());
+
+        // Resolve HAVING against output projection
+        SqlExpr? resolvedHaving = null;
+        if (plan.Having is not null)
+            resolvedHaving = ResolveHavingExpr(plan.Having, outputProjection, aggregates, outputMap);
+
+        var aggArray = aggregates.ToArray();
+        var factoryArray = factories.ToArray();
+        var outputMapArray = outputMap.ToArray();
+        var passThruArray = passThruOrdinals.ToArray();
+
+        // Strategy selection: use streaming sort-based if input is sorted by GROUP BY keys
+        if (groupKeyOrdinals.Length > 0 && GroupBySatisfiedByOrder(groupKeyOrdinals, providedOrder))
+        {
+            return new SortGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
+                outputMapArray, passThruArray, resolvedHaving, outputProjection);
+        }
+
+        return new HashGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
+            outputMapArray, passThruArray, resolvedHaving, outputProjection);
+    }
+
+    private static bool GroupBySatisfiedByOrder(int[] groupKeyOrdinals, SortKey[] providedOrder)
+    {
+        if (providedOrder.Length < groupKeyOrdinals.Length) return false;
+        for (int i = 0; i < groupKeyOrdinals.Length; i++)
+        {
+            if (providedOrder[i].Ordinal != groupKeyOrdinals[i])
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves HAVING expressions: aggregate function calls are mapped to output column ordinals,
+    /// and column references are resolved against the output projection.
+    /// </summary>
+    private SqlExpr ResolveHavingExpr(SqlExpr expr, Projection outputProjection,
+        List<AggregateDescriptor> aggregates, List<int> outputMap)
+    {
+        // Map aggregate function calls to their output ordinal
+        if (expr is FunctionCallExpr func &&
+            Functions.FunctionRegistry.IsAggregate(func.Name, func.IsStar ? 0 : func.Arguments.Length))
+        {
+            // Find which output column this aggregate maps to
+            int aggIdx = 0;
+            for (int i = 0; i < outputMap.Count; i++)
+            {
+                if (outputMap[i] == -1) // aggregate slot
+                {
+                    if (aggIdx < aggregates.Count)
+                    {
+                        // Match by name + star + arg count
+                        var desc = aggregates[aggIdx];
+                        if (MatchesAggregate(func, desc))
+                            return new ResolvedColumnExpr(i);
+                        aggIdx++;
+                    }
+                }
+            }
+            // Aggregate not in SELECT list — still need to evaluate it
+            // For now, fall through to column resolution
+        }
+
+        return expr switch
+        {
+            ColumnRefExpr col => ResolveColumnRef(col, outputProjection),
+            BinaryExpr b => b with
+            {
+                Left = ResolveHavingExpr(b.Left, outputProjection, aggregates, outputMap),
+                Right = ResolveHavingExpr(b.Right, outputProjection, aggregates, outputMap),
+            },
+            UnaryExpr u => u with { Operand = ResolveHavingExpr(u.Operand, outputProjection, aggregates, outputMap) },
+            LiteralExpr lit => new ResolvedLiteralExpr(ExprEvaluator.EvaluateLiteral(lit)),
+            ResolvedLiteralExpr or ResolvedColumnExpr => expr,
+            _ => expr,
+        };
+    }
+
+    private static bool MatchesAggregate(FunctionCallExpr func, AggregateDescriptor desc)
+    {
+        if (func.IsStar != desc.IsStar) return false;
+        if (func.IsStar) return true;
+        return func.Arguments.Length == desc.ArgExprs.Length;
     }
 
     private bool TryExtractAggregate(SqlExpr expr, Projection sourceProjection, out AggregateDescriptor desc)
@@ -815,7 +956,7 @@ public sealed class QueryPlanner
             FilterPlan filter => GetPlanAlias(filter.Source),
             ProjectPlan project => GetPlanAlias(project.Source),
             DistinctPlan distinct => GetPlanAlias(distinct.Source),
-            AggregatePlan agg => GetPlanAlias(agg.Source),
+            GroupByPlan agg => GetPlanAlias(agg.Source),
             LimitPlan limit => GetPlanAlias(limit.Source),
             _ => "t"
         };
@@ -1038,8 +1179,8 @@ public sealed class QueryPlanner
                 return (new DistinctEnumerator(child), Array.Empty<SortKey>());
             }
 
-            case AggregatePlan agg:
-                return (BuildAggregate(agg, tx), Array.Empty<SortKey>());
+            case GroupByPlan agg:
+                return (BuildGroupBy(agg, tx), Array.Empty<SortKey>());
 
             case LimitPlan limit:
             {
