@@ -2329,3 +2329,177 @@ public class GroupByBenchmarks
         return count;
     }
 }
+
+// ---------------------------------------------------------------------------
+//  Index scan benchmarks
+//  Compares full table scan vs index scan for WHERE on a column matching 20%
+//  of rows, against SQLite baselines with the same index.
+// ---------------------------------------------------------------------------
+
+[Config(typeof(QueryBenchmarkConfig))]
+[MemoryDiagnoser]
+public class IndexScanBenchmarks
+{
+    // Two tables: one without index, one with index on category.
+    // category has 5 distinct values (0..4), so WHERE category = 0 hits 20% of rows.
+
+    private string _tempDir = null!;
+    private Database _dbNoIdx = null!;
+    private Database _dbIdx = null!;
+    private LsmStore _storeNoIdx = null!;
+    private LsmStore _storeIdx = null!;
+    private SqliteConnection _sqliteNoIdx = null!;
+    private SqliteConnection _sqliteIdx = null!;
+
+    [Params(10_000, 1_000_000)]
+    public int RowCount;
+
+    [IterationSetup]
+    public void IterationSetup()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "sequellight_idxscan_bench_" + Guid.NewGuid().ToString("N"));
+        var dirNoIdx = Path.Combine(_tempDir, "noidx");
+        var dirIdx = Path.Combine(_tempDir, "idx");
+        Directory.CreateDirectory(dirNoIdx);
+        Directory.CreateDirectory(dirIdx);
+
+        // ---- SequelLight: no-index DB ----
+        _storeNoIdx = LsmStore.OpenAsync(new LsmStoreOptions { Directory = dirNoIdx }).AsTask().GetAwaiter().GetResult();
+        _dbNoIdx = new Database(_storeNoIdx, dirNoIdx);
+        _dbNoIdx.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+        _dbNoIdx.ExecuteNonQueryAsync("CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+        SeedSequelLight(_storeNoIdx, _dbNoIdx);
+
+        // ---- SequelLight: indexed DB ----
+        _storeIdx = LsmStore.OpenAsync(new LsmStoreOptions { Directory = dirIdx }).AsTask().GetAwaiter().GetResult();
+        _dbIdx = new Database(_storeIdx, dirIdx);
+        _dbIdx.LoadSchemaAsync().AsTask().GetAwaiter().GetResult();
+        _dbIdx.ExecuteNonQueryAsync("CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+        SeedSequelLight(_storeIdx, _dbIdx);
+        _dbIdx.ExecuteNonQueryAsync("CREATE INDEX idx_category ON t(category)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+
+        // ---- SQLite: no-index DB ----
+        _sqliteNoIdx = new SqliteConnection($"Data Source={Path.Combine(dirNoIdx, "sqlite.db")}");
+        _sqliteNoIdx.Open();
+        SetupSqlite(_sqliteNoIdx, createIndex: false);
+
+        // ---- SQLite: indexed DB ----
+        _sqliteIdx = new SqliteConnection($"Data Source={Path.Combine(dirIdx, "sqlite.db")}");
+        _sqliteIdx.Open();
+        SetupSqlite(_sqliteIdx, createIndex: true);
+    }
+
+    private void SeedSequelLight(LsmStore store, Database db)
+    {
+        var tx = store.BeginReadWrite();
+        var table = db.Schema.GetTable("t")!;
+        for (int i = 0; i < RowCount; i++)
+        {
+            var row = new DbValue[]
+            {
+                DbValue.Integer(i),
+                DbValue.Integer(i % 5),           // 5 categories → 20% per category
+                DbValue.Integer(i * 7 % 10000),
+                DbValue.Text(Encoding.UTF8.GetBytes($"item_{i:D8}")),
+            };
+            tx.Put(table.EncodeRowKey(row), table.EncodeRowValue(row));
+        }
+        tx.CommitAsync().AsTask().GetAwaiter().GetResult();
+        tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private void SetupSqlite(SqliteConnection conn, bool createIndex)
+    {
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, val INTEGER, name TEXT)";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var txn = conn.BeginTransaction())
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = txn;
+            cmd.CommandText = "INSERT INTO t (id, category, val, name) VALUES ($id, $cat, $val, $name)";
+            var pId = cmd.Parameters.Add("$id", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pCat = cmd.Parameters.Add("$cat", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pVal = cmd.Parameters.Add("$val", Microsoft.Data.Sqlite.SqliteType.Integer);
+            var pName = cmd.Parameters.Add("$name", Microsoft.Data.Sqlite.SqliteType.Text);
+            for (int i = 0; i < RowCount; i++)
+            {
+                pId.Value = (long)i;
+                pCat.Value = (long)(i % 5);
+                pVal.Value = (long)(i * 7 % 10000);
+                pName.Value = $"item_{i:D8}";
+                cmd.ExecuteNonQuery();
+            }
+            txn.Commit();
+        }
+
+        if (createIndex)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE INDEX idx_category ON t(category)";
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    [IterationCleanup]
+    public void IterationCleanup()
+    {
+        _sqliteNoIdx.Dispose();
+        _sqliteIdx.Dispose();
+        _dbNoIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _dbIdx.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+    }
+
+    // ---- SequelLight ----
+
+    [Benchmark(Baseline = true, Description = "Full scan WHERE category = 0 (no index)")]
+    public async Task<int> FullScan_NoIndex()
+    {
+        var reader = await _dbNoIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "Index scan WHERE category = 0 (indexed)")]
+    public async Task<int> IndexScan_Indexed()
+    {
+        var reader = await _dbIdx.ExecuteReaderAsync("SELECT * FROM t WHERE category = 0", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    // ---- SQLite ----
+
+    [Benchmark(Description = "SQLite: Full scan WHERE category = 0 (no index)")]
+    public int Sqlite_FullScan_NoIndex()
+    {
+        using var cmd = _sqliteNoIdx.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 0";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: Index scan WHERE category = 0 (indexed)")]
+    public int Sqlite_IndexScan_Indexed()
+    {
+        using var cmd = _sqliteIdx.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 0";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+}

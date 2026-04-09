@@ -5,15 +5,17 @@ A (vibe-coded) C# implementation of an embedded SQL database (parser using the S
 - A native ADO.NET compatible API.
 - Schema DDL (uses strict schema) for tables.
 - Primary Key support for indexing.
-- SELECT, JOINs, WHERE, ORDER BY, LIMIT/OFFSET.
+- SELECT, JOINs, WHERE, ORDER BY, GROUP BY/HAVIN, LIMIT/OFFSET.
+- Scalar and Aggregate functions.
 - INSERT INTO VALUES (doesn't check table constraints yet), INSERT INTO SELECT, UPDATE.
 - Heuristics used to optimise query plan:
     - Nested loop join
     - Merge join
     - Hash join
+    - Index scan
     - Push down predicates
     - Push down projections
-    - Constant folding
+    - Constant folding (including scalar and aggregate functions)
 
 More features to come.
 
@@ -168,3 +170,17 @@ Below are some recent runs:
 | 'SQLite: ORDER BY pk prefix + non-pk'               | 10000    | 1.8902 ms | 0.2755 ms | 0.1822 ms | 1.9370 ms | 1.6427 ms |  2.1325 ms |  2.00 |    0.35 |     760 B |        1.02 |
 | 'SQLite: ORDER BY non-pk col'                       | 10000    | 1.9978 ms | 0.2583 ms | 0.1708 ms | 2.0510 ms | 1.7707 ms |  2.2581 ms |  2.12 |    0.36 |     752 B |        1.01 |
 | 'SQLite: ORDER BY pk DESC'                          | 10000    | 1.0069 ms | 0.2151 ms | 0.1423 ms | 1.0389 ms | 0.8160 ms |  1.1925 ms |  1.07 |    0.22 |     752 B |        1.01 |
+
+### INDEX benchmarks
+
+| Method                                            | RowCount | Mean        | Error     | StdDev    | Median      | Min         | Max         | Ratio | RatioSD | Gen0       | Gen1      | Allocated   | Alloc Ratio |
+|-------------------------------------------------- |--------- |------------:|----------:|----------:|------------:|------------:|------------:|------:|--------:|-----------:|----------:|------------:|------------:|
+| 'Full scan WHERE category = 0 (no index)'         | 10000    |   1.7442 ms | 1.9005 ms | 0.9940 ms |   1.6924 ms |   0.7886 ms |   3.2458 ms |  1.33 |    1.04 |          - |         - |    403728 B |       1.000 |
+| 'Index scan WHERE category = 0 (indexed)'         | 10000    |   1.4300 ms | 1.6165 ms | 1.0692 ms |   0.9799 ms |   0.4349 ms |   3.1218 ms |  1.09 |    1.03 |          - |         - |    404832 B |       1.003 |
+| 'SQLite: Full scan WHERE category = 0 (no index)' | 10000    |   0.3558 ms | 0.0332 ms | 0.0198 ms |   0.3491 ms |   0.3297 ms |   0.3903 ms |  0.27 |    0.14 |          - |         - |       704 B |       0.002 |
+| 'SQLite: Index scan WHERE category = 0 (indexed)' | 10000    |   0.4030 ms | 0.0473 ms | 0.0248 ms |   0.4110 ms |   0.3516 ms |   0.4286 ms |  0.31 |    0.16 |          - |         - |       704 B |       0.002 |
+|                                                   |          |             |           |           |             |             |             |       |         |            |           |             |             |
+| 'Full scan WHERE category = 0 (no index)'         | 1000000  | 145.2435 ms | 2.9791 ms | 1.9705 ms | 145.6573 ms | 141.6600 ms | 147.7391 ms |  1.00 |    0.02 | 12000.0000 | 4000.0000 | 107384184 B |       1.000 |
+| 'Index scan WHERE category = 0 (indexed)'         | 1000000  | 130.5289 ms | 1.1586 ms | 0.6895 ms | 130.6151 ms | 129.6042 ms | 131.8922 ms |  0.90 |    0.01 |  6000.0000 |         - |  55502104 B |       0.517 |
+| 'SQLite: Full scan WHERE category = 0 (no index)' | 1000000  |  33.5016 ms | 0.3072 ms | 0.1828 ms |  33.5007 ms |  33.2583 ms |  33.7857 ms |  0.23 |    0.00 |          - |         - |       704 B |       0.000 |
+| 'SQLite: Index scan WHERE category = 0 (indexed)' | 1000000  |  42.6785 ms | 0.2802 ms | 0.1853 ms |  42.6847 ms |  42.3720 ms |  43.0336 ms |  0.29 |    0.00 |          - |         - |       704 B |       0.000 |
