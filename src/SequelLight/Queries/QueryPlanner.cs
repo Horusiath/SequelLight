@@ -818,6 +818,15 @@ public sealed class QueryPlanner
     /// Returns an IndexScan (possibly wrapped with a residual Filter) or null if no index is usable.
     /// </summary>
     private IDbEnumerator? TryBuildIndexScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+        => TryBuildIndexScanWithOrder(scan, filter, tx)?.Enumerator;
+
+    /// <summary>
+    /// Attempts to use a secondary index for a FilterPlan over a ScanPlan.
+    /// Returns the enumerator and the sort order provided by the index
+    /// (unmatched suffix of index columns + PK columns, all ASC).
+    /// </summary>
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildIndexScanWithOrder(
+        ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
     {
         var table = scan.Table;
         var indexes = new List<IndexSchema>();
@@ -877,7 +886,11 @@ public sealed class QueryPlanner
             var cursor = tx.CreateCursor();
             var indexScan = new Indexes.IndexScan(cursor, index, table, tx, seekPrefix, null);
 
+            // Extract sort order: unmatched index suffix + PK columns
+            var sortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
+
             // If there are residual conjuncts (not covered by the index), wrap with Filter
+            IDbEnumerator result = indexScan;
             if (usedConjuncts.Count < conjuncts.Count)
             {
                 var residuals = new List<SqlExpr>();
@@ -886,13 +899,47 @@ public sealed class QueryPlanner
                         residuals.Add(conjuncts[i]);
                 var residual = HeuristicOptimizer.CombineAnd(residuals);
                 var resolved = ResolveColumns(residual, indexScan.Projection);
-                return new Filter(indexScan, resolved);
+                result = new Filter(indexScan, resolved);
             }
 
-            return indexScan;
+            return (result, sortKeys);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Extracts the sort order provided by an index scan after consuming a seek prefix
+    /// of <paramref name="matched"/> leading equality columns. The order is:
+    /// unmatched index columns (ASC only) followed by PK columns (always ASC),
+    /// with ordinals relative to the full table projection.
+    /// </summary>
+    private static SortKey[] ExtractIndexSortKeys(
+        IndexSchema index, TableSchema table, int matched, int[] idxCols)
+    {
+        table.EnsureEncodingMetadata();
+        var pkIndices = table.PkColumnIndices;
+
+        var keys = new List<SortKey>();
+
+        // Unmatched index columns — stop at first DESC (encoding may not support it)
+        for (int i = matched; i < idxCols.Length; i++)
+        {
+            if (index.Columns[i].Order == SortOrder.Desc) break;
+            keys.Add(new SortKey(idxCols[i], SortOrder.Asc));
+        }
+
+        // PK columns (always ASC), skip if already in index
+        for (int i = 0; i < pkIndices.Length; i++)
+        {
+            bool inIndex = false;
+            for (int j = 0; j < idxCols.Length; j++)
+                if (idxCols[j] == pkIndices[i]) { inIndex = true; break; }
+            if (inIndex) continue;
+            keys.Add(new SortKey(pkIndices[i], SortOrder.Asc));
+        }
+
+        return keys.ToArray();
     }
 
     /// <summary>
@@ -932,6 +979,15 @@ public sealed class QueryPlanner
     /// </summary>
     private IDbEnumerator? TryBuildIndexOnlyScan(ScanPlan scan, FilterPlan filter,
         ProjectPlan project, ReadOnlyTransaction tx)
+        => TryBuildIndexOnlyScanWithOrder(scan, filter, project, tx)?.Enumerator;
+
+    /// <summary>
+    /// Tries to build an IndexOnlyScan for a ProjectPlan → FilterPlan → ScanPlan pattern.
+    /// Returns the enumerator and sort order (remapped to the IndexOnlyScan's output projection),
+    /// or null if no index can satisfy the query without a table lookup.
+    /// </summary>
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildIndexOnlyScanWithOrder(
+        ScanPlan scan, FilterPlan filter, ProjectPlan project, ReadOnlyTransaction tx)
     {
         var table = scan.Table;
         var indexes = new List<IndexSchema>();
@@ -1043,11 +1099,16 @@ public sealed class QueryPlanner
                 outputMap.Add(keyPos);
             }
 
+            var outputMapArray = outputMap.ToArray();
             var indexOnlyProjection = new Projection(outputNames.ToArray());
             var cursor = tx.CreateCursor();
             IDbEnumerator result = new Indexes.IndexOnlyScan(
                 cursor, seekPrefix, null, index.Oid.Value, index.Name, table.Name,
-                allKeyTypes, outputMap.ToArray(), indexOnlyProjection);
+                allKeyTypes, outputMapArray, indexOnlyProjection);
+
+            // Extract sort order and remap to output projection ordinals
+            var fullSortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
+            var remappedKeys = RemapIndexOnlySortKeys(fullSortKeys, idxCols, pkIndices, outputMapArray);
 
             // Apply residual filter if needed
             if (usedConjuncts.Count < conjuncts.Count)
@@ -1061,10 +1122,45 @@ public sealed class QueryPlanner
                 result = new Filter(result, resolved);
             }
 
-            return result;
+            return (result, remappedKeys);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Remaps sort keys from table column ordinals (as produced by ExtractIndexSortKeys)
+    /// to IndexOnlyScan output ordinals via the outputMap.
+    /// Stops at the first sort key column not present in the output (prefix semantics).
+    /// </summary>
+    private static SortKey[] RemapIndexOnlySortKeys(
+        SortKey[] fullSortKeys, int[] idxCols, int[] pkIndices, int[] outputMap)
+    {
+        var remapped = new List<SortKey>();
+        foreach (var sk in fullSortKeys)
+        {
+            // Convert table column ordinal to key position in the index key
+            int keyPos = -1;
+            for (int i = 0; i < idxCols.Length; i++)
+            {
+                if (idxCols[i] == sk.Ordinal) { keyPos = i; break; }
+            }
+            if (keyPos < 0)
+            {
+                // Must be a PK column — find its key position
+                for (int i = 0; i < pkIndices.Length; i++)
+                {
+                    if (pkIndices[i] == sk.Ordinal) { keyPos = idxCols.Length + i; break; }
+                }
+            }
+            if (keyPos < 0) break;
+
+            // Find which output position maps to this key position
+            int outputIdx = Array.IndexOf(outputMap, keyPos);
+            if (outputIdx < 0) break; // column not in output — prefix stops here
+            remapped.Add(new SortKey(outputIdx, sk.Order));
+        }
+        return remapped.ToArray();
     }
 
     private static bool CollectColumnNames(SqlExpr expr, List<string> names)
@@ -1577,6 +1673,13 @@ public sealed class QueryPlanner
 
             case FilterPlan filter:
             {
+                // Try index scan — may provide sort order from the index
+                if (filter.Source is ScanPlan scanForIndex && scanForIndex.Table.IndexCount > 0)
+                {
+                    var indexResult = TryBuildIndexScanWithOrder(scanForIndex, filter, tx);
+                    if (indexResult is not null)
+                        return indexResult.Value;
+                }
                 var (child, childOrder) = BuildPhysicalWithOrder(filter.Source, tx);
                 var resolved = ResolveColumns(filter.Predicate, child.Projection);
                 return (new Filter(child, resolved), childOrder);
@@ -1584,6 +1687,13 @@ public sealed class QueryPlanner
 
             case ProjectPlan project:
             {
+                // Try index-only scan — may provide sort order from the index
+                if (project.Source is FilterPlan fp && fp.Source is ScanPlan sp && sp.Table.IndexCount > 0)
+                {
+                    var indexOnly = TryBuildIndexOnlyScanWithOrder(sp, fp, project, tx);
+                    if (indexOnly is not null)
+                        return indexOnly.Value;
+                }
                 var (child, childOrder) = BuildPhysicalWithOrder(project.Source, tx);
                 var selectors = ResolveSelectors(project.Columns, child.Projection);
                 var remapped = RemapSortKeys(childOrder, selectors);

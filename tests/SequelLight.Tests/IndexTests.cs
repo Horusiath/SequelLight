@@ -565,3 +565,133 @@ public class IndexNestedLoopJoinTests : TempDirTest
         Assert.Equal(2, rows.Count);
     }
 }
+
+public class OrderByEliminationTests : TempDirTest
+{
+    private async Task<SequelLightConnection> OpenConnectionAsync()
+    {
+        var conn = new SequelLightConnection($"Data Source={TempDir}");
+        await conn.OpenAsync();
+        return conn;
+    }
+
+    private static async Task Exec(SequelLightConnection conn, string sql)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<List<string>> Explain(SequelLightConnection conn, string sql)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN " + sql;
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var details = new List<string>();
+        while (await reader.ReadAsync())
+            details.Add(reader.GetString(2));
+        return details;
+    }
+
+    [Fact]
+    public async Task IndexScan_EliminatesSort()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_ab ON t(a, b)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 20, 'x'), (2, 1, 10, 'y'), (3, 2, 5, 'z')");
+
+        var details = await Explain(conn, "SELECT * FROM t WHERE a = 1 ORDER BY b");
+        Assert.Contains(details, d => d.Contains("INDEX SCAN idx_ab"));
+        Assert.DoesNotContain(details, d => d.StartsWith("SORT"));
+    }
+
+    [Fact]
+    public async Task IndexScan_CompositePrefix_EliminatesSort()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_abc ON t(a, b, c)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 3), (2, 1, 1, 4), (3, 1, 2, 1)");
+
+        var details = await Explain(conn, "SELECT * FROM t WHERE a = 1 ORDER BY b, c");
+        Assert.Contains(details, d => d.Contains("INDEX SCAN idx_abc"));
+        Assert.DoesNotContain(details, d => d.StartsWith("SORT"));
+    }
+
+    [Fact]
+    public async Task IndexScan_OrderMismatch_StillSorts()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_abc ON t(a, b, c)");
+
+        // ORDER BY c skips b — index order is (b, c), can't satisfy ORDER BY c alone
+        var details = await Explain(conn, "SELECT * FROM t WHERE a = 1 ORDER BY c");
+        Assert.Contains(details, d => d.StartsWith("SORT"));
+    }
+
+    [Fact]
+    public async Task IndexScan_DescMismatch_StillSorts()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_ab ON t(a, b)");
+
+        // ORDER BY b DESC doesn't match ASC index order
+        var details = await Explain(conn, "SELECT * FROM t WHERE a = 1 ORDER BY b DESC");
+        Assert.Contains(details, d => d.Contains("SORT"));
+    }
+
+    [Fact]
+    public async Task IndexOnlyScan_EliminatesSort()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, val TEXT)");
+        await Exec(conn, "CREATE INDEX idx_ab ON t(a, b)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 20, 'x'), (2, 1, 10, 'y'), (3, 2, 5, 'z')");
+
+        // SELECT only index-covered columns — uses index scan (regular or index-only), no sort
+        var details = await Explain(conn, "SELECT a, b FROM t WHERE a = 1 ORDER BY b");
+        Assert.Contains(details, d => d.Contains("INDEX") && d.Contains("SCAN"));
+        Assert.DoesNotContain(details, d => d.StartsWith("SORT"));
+    }
+
+    [Fact]
+    public async Task IndexScan_Correctness_RowsInOrder()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, priority INTEGER, name TEXT)");
+        await Exec(conn, "CREATE INDEX idx_cat_pri ON t(category, priority)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 30, 'c'), (2, 1, 10, 'a'), (3, 1, 20, 'b'), (4, 2, 5, 'd')");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM t WHERE category = 1 ORDER BY priority";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var names = new List<string>();
+        while (await reader.ReadAsync())
+            names.Add(reader.GetString(0));
+
+        Assert.Equal(new[] { "a", "b", "c" }, names);
+    }
+
+    [Fact]
+    public async Task IndexOnlyScan_Correctness_RowsInOrder()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, priority INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_cat_pri ON t(category, priority)");
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 1, 20), (4, 2, 5)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT priority FROM t WHERE category = 1 ORDER BY priority";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var values = new List<long>();
+        while (await reader.ReadAsync())
+            values.Add(reader.GetInt64(0));
+
+        Assert.Equal(new[] { 10L, 20L, 30L }, values);
+    }
+}
