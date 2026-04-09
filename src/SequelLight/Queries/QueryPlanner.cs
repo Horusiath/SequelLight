@@ -1138,9 +1138,10 @@ public sealed class QueryPlanner
 
                     // If predicate pushdown placed conditions on the right table,
                     // resolve and apply them as a residual filter on the INLJ output.
-                    if (join.Right is FilterPlan rightFilter)
+                    var rightFilterPlan = ExtractFilterPlan(join.Right);
+                    if (rightFilterPlan is not null)
                     {
-                        var rightPred = ResolveColumns(rightFilter.Predicate, combinedProjection);
+                        var rightPred = ResolveColumns(rightFilterPlan.Predicate, combinedProjection);
                         inljResidual = inljResidual is not null
                             ? HeuristicOptimizer.CombineAnd(new List<SqlExpr> { inljResidual, rightPred })
                             : rightPred;
@@ -1205,14 +1206,26 @@ public sealed class QueryPlanner
     }
 
     /// <summary>
-    /// Extracts the TableSchema from a logical plan if it's a plain ScanPlan
-    /// (possibly wrapped in a FilterPlan after predicate pushdown).
-    /// Returns null if the plan shape doesn't qualify for INLJ.
+    /// Extracts the TableSchema from a logical plan by unwrapping ProjectPlan
+    /// and FilterPlan nodes inserted by the optimizer. The INLJ replaces the
+    /// entire right side and builds its own projection from the raw table,
+    /// so these wrappers can be safely skipped.
     /// </summary>
     private static TableSchema? TryGetScanTable(LogicalPlan plan) => plan switch
     {
         ScanPlan scan => scan.Table,
-        FilterPlan { Source: ScanPlan scan } => scan.Table,
+        FilterPlan filter => TryGetScanTable(filter.Source),
+        ProjectPlan project => TryGetScanTable(project.Source),
+        _ => null
+    };
+
+    /// <summary>
+    /// Walks through ProjectPlan wrappers to find a FilterPlan node, if any.
+    /// </summary>
+    private static FilterPlan? ExtractFilterPlan(LogicalPlan plan) => plan switch
+    {
+        FilterPlan f => f,
+        ProjectPlan p => ExtractFilterPlan(p.Source),
         _ => null
     };
 
