@@ -21,13 +21,16 @@ internal sealed class IndexScan : IDbEnumerator
     private readonly byte[]? _upperBound;
     private bool _seeked;
 
-    // Decode buffers (reused per row)
+    // Preallocated decode buffers (reused per row — zero per-row allocation)
     private readonly int _columnCount;
     private readonly DbValue[] _pkBuf;
+    private readonly DbValue[] _valueBuf;
     private readonly DbType[] _pkColumnTypes;
     private readonly int[] _pkColumnIndices;
     private readonly ColumnSchema[] _valueColumns;
     private readonly int[] _valueColumnOutputIndices;
+
+    private const int OidSize = 4;
 
     internal IndexSchema Index => _index;
     internal TableSchema Table => _table;
@@ -89,6 +92,7 @@ internal sealed class IndexScan : IDbEnumerator
         }
 
         _pkBuf = new DbValue[pkCount];
+        _valueBuf = new DbValue[valCount];
         Current = new DbValue[_columnCount];
     }
 
@@ -96,7 +100,6 @@ internal sealed class IndexScan : IDbEnumerator
     {
         while (true)
         {
-            // Seek or advance
             if (!_seeked)
             {
                 _seeked = true;
@@ -114,12 +117,7 @@ internal sealed class IndexScan : IDbEnumerator
 
             var indexKey = _cursor.CurrentKey.Span;
 
-            // Check prefix still matches (index Oid)
-            if (indexKey.Length < 4 ||
-                BinaryPrimitives.ReadUInt32BigEndian(indexKey) != _index.Oid.Value)
-                return false;
-
-            // Check key is within seek prefix range
+            // Check prefix still matches (index Oid + seek values)
             if (indexKey.Length < _seekPrefix.Length ||
                 !indexKey[.._seekPrefix.Length].SequenceEqual(_seekPrefix))
                 return false;
@@ -132,25 +130,27 @@ internal sealed class IndexScan : IDbEnumerator
             if (_cursor.IsTombstone)
                 continue;
 
-            // Extract PK from index key using stored offset
+            // Extract PK suffix from index key using stored offset — zero parse
             var indexValue = _cursor.CurrentValue.Span;
             var pkSuffix = IndexKeyEncoder.ExtractPkSuffix(indexKey, indexValue);
             var tableKey = IndexKeyEncoder.BuildTableKey(_table.Oid, pkSuffix);
 
-            // Bookmark lookup: fetch full row from main table
+            // Bookmark lookup
             var rowValue = await _tx.GetAsync(tableKey).ConfigureAwait(false);
             if (rowValue is null)
-                continue; // Row was deleted but index entry not yet cleaned up
+                continue;
 
-            // Decode full row
+            // Decode PK columns from table key
             RowKeyEncoder.Decode(tableKey, out _, _pkBuf, _pkColumnTypes);
-            var valueBuf = new DbValue[_valueColumns.Length];
-            RowValueEncoder.Decode(rowValue.AsSpan(), valueBuf, _valueColumns);
 
+            // Decode value columns — zero-copy: text/blob reference the returned byte[]
+            RowValueEncoder.Decode((ReadOnlyMemory<byte>)rowValue, _valueBuf, _valueColumns);
+
+            // Assemble full row
             for (int i = 0; i < _pkColumnIndices.Length; i++)
                 Current[_pkColumnIndices[i]] = _pkBuf[i];
             for (int i = 0; i < _valueColumnOutputIndices.Length; i++)
-                Current[_valueColumnOutputIndices[i]] = valueBuf[i];
+                Current[_valueColumnOutputIndices[i]] = _valueBuf[i];
 
             return true;
         }
