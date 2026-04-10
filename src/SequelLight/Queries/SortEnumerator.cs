@@ -47,7 +47,7 @@ internal sealed class SortEnumerator : IDbEnumerator
 
     // Spill mode state
     private SpillBuffer? _spillBuffer;
-    private KWayMerger<byte[], ReadOnlyMemory<byte>>? _spillReader;
+    private SpillReader? _spillReader;
     private bool _spillExhausted;
 
     internal IDbEnumerator Source => _source;
@@ -177,7 +177,10 @@ internal sealed class SortEnumerator : IDbEnumerator
 
     private async ValueTask<bool> MaterializeWithSpill(CancellationToken ct)
     {
-        var spill = new SpillBuffer(_memoryBudgetBytes, _allocateSpillPath!, _blockCache);
+        // Sort encodes a monotonic per-row tiebreak into every key, so keys are unique by
+        // construction. Skip the SpillBuffer's hash dedup index entirely — pure append.
+        var spill = new SpillBuffer(_memoryBudgetBytes, _allocateSpillPath!, _blockCache,
+            allowOverwrite: false);
         long tiebreak = 0;
 
         try

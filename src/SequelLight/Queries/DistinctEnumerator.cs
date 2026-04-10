@@ -37,7 +37,7 @@ internal sealed class DistinctEnumerator : IDbEnumerator
 
     // Spill mode state
     private SpillBuffer? _spillBuffer;
-    private KWayMerger<byte[], ReadOnlyMemory<byte>>? _spillReader;
+    private SpillReader? _spillReader;
     private bool _spillMaterialized;
     private bool _spillExhausted;
     private DbValue[]? _spillCurrent;

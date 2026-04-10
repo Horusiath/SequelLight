@@ -1494,14 +1494,14 @@ public class SpillBufferTests : TempDirTest
     private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
     private static string Str(ReadOnlyMemory<byte> m) => Encoding.UTF8.GetString(m.Span);
 
-    private static async Task<List<(string Key, string? Value)>> Drain(KWayMerger<byte[], ReadOnlyMemory<byte>> merger)
+    private static async Task<List<(string Key, string? Value)>> Drain(SpillReader reader)
     {
         var result = new List<(string, string?)>();
-        while (await merger.MoveNextAsync())
+        while (await reader.MoveNextAsync())
         {
             result.Add((
-                Encoding.UTF8.GetString(merger.CurrentKey),
-                merger.CurrentIsTombstone ? null : Str(merger.CurrentValue)));
+                Encoding.UTF8.GetString(reader.CurrentKey),
+                reader.CurrentIsTombstone ? null : Str(reader.CurrentValue)));
         }
         return result;
     }

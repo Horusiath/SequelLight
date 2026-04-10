@@ -371,15 +371,13 @@ internal sealed class ArrayCursor : Cursor
     }
 
     /// <summary>
-    /// Snapshots a sorted dictionary that already stores nullable values directly
-    /// (used by the transaction spill buffer's in-memory portion).
+    /// Adopts a pre-built sorted snapshot. Used by <see cref="SpillBuffer.CreateChildCursors"/>
+    /// to hand the cursor a freshly materialized array of entries from the buffer's
+    /// in-memory pool without going through a <see cref="SortedDictionary{TKey, TValue}"/>.
     /// </summary>
-    public ArrayCursor(SortedDictionary<byte[], byte[]?> source)
+    public ArrayCursor((byte[] Key, byte[]? Value)[] entries)
     {
-        _entries = new (byte[], byte[]?)[source.Count];
-        int i = 0;
-        foreach (var kvp in source)
-            _entries[i++] = (kvp.Key, kvp.Value);
+        _entries = entries;
     }
 
     public override bool IsValid => _pos >= 0 && _pos < _entries.Length;
