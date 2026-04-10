@@ -1308,3 +1308,344 @@ public class LsmStoreTests : TempDirTest
         Assert.True(await tx.CommitAsync());
     }
 }
+
+public class SpillBufferTests : TempDirTest
+{
+    private long _nextSpillId;
+
+    private string AllocatePath()
+    {
+        long id = Interlocked.Increment(ref _nextSpillId);
+        return Path.Combine(TempDir, $"spill_{id:D10}.sst");
+    }
+
+    private static byte[] Bytes(string s) => Encoding.UTF8.GetBytes(s);
+    private static string Str(ReadOnlyMemory<byte> m) => Encoding.UTF8.GetString(m.Span);
+
+    private static async Task<List<(string Key, string? Value)>> Drain(KWayMerger<byte[], ReadOnlyMemory<byte>> merger)
+    {
+        var result = new List<(string, string?)>();
+        while (await merger.MoveNextAsync())
+        {
+            result.Add((
+                Encoding.UTF8.GetString(merger.CurrentKey),
+                merger.CurrentIsTombstone ? null : Str(merger.CurrentValue)));
+        }
+        return result;
+    }
+
+    [Fact]
+    public async Task InMemoryOnly_Iterates_In_Sorted_Order()
+    {
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 1024 * 1024, AllocatePath);
+
+        await spill.AddAsync(Bytes("c"), Bytes("3"));
+        await spill.AddAsync(Bytes("a"), Bytes("1"));
+        await spill.AddAsync(Bytes("b"), Bytes("2"));
+
+        Assert.False(spill.HasSpilled);
+
+        await using var reader = spill.CreateSortedReader();
+        Assert.Equal(
+            new (string, string?)[] { ("a", "1"), ("b", "2"), ("c", "3") },
+            await Drain(reader));
+    }
+
+    [Fact]
+    public async Task Spills_When_Budget_Exceeded()
+    {
+        // Tiny budget forces spilling after just a couple of entries.
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        for (int i = 0; i < 50; i++)
+            await spill.AddAsync(Bytes($"k{i:D3}"), Bytes($"v{i:D3}"));
+
+        Assert.True(spill.HasSpilled, "Buffer should have spilled at least one run");
+        Assert.True(spill.SpilledRunCount > 0);
+
+        await using var reader = spill.CreateSortedReader();
+        var result = await Drain(reader);
+
+        Assert.Equal(50, result.Count);
+        for (int i = 0; i < 50; i++)
+        {
+            Assert.Equal($"k{i:D3}", result[i].Key);
+            Assert.Equal($"v{i:D3}", result[i].Value);
+        }
+    }
+
+    [Fact]
+    public async Task Spilled_And_Unspilled_Produce_Identical_Output()
+    {
+        // Same input, two budgets: one that fits, one that forces multiple spills.
+        async Task<List<(string, string?)>> Run(long budget)
+        {
+            await using var spill = new SpillBuffer(memoryBudgetBytes: budget, AllocatePath);
+            // Mix insertion order — sort buffer must produce sorted output regardless.
+            int[] order = { 7, 2, 19, 0, 13, 4, 11, 17, 1, 9, 15, 3, 18, 6, 12, 8, 14, 5, 10, 16 };
+            foreach (int i in order)
+                await spill.AddAsync(Bytes($"k{i:D2}"), Bytes($"v{i:D2}"));
+            await using var r = spill.CreateSortedReader();
+            return await Drain(r);
+        }
+
+        var unspilled = await Run(1024 * 1024);
+        var spilled = await Run(128);
+        Assert.Equal(unspilled, spilled);
+        Assert.Equal(20, unspilled.Count);
+    }
+
+    [Fact]
+    public async Task Newer_Add_Overrides_Older_Across_Spill()
+    {
+        // Add a value, force a spill, then add a new value for the same key in memory.
+        // Reader should see the in-memory (newer) value.
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        await spill.AddAsync(Bytes("k"), Bytes("old"));
+        for (int i = 0; i < 10; i++)
+            await spill.AddAsync(Bytes($"filler{i:D2}"), Bytes($"f{i}"));
+
+        Assert.True(spill.HasSpilled);
+        await spill.AddAsync(Bytes("k"), Bytes("new"));
+
+        var (val, found) = await spill.TryGetAsync(Bytes("k"));
+        Assert.True(found);
+        Assert.Equal("new", Encoding.UTF8.GetString(val!));
+
+        await using var reader = spill.CreateSortedReader();
+        var result = await Drain(reader);
+        var k = result.Single(x => x.Key == "k");
+        Assert.Equal("new", k.Value);
+    }
+
+    [Fact]
+    public async Task TryGet_Finds_In_Memory_And_In_Spill()
+    {
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        for (int i = 0; i < 30; i++)
+            await spill.AddAsync(Bytes($"k{i:D3}"), Bytes($"v{i}"));
+
+        Assert.True(spill.HasSpilled);
+
+        // Pick a key that should have been spilled.
+        var (early, foundEarly) = await spill.TryGetAsync(Bytes("k001"));
+        Assert.True(foundEarly);
+        Assert.Equal("v1", Encoding.UTF8.GetString(early!));
+
+        // And one that should still be in memory (the very last add).
+        var (late, foundLate) = await spill.TryGetAsync(Bytes("k029"));
+        Assert.True(foundLate);
+        Assert.Equal("v29", Encoding.UTF8.GetString(late!));
+
+        // And a key that doesn't exist.
+        var (missing, foundMissing) = await spill.TryGetAsync(Bytes("zzz"));
+        Assert.False(foundMissing);
+        Assert.Null(missing);
+    }
+
+    [Fact]
+    public async Task Tombstone_Shadows_Older_Value()
+    {
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        // Insert and spill.
+        await spill.AddAsync(Bytes("k"), Bytes("live"));
+        for (int i = 0; i < 10; i++)
+            await spill.AddAsync(Bytes($"f{i:D2}"), Bytes("x"));
+        Assert.True(spill.HasSpilled);
+
+        // Tombstone the key in the next in-memory generation.
+        await spill.AddAsync(Bytes("k"), null);
+
+        var (val, found) = await spill.TryGetAsync(Bytes("k"));
+        Assert.True(found);
+        Assert.Null(val);
+
+        await using var reader = spill.CreateSortedReader();
+        var result = await Drain(reader);
+        var k = result.Single(x => x.Key == "k");
+        Assert.Null(k.Value);
+    }
+
+    [Fact]
+    public async Task Dispose_Deletes_Spill_Files()
+    {
+        var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        for (int i = 0; i < 30; i++)
+            await spill.AddAsync(Bytes($"k{i:D3}"), Bytes($"v{i}"));
+
+        Assert.True(spill.HasSpilled);
+        var filesBefore = Directory.GetFiles(TempDir, "spill_*.sst");
+        Assert.NotEmpty(filesBefore);
+
+        await spill.DisposeAsync();
+
+        var filesAfter = Directory.GetFiles(TempDir, "spill_*.sst");
+        Assert.Empty(filesAfter);
+    }
+
+    [Fact]
+    public async Task Combiner_Folds_Across_Memory_And_Spilled_Runs()
+    {
+        // Use the combiner to sum integer-encoded values across spill generations.
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        // First generation: each key gets value 1.
+        for (int i = 0; i < 20; i++)
+            await spill.AddAsync(Bytes($"k{i:D2}"), Bytes("1"));
+        Assert.True(spill.HasSpilled);
+
+        // Second generation: same keys, value 10. The newer in-memory entries shadow only on
+        // dedup; with the combiner, both contribute and we expect 11.
+        for (int i = 0; i < 20; i++)
+            await spill.AddAsync(Bytes($"k{i:D2}"), Bytes("10"));
+
+        // Note: AddAsync overwrites within a generation, so the second loop replaces the
+        // first generation's still-in-memory copies. The first generation is now on disk
+        // (frozen at value 1), and the in-memory has value 10.
+
+        Func<ReadOnlyMemory<byte>, ReadOnlyMemory<byte>, ReadOnlyMemory<byte>> sum = (l, r) =>
+            Encoding.UTF8.GetBytes(
+                (int.Parse(Encoding.UTF8.GetString(l.Span)) + int.Parse(Encoding.UTF8.GetString(r.Span))).ToString());
+
+        await using var reader = spill.CreateSortedReader(combiner: sum);
+        var result = await Drain(reader);
+
+        Assert.Equal(20, result.Count);
+        foreach (var (key, value) in result)
+            Assert.Equal("11", value);
+    }
+
+    [Fact]
+    public async Task TryGetMemory_Returns_False_For_Spilled_Keys()
+    {
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 200, AllocatePath);
+
+        // With budget 200 and ~102B per entry, every 2nd Add triggers a spill that clears
+        // memory. 29 adds therefore leave the 29th (k028) sitting alone in memory.
+        for (int i = 0; i < 29; i++)
+            await spill.AddAsync(Bytes($"k{i:D3}"), Bytes($"v{i}"));
+
+        Assert.True(spill.HasSpilled);
+
+        Assert.True(spill.TryGetMemory(Bytes("k028"), out var inMem));
+        Assert.NotNull(inMem);
+
+        // k000 was spilled — TryGetMemory does not consult disk.
+        Assert.False(spill.TryGetMemory(Bytes("k000"), out _));
+    }
+
+    [Fact]
+    public void Constructor_Rejects_Zero_Or_Negative_Budget()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SpillBuffer(0, AllocatePath));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SpillBuffer(-1, AllocatePath));
+    }
+
+    [Fact]
+    public async Task Empty_Buffer_Reader_Returns_False_Immediately()
+    {
+        await using var spill = new SpillBuffer(memoryBudgetBytes: 1024, AllocatePath);
+
+        await using var reader = spill.CreateSortedReader();
+        Assert.False(await reader.MoveNextAsync());
+    }
+}
+
+public class TempDirectoryTests : TempDirTest
+{
+    [Fact]
+    public async Task Open_Creates_Default_Temp_Directory()
+    {
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        var defaultTemp = Path.Combine(TempDir, "tmp");
+        Assert.True(Directory.Exists(defaultTemp), "Default tmp/ subdirectory should exist after open");
+    }
+
+    [Fact]
+    public async Task Open_Wipes_Stale_Files_From_Temp_Directory()
+    {
+        // Pre-create the temp dir with a leftover spill file from a "previous run".
+        var tempDir = Path.Combine(TempDir, "tmp");
+        Directory.CreateDirectory(tempDir);
+        var stalePath = Path.Combine(tempDir, "spill_stale.sst");
+        File.WriteAllText(stalePath, "garbage");
+        Assert.True(File.Exists(stalePath));
+
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+
+        Assert.False(File.Exists(stalePath), "Stale spill file should be removed on open");
+        Assert.True(Directory.Exists(tempDir), "Temp directory should be recreated empty");
+    }
+
+    [Fact]
+    public async Task Dispose_Removes_Temp_Directory()
+    {
+        var tempDir = Path.Combine(TempDir, "tmp");
+
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            Assert.True(Directory.Exists(tempDir));
+        }
+
+        Assert.False(Directory.Exists(tempDir), "Temp directory should be removed on dispose");
+    }
+
+    [Fact]
+    public async Task Dispose_Removes_Temp_Directory_With_Leftover_Files()
+    {
+        var tempDir = Path.Combine(TempDir, "tmp");
+
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            // Simulate a spill consumer that forgot to clean up its files.
+            File.WriteAllText(Path.Combine(tempDir, "spill_orphan.sst"), "data");
+        }
+
+        Assert.False(Directory.Exists(tempDir));
+    }
+
+    [Fact]
+    public async Task Custom_TempDirectory_Is_Honored()
+    {
+        var customTemp = Path.Combine(TempDir, "custom_temp_location");
+
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            TempDirectory = customTemp,
+        }))
+        {
+            Assert.True(Directory.Exists(customTemp));
+            Assert.False(Directory.Exists(Path.Combine(TempDir, "tmp")),
+                "Default tmp/ should not be created when a custom path is set");
+        }
+
+        Assert.False(Directory.Exists(customTemp), "Custom temp dir should be removed on dispose");
+    }
+
+    [Fact]
+    public async Task Reopen_After_Crash_With_Leftover_Spill_Files_Cleans_Them_Up()
+    {
+        var tempDir = Path.Combine(TempDir, "tmp");
+
+        // First open: creates the temp dir.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir })) { }
+
+        // Simulate a crash by recreating the temp dir with leftover files
+        // (DisposeAsync would normally have removed them, but a crash bypasses Dispose).
+        Directory.CreateDirectory(tempDir);
+        File.WriteAllText(Path.Combine(tempDir, "spill_0000000001.sst"), "leftover1");
+        File.WriteAllText(Path.Combine(tempDir, "spill_0000000002.sst"), "leftover2");
+
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            Assert.True(Directory.Exists(tempDir));
+            Assert.Empty(Directory.GetFiles(tempDir));
+        }
+    }
+}

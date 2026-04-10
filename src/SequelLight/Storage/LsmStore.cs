@@ -11,6 +11,13 @@ public sealed class LsmStoreOptions
     public int SSTableBlockSize { get; init; } = SSTableWriter.DefaultBlockSize;
     public long BlockCacheSize { get; init; } = 64 * 1024 * 1024; // 64 MiB
     public ICompactionStrategy CompactionStrategy { get; init; } = new LevelTieredCompaction();
+
+    /// <summary>
+    /// Directory used for short-lived spill files (sort runs, hash join build sides, transaction
+    /// overflow, etc.). Wiped on store open and on store close. If null, defaults to a "tmp"
+    /// subdirectory of <see cref="Directory"/>.
+    /// </summary>
+    public string? TempDirectory { get; init; }
 }
 
 /// <summary>
@@ -20,6 +27,7 @@ public sealed class LsmStoreOptions
 public sealed class LsmStore : IAsyncDisposable
 {
     private readonly LsmStoreOptions _options;
+    private readonly string _tempDirectory;
     private readonly MemTable _memTable = new();
     private readonly BlockCache? _blockCache;
     private WriteAheadLog? _wal;
@@ -29,6 +37,7 @@ public sealed class LsmStore : IAsyncDisposable
     private readonly ConcurrentDictionary<string, SSTableReader> _readerCache = new();
     private readonly ConcurrentBag<SSTableReader> _retiredReaders = new();
     private int _nextFileId;
+    private long _nextSpillId;
     private int _compacting;
 
     // Background compaction
@@ -39,8 +48,25 @@ public sealed class LsmStore : IAsyncDisposable
     private LsmStore(LsmStoreOptions options)
     {
         _options = options;
+        _tempDirectory = options.TempDirectory ?? Path.Combine(options.Directory, "tmp");
         if (options.BlockCacheSize > 0)
             _blockCache = new BlockCache(options.BlockCacheSize);
+    }
+
+    /// <summary>
+    /// Directory holding short-lived spill files. Wiped on open and on dispose. Spill consumers
+    /// (sort, distinct, group-by, hash-join, transaction overflow) write here.
+    /// </summary>
+    internal string TempDirectory => _tempDirectory;
+
+    /// <summary>
+    /// Allocates a unique path under the temp directory for a new spill file. The caller owns
+    /// the file and is responsible for deleting it when done.
+    /// </summary>
+    internal string AllocateSpillFilePath()
+    {
+        long id = Interlocked.Increment(ref _nextSpillId);
+        return Path.Combine(_tempDirectory, $"spill_{id:D10}.sst");
     }
 
     public static async ValueTask<LsmStore> OpenAsync(LsmStoreOptions options)
@@ -55,6 +81,12 @@ public sealed class LsmStore : IAsyncDisposable
 
     private async ValueTask RecoverAsync()
     {
+        // Wipe and recreate the temp directory. Anything left over here is from a previous run
+        // (or a crash); it cannot be referenced by committed state, which lives in the data dir.
+        if (System.IO.Directory.Exists(_tempDirectory))
+            System.IO.Directory.Delete(_tempDirectory, recursive: true);
+        System.IO.Directory.CreateDirectory(_tempDirectory);
+
         // Load existing SSTables
         var sstFiles = System.IO.Directory.GetFiles(_options.Directory, "*.sst");
         Array.Sort(sstFiles, StringComparer.Ordinal);
@@ -361,6 +393,19 @@ public sealed class LsmStore : IAsyncDisposable
             await retired.DisposeAsync().ConfigureAwait(false);
 
         _blockCache?.Dispose();
+
+        // Remove the temp directory and any spill files still in it. Owners of live spill
+        // buffers are expected to dispose them before disposing the store; this is a final
+        // safety net so the on-disk footprint is always cleaned up.
+        try
+        {
+            if (System.IO.Directory.Exists(_tempDirectory))
+                System.IO.Directory.Delete(_tempDirectory, recursive: true);
+        }
+        catch
+        {
+            // Best-effort: a leftover handle on the temp dir shouldn't fail dispose.
+        }
     }
 
 }
