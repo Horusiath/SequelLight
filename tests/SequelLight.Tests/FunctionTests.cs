@@ -568,4 +568,78 @@ public class SelectDistinctTests : TempDirTest
             details.Add(reader.GetString(2));
         Assert.Contains(details, d => d == "DISTINCT");
     }
+
+    [Fact]
+    public async Task SelectDistinct_Spills_When_Operator_Memory_Budget_Is_Tiny()
+    {
+        // Force the DistinctEnumerator into its spill path with a 1 KiB budget. The query
+        // inserts many rows with heavy duplication; DISTINCT must collapse them and the spill
+        // files must be cleaned up after the reader is disposed.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 1000 rows, 50 distinct labels — each label appears 20 times.
+        for (int i = 0; i < 1000; i++)
+        {
+            cmd.CommandText = $"INSERT INTO t VALUES ({i}, 'lbl_{i % 50:D2}')";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        cmd.CommandText = "SELECT DISTINCT label FROM t";
+        var labels = new List<string>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                labels.Add(reader.GetString(0));
+        }
+
+        Assert.Equal(50, labels.Count);
+        for (int i = 0; i < 50; i++)
+            Assert.Contains($"lbl_{i:D2}", labels);
+
+        // Spill files cleaned up.
+        var tmpDir = Path.Combine(TempDir, "tmp");
+        if (Directory.Exists(tmpDir))
+            Assert.Empty(Directory.GetFiles(tmpDir, "spill_*.sst"));
+    }
+
+    [Fact]
+    public async Task SelectDistinct_Spilling_With_OrderBy_Produces_Sorted_Distinct()
+    {
+        // DISTINCT followed by ORDER BY: spill kicks in for the distinct step, then sort
+        // re-orders the (already de-duplicated) result.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        var rng = new Random(11);
+        for (int i = 0; i < 800; i++)
+        {
+            cmd.CommandText = $"INSERT INTO t VALUES ({i}, 'cat_{rng.Next(0, 30):D2}')";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        cmd.CommandText = "SELECT DISTINCT category FROM t ORDER BY category";
+        var rows = new List<string>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                rows.Add(reader.GetString(0));
+        }
+
+        Assert.True(rows.Count <= 30);
+        Assert.True(rows.Count > 0);
+        for (int i = 1; i < rows.Count; i++)
+            Assert.True(string.CompareOrdinal(rows[i - 1], rows[i]) < 0,
+                $"row {i - 1} '{rows[i - 1]}' should be < row {i} '{rows[i]}'");
+    }
 }

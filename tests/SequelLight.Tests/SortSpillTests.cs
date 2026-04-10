@@ -415,3 +415,192 @@ public class SortEnumeratorSpillTests : IAsyncDisposable
         Assert.True(result[2][2].IsNull);
     }
 }
+
+public class DistinctEnumeratorSpillTests : IAsyncDisposable
+{
+    private readonly string _tempDir = Path.Combine(
+        Path.GetTempPath(), "sl_distinct_spill_" + Guid.NewGuid().ToString("N"));
+    private long _nextSpillId;
+
+    public DistinctEnumeratorSpillTests()
+    {
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        try { Directory.Delete(_tempDir, recursive: true); } catch { }
+        return ValueTask.CompletedTask;
+    }
+
+    private string AllocatePath()
+    {
+        long id = Interlocked.Increment(ref _nextSpillId);
+        return Path.Combine(_tempDir, $"spill_{id:D10}.sst");
+    }
+
+    /// <summary>Test source: yields rows from an in-memory list.</summary>
+    private sealed class ListSource : IDbEnumerator
+    {
+        private readonly List<DbValue[]> _rows;
+        private int _idx = -1;
+        public Projection Projection { get; }
+        public DbValue[] Current { get; }
+        public ListSource(List<DbValue[]> rows, int width)
+        {
+            _rows = rows;
+            var names = new string[width];
+            for (int i = 0; i < width; i++) names[i] = $"c{i}";
+            Projection = new Projection(names);
+            Current = new DbValue[width];
+        }
+        public ValueTask<bool> NextAsync(CancellationToken ct = default)
+        {
+            if (++_idx >= _rows.Count) return new ValueTask<bool>(false);
+            _rows[_idx].AsSpan().CopyTo(Current);
+            return new ValueTask<bool>(true);
+        }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private static async Task<List<DbValue[]>> Drain(DistinctEnumerator distinct)
+    {
+        var result = new List<DbValue[]>();
+        while (await distinct.NextAsync())
+        {
+            var snapshot = new DbValue[distinct.Current.Length];
+            distinct.Current.AsSpan().CopyTo(snapshot);
+            result.Add(snapshot);
+        }
+        return result;
+    }
+
+    [Fact]
+    public async Task Spill_Mode_Dedups_Across_Many_Spilled_Runs()
+    {
+        // 600 rows, only 50 distinct values (each repeated 12 times). With a tiny budget the
+        // SpillBuffer ends up with many runs that all contain overlapping keys; the merger
+        // must collapse them into 50 unique outputs.
+        var rows = new List<DbValue[]>();
+        for (int rep = 0; rep < 12; rep++)
+            for (int i = 0; i < 50; i++)
+                rows.Add(new[] { DbValue.Integer(i) });
+
+        var distinct = new DistinctEnumerator(
+            new ListSource(rows, width: 1),
+            memoryBudgetBytes: 256,
+            allocateSpillPath: AllocatePath);
+
+        var result = await Drain(distinct);
+        await distinct.DisposeAsync();
+
+        Assert.Equal(50, result.Count);
+        // SQL DISTINCT does not impose an order. Verify the multiset, not positions.
+        var expected = new HashSet<long>(Enumerable.Range(0, 50).Select(i => (long)i));
+        var actual = new HashSet<long>(result.Select(r => r[0].AsInteger()));
+        Assert.Equal(expected, actual);
+
+        Assert.Empty(Directory.GetFiles(_tempDir, "spill_*.sst"));
+    }
+
+    [Fact]
+    public async Task Spill_Mode_Multi_Column_Dedup()
+    {
+        // (group, value) pairs with duplicates across both columns.
+        var rows = new List<DbValue[]>();
+        var rng = new Random(7);
+        for (int i = 0; i < 1000; i++)
+            rows.Add(new[]
+            {
+                DbValue.Integer(rng.Next(0, 5)),
+                DbValue.Text(Encoding.UTF8.GetBytes($"v{rng.Next(0, 10):D2}"))
+            });
+
+        var expected = new HashSet<(long, string)>();
+        foreach (var r in rows)
+            expected.Add((r[0].AsInteger(), Encoding.UTF8.GetString(r[1].AsText().Span)));
+
+        var distinct = new DistinctEnumerator(
+            new ListSource(rows, width: 2),
+            memoryBudgetBytes: 512,
+            allocateSpillPath: AllocatePath);
+
+        var result = await Drain(distinct);
+        await distinct.DisposeAsync();
+
+        var actual = new HashSet<(long, string)>();
+        foreach (var r in result)
+            actual.Add((r[0].AsInteger(), Encoding.UTF8.GetString(r[1].AsText().Span)));
+
+        Assert.Equal(expected.Count, result.Count); // no row appears twice
+        Assert.Equal(expected, actual);             // exact same set
+    }
+
+    [Fact]
+    public async Task Spill_Mode_Handles_All_Unique_Rows()
+    {
+        // No duplicates — DISTINCT degenerates to "yield everything once".
+        var rows = new List<DbValue[]>();
+        for (int i = 0; i < 200; i++)
+            rows.Add(new[] { DbValue.Integer(i * 7) });
+
+        var distinct = new DistinctEnumerator(
+            new ListSource(rows, width: 1),
+            memoryBudgetBytes: 256,
+            allocateSpillPath: AllocatePath);
+
+        var result = await Drain(distinct);
+        await distinct.DisposeAsync();
+
+        Assert.Equal(200, result.Count);
+        // Order is not specified by SQL DISTINCT — verify the multiset.
+        var expected = new HashSet<long>(Enumerable.Range(0, 200).Select(i => (long)(i * 7)));
+        var actual = new HashSet<long>(result.Select(r => r[0].AsInteger()));
+        Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public async Task Spill_Mode_Handles_NULLs_As_Distinct_Group()
+    {
+        // SQL semantics: two NULLs are equal for DISTINCT purposes (collapsed to one).
+        var rows = new List<DbValue[]>();
+        for (int i = 0; i < 50; i++)
+        {
+            rows.Add(new[] { DbValue.Null });
+            rows.Add(new[] { DbValue.Integer(i) });
+        }
+
+        var distinct = new DistinctEnumerator(
+            new ListSource(rows, width: 1),
+            memoryBudgetBytes: 256,
+            allocateSpillPath: AllocatePath);
+
+        var result = await Drain(distinct);
+        await distinct.DisposeAsync();
+
+        Assert.Equal(51, result.Count); // 50 distinct ints + 1 null
+        int nullCount = result.Count(r => r[0].IsNull);
+        Assert.Equal(1, nullCount);
+    }
+
+    [Fact]
+    public async Task InMemory_Mode_Preserves_Source_Order()
+    {
+        // No allocator → in-memory hashset mode → output in source order.
+        var rows = new List<DbValue[]>
+        {
+            new[] { DbValue.Integer(3) },
+            new[] { DbValue.Integer(1) },
+            new[] { DbValue.Integer(3) }, // dup
+            new[] { DbValue.Integer(2) },
+            new[] { DbValue.Integer(1) }, // dup
+        };
+
+        var distinct = new DistinctEnumerator(new ListSource(rows, width: 1));
+        var result = await Drain(distinct);
+        await distinct.DisposeAsync();
+
+        // First-seen order: 3, 1, 2.
+        Assert.Equal(new long[] { 3, 1, 2 }, result.Select(r => r[0].AsInteger()).ToArray());
+    }
+}

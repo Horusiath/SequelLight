@@ -410,7 +410,7 @@ public sealed class QueryPlanner
         if (orderBy is not { Length: > 0 })
         {
             var result = BuildPhysical(logical, tx);
-            if (distinct) result = new DistinctEnumerator(result);
+            if (distinct) result = BuildDistinctEnumerator(result, tx);
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
@@ -418,7 +418,7 @@ public sealed class QueryPlanner
         if (logical is not ProjectPlan topProject)
         {
             var result = BuildPhysical(logical, tx);
-            if (distinct) result = new DistinctEnumerator(result);
+            if (distinct) result = BuildDistinctEnumerator(result, tx);
             long maxRows = 0;
             if (limitPlan is not null)
                 maxRows = EvaluateLimitForTopN(limitPlan);
@@ -447,7 +447,7 @@ public sealed class QueryPlanner
             ? source
             : new Select(source, selectors);
 
-        if (distinct) physicalResult = new DistinctEnumerator(physicalResult);
+        if (distinct) physicalResult = BuildDistinctEnumerator(physicalResult, tx);
         return limitPlan is not null ? BuildLimitEnumerator(limitPlan, physicalResult) : physicalResult;
     }
 
@@ -562,7 +562,7 @@ public sealed class QueryPlanner
 
         // UNION (not ALL) needs deduplication at this compound boundary
         if (compound.Op == CompoundOp.Union)
-            result = new DistinctEnumerator(result);
+            result = BuildDistinctEnumerator(result, tx);
 
         return result;
     }
@@ -672,7 +672,7 @@ public sealed class QueryPlanner
             case DistinctPlan distinct:
             {
                 var child = BuildPhysical(distinct.Source, tx);
-                return new DistinctEnumerator(child);
+                return BuildDistinctEnumerator(child, tx);
             }
 
             case GroupByPlan agg:
@@ -2219,7 +2219,7 @@ public sealed class QueryPlanner
             case DistinctPlan distinct:
             {
                 var (child, childOrder) = BuildPhysicalWithOrder(distinct.Source, tx);
-                return (new DistinctEnumerator(child), Array.Empty<SortKey>());
+                return (BuildDistinctEnumerator(child, tx), Array.Empty<SortKey>());
             }
 
             case GroupByPlan agg:
@@ -2319,6 +2319,17 @@ public sealed class QueryPlanner
             satisfied++;
         }
         return satisfied;
+    }
+
+    private static DistinctEnumerator BuildDistinctEnumerator(IDbEnumerator source, ReadOnlyTransaction? tx)
+    {
+        if (tx is null)
+            return new DistinctEnumerator(source);
+        var store = tx.OwningStore;
+        return new DistinctEnumerator(
+            source,
+            memoryBudgetBytes: store.OperatorMemoryBudgetBytes,
+            allocateSpillPath: store.AllocateSpillFilePath);
     }
 
     private SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0, ReadOnlyTransaction? tx = null)
