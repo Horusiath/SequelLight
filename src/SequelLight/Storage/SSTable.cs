@@ -40,9 +40,14 @@ public sealed class SSTableWriter : IAsyncDisposable
     private readonly FileStream _stream;
     private readonly int _targetBlockSize;
     private readonly MemoryPool<byte> _pool;
+    private readonly bool _buildBloomFilter;
 
     private readonly List<IndexEntry> _index = new();
-    private readonly List<byte[]> _allKeys = new();
+    // Only allocated when bloom is enabled. The list pins every key written so the bloom
+    // filter can be built at FinishAsync — a noticeable allocation hit on large flushes
+    // (≈8 bytes per ref + the List backing array). Disabled for sequential-read-only spill
+    // runs (sort/distinct), where bloom filtering provides no value.
+    private readonly List<byte[]>? _allKeys;
     private IMemoryOwner<byte>? _blockBuffer;
     private int _blockOffset;
     private int _entryCount;
@@ -51,20 +56,35 @@ public sealed class SSTableWriter : IAsyncDisposable
     private byte[]? _blockFirstKey;
     private long _blockStartPos;
 
-    private SSTableWriter(FileStream stream, int targetBlockSize, MemoryPool<byte> pool)
+    private SSTableWriter(FileStream stream, int targetBlockSize, MemoryPool<byte> pool, bool buildBloomFilter)
     {
         _stream = stream;
         _targetBlockSize = targetBlockSize;
         _pool = pool;
+        _buildBloomFilter = buildBloomFilter;
         _blockBuffer = pool.Rent(targetBlockSize * 2);
         _blockStartPos = 0;
+        if (buildBloomFilter)
+            _allKeys = new List<byte[]>();
     }
 
-    public static SSTableWriter Create(string filePath, int targetBlockSize = DefaultBlockSize, MemoryPool<byte>? pool = null)
+    /// <summary>
+    /// Creates a new SSTable writer at <paramref name="filePath"/>. Set
+    /// <paramref name="buildBloomFilter"/> to false to skip bloom filter construction
+    /// for SSTables that will only ever be scanned sequentially (e.g. spill runs from
+    /// SortEnumerator/DistinctEnumerator). The resulting file is still readable by
+    /// <see cref="SSTableReader"/> — point lookups simply lose the fast-reject hint and
+    /// fall through to a binary search over the block index.
+    /// </summary>
+    public static SSTableWriter Create(
+        string filePath,
+        int targetBlockSize = DefaultBlockSize,
+        MemoryPool<byte>? pool = null,
+        bool buildBloomFilter = true)
     {
         var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None,
             bufferSize: 4096, useAsync: true);
-        return new SSTableWriter(stream, targetBlockSize, pool ?? MemoryPool<byte>.Shared);
+        return new SSTableWriter(stream, targetBlockSize, pool ?? MemoryPool<byte>.Shared, buildBloomFilter);
     }
 
     public async ValueTask WriteEntryAsync(byte[] key, byte[]? value)
@@ -115,7 +135,7 @@ public sealed class SSTableWriter : IAsyncDisposable
         _prevKey = key;
         _entryCount++;
         _totalEntryCount++;
-        _allKeys.Add(key);
+        _allKeys?.Add(key);
     }
 
     /// <summary>
@@ -171,7 +191,7 @@ public sealed class SSTableWriter : IAsyncDisposable
         _prevKey = key;
         _entryCount++;
         _totalEntryCount++;
-        _allKeys.Add(key);
+        _allKeys?.Add(key);
     }
 
     public async ValueTask FinishAsync()
@@ -209,14 +229,21 @@ public sealed class SSTableWriter : IAsyncDisposable
             ArrayPool<byte>.Shared.Return(indexBuf);
         }
 
-        // Build and write bloom filter
-        var bloom = BloomFilter.Create(_totalEntryCount);
-        foreach (var key in _allKeys)
-            bloom.Add(key);
-
+        // Build and write bloom filter (skipped for sequential-read-only spill runs).
+        // bloomOffset is captured even when no bloom is written so the reader's
+        // indexBlockLen calculation (bloomOffset - indexOffset) still gives the right
+        // index block size — bloomOffset points at the byte right after the index.
         long bloomOffset = _stream.Position;
-        int bloomLength = bloom.ByteCount;
-        await _stream.WriteAsync(bloom.AsSpan().ToArray().AsMemory(0, bloomLength)).ConfigureAwait(false);
+        int bloomLength = 0;
+        if (_buildBloomFilter)
+        {
+            var bloom = BloomFilter.Create(_totalEntryCount);
+            foreach (var key in _allKeys!)
+                bloom.Add(key);
+
+            bloomLength = bloom.ByteCount;
+            await _stream.WriteAsync(bloom.AsSpan().ToArray().AsMemory(0, bloomLength)).ConfigureAwait(false);
+        }
 
         // Write footer (32 bytes)
         var footer = ArrayPool<byte>.Shared.Rent(FooterSize);

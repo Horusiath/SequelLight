@@ -143,7 +143,11 @@ internal sealed class DistinctEnumerator : IDbEnumerator
 
     private async ValueTask MaterializeIntoSpillAsync(CancellationToken ct)
     {
-        var spill = new SpillBuffer(_memoryBudgetBytes, _allocateSpillPath!, _blockCache);
+        // DISTINCT keeps the dedup hash index (allowOverwrite=true) so duplicate rows
+        // collapse in memory before spill, but spilled runs are only drained sequentially
+        // via the merger — skip the bloom filter for those.
+        var spill = new SpillBuffer(_memoryBudgetBytes, _allocateSpillPath!, _blockCache,
+            sequentialSpillsOnly: true);
         try
         {
             while (await _source.NextAsync(ct).ConfigureAwait(false))

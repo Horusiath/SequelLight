@@ -155,4 +155,44 @@ public class SpillBufferBenchmarks
         while (await reader.MoveNextAsync()) n++;
         return n;
     }
+
+    // ---- Sequential-spill variants (after #2): bloom-filter-less SSTable writer. ----
+    // These exercise the configuration used in production by SortEnumerator and
+    // DistinctEnumerator: spilled runs are only ever drained via the merger, so the
+    // bloom filter and the per-key retention list inside SSTableWriter are skipped.
+
+    [Benchmark(Description = "AddAsync (with spill, ~8 runs, sequential)")]
+    public async Task<int> AddOnly_WithSpill_Sequential()
+    {
+        long budget = Math.Max(4096, (long)(RowCount / 8) * 176);
+
+        await using var spill = new SpillBuffer(
+            memoryBudgetBytes: budget,
+            allocateSpillPath: AllocateSpillPath,
+            sequentialSpillsOnly: true);
+
+        for (int i = 0; i < _keys.Length; i++)
+            await spill.AddAsync(_keys[i], _values[i]);
+
+        return spill.SpilledRunCount;
+    }
+
+    [Benchmark(Description = "Add + CreateSortedReader drain (with spill, ~8 runs, sequential)")]
+    public async Task<int> AddAndDrain_WithSpill_Sequential()
+    {
+        long budget = Math.Max(4096, (long)(RowCount / 8) * 176);
+
+        await using var spill = new SpillBuffer(
+            memoryBudgetBytes: budget,
+            allocateSpillPath: AllocateSpillPath,
+            sequentialSpillsOnly: true);
+
+        for (int i = 0; i < _keys.Length; i++)
+            await spill.AddAsync(_keys[i], _values[i]);
+
+        int n = 0;
+        await using var reader = spill.CreateSortedReader();
+        while (await reader.MoveNextAsync()) n++;
+        return n;
+    }
 }

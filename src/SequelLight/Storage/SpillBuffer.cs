@@ -56,6 +56,7 @@ public sealed class SpillBuffer : IAsyncDisposable
     private readonly BlockCache? _blockCache;
     private readonly int _blockSize;
     private readonly bool _allowOverwrite;
+    private readonly bool _sequentialSpillsOnly;
 
     // Append-only entry pool. Entries are reordered in place by EnsureSorted before
     // any sorted consumption (spill flush, sorted reader, child cursors, commit path).
@@ -84,12 +85,19 @@ public sealed class SpillBuffer : IAsyncDisposable
 
     private bool _disposed;
 
+    /// <param name="sequentialSpillsOnly">When true, spilled SSTables are written without
+    /// a bloom filter — appropriate for callers that only ever drain spilled runs via
+    /// <see cref="CreateSortedReader"/> (e.g. sort, distinct). Skips per-key bloom hash
+    /// work, releases key references between blocks, and shrinks the on-disk file. Set to
+    /// false (the default) when point lookups via <see cref="TryGetAsync"/> or random-access
+    /// cursors via <see cref="CreateChildCursors"/> are expected.</param>
     public SpillBuffer(
         long memoryBudgetBytes,
         Func<string> allocateSpillPath,
         BlockCache? blockCache = null,
         int blockSize = SSTableWriter.DefaultBlockSize,
-        bool allowOverwrite = true)
+        bool allowOverwrite = true,
+        bool sequentialSpillsOnly = false)
     {
         if (memoryBudgetBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(memoryBudgetBytes));
@@ -98,6 +106,7 @@ public sealed class SpillBuffer : IAsyncDisposable
         _blockCache = blockCache;
         _blockSize = blockSize;
         _allowOverwrite = allowOverwrite;
+        _sequentialSpillsOnly = sequentialSpillsOnly;
 
         _entries = ArrayPool<InMemEntry>.Shared.Rent(InitialEntryCapacity);
 
@@ -444,7 +453,8 @@ public sealed class SpillBuffer : IAsyncDisposable
         EnsureSorted();
 
         var path = _allocateSpillPath();
-        await using (var writer = SSTableWriter.Create(path, _blockSize))
+        await using (var writer = SSTableWriter.Create(path, _blockSize,
+            buildBloomFilter: !_sequentialSpillsOnly))
         {
             for (int i = 0; i < _entryCount; i++)
             {

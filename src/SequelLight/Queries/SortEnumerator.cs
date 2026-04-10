@@ -178,9 +178,12 @@ internal sealed class SortEnumerator : IDbEnumerator
     private async ValueTask<bool> MaterializeWithSpill(CancellationToken ct)
     {
         // Sort encodes a monotonic per-row tiebreak into every key, so keys are unique by
-        // construction. Skip the SpillBuffer's hash dedup index entirely — pure append.
+        // construction — skip the dedup hash index entirely (pure append). And spilled
+        // runs are only ever drained sequentially via the merger, so the bloom filter is
+        // pure overhead — skip it too.
         var spill = new SpillBuffer(_memoryBudgetBytes, _allocateSpillPath!, _blockCache,
-            allowOverwrite: false);
+            allowOverwrite: false,
+            sequentialSpillsOnly: true);
         long tiebreak = 0;
 
         try
