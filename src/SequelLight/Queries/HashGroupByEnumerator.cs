@@ -11,6 +11,14 @@ namespace SequelLight.Queries;
 ///
 /// When <see cref="_groupKeyOrdinals"/> is empty, degenerates to a single implicit
 /// group (equivalent to plain aggregation without GROUP BY).
+///
+/// <para>
+/// Memory: O(unique groups). For non-trivial GROUP BY queries the planner prefers the
+/// sort-then-aggregate path (<see cref="SortGroupByEnumerator"/> over a spilling
+/// <see cref="SortEnumerator"/>) because it bounds memory via the existing spill
+/// machinery; this hash-based operator is reserved for the implicit single-group case
+/// (no GROUP BY at all).
+/// </para>
 /// </summary>
 internal sealed class HashGroupByEnumerator : IDbEnumerator
 {
@@ -109,7 +117,7 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
             if (_groupKeyOrdinals.Length == 0)
             {
                 // Single implicit group
-                if (_buckets.Count == 0)
+                if (_buckets!.Count == 0)
                     _buckets.Add(CreateBucket(srcRow, hasDistinct, out distinctSets));
                 bucket = _buckets[0];
             }
@@ -156,7 +164,7 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
         }
 
         // For no-GROUP-BY with no rows, still produce one row (aggregate defaults)
-        if (_groupKeyOrdinals.Length == 0 && _buckets.Count == 0)
+        if (_groupKeyOrdinals.Length == 0 && _buckets!.Count == 0)
             _buckets.Add(CreateBucket(Array.Empty<DbValue>(), false, out _));
     }
 
@@ -230,7 +238,6 @@ internal sealed class HashGroupByEnumerator : IDbEnumerator
     private void EmitRow(GroupBucket bucket)
     {
         int aggIdx = 0;
-        int keyIdx = 0;
         for (int i = 0; i < Current.Length; i++)
         {
             int map = _outputMap[i];

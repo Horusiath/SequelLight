@@ -604,3 +604,4 @@ public class DistinctEnumeratorSpillTests : IAsyncDisposable
         Assert.Equal(new long[] { 3, 1, 2 }, result.Select(r => r[0].AsInteger()).ToArray());
     }
 }
+

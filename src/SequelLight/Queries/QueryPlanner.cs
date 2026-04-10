@@ -820,14 +820,31 @@ public sealed class QueryPlanner
         var outputMapArray = outputMap.ToArray();
         var passThruArray = passThruOrdinals.ToArray();
 
-        // Strategy selection: use streaming sort-based if input is sorted by GROUP BY keys
-        if (groupKeyOrdinals.Length > 0 && GroupBySatisfiedByOrder(groupKeyOrdinals, providedOrder))
+        // No GROUP BY: single implicit group, hash operator handles it cheaply.
+        if (groupKeyOrdinals.Length == 0)
         {
-            return new SortGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
+            return new HashGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
                 outputMapArray, passThruArray, resolvedHaving, outputProjection);
         }
 
-        return new HashGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
+        // For non-trivial GROUP BY we always go through sort-then-aggregate. This bounds
+        // memory via the existing SortEnumerator spill machinery (no per-aggregate spill
+        // logic needed) and naturally supports DISTINCT aggregates and pass-through columns.
+        // If the input is already sorted by the group key columns, the sort is elided.
+        if (!GroupBySatisfiedByOrder(groupKeyOrdinals, providedOrder))
+        {
+            var ascOrders = new SortOrder[groupKeyOrdinals.Length]; // default = Asc
+            var store = tx.OwningStore;
+            child = new SortEnumerator(
+                child,
+                (int[])groupKeyOrdinals.Clone(),
+                ascOrders,
+                maxRows: 0,
+                memoryBudgetBytes: store.OperatorMemoryBudgetBytes,
+                allocateSpillPath: store.AllocateSpillFilePath);
+        }
+
+        return new SortGroupByEnumerator(child, groupKeyOrdinals, aggArray, factoryArray,
             outputMapArray, passThruArray, resolvedHaving, outputProjection);
     }
 
