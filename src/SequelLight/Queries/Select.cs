@@ -21,10 +21,26 @@ public sealed class Select : IDbEnumerator
         _source = source;
         _selectors = selectors;
 
+        var sourceProjection = source.Projection;
         var names = new QualifiedName[selectors.Length];
+        // Forward column type affinity for column-ref selectors so DATETIME columns survive
+        // a SELECT projection. Constant and computed selectors get None and the affinity
+        // array stays null when no output column has a non-default affinity.
+        ColumnTypeAffinity[]? affinities = null;
         for (int i = 0; i < selectors.Length; i++)
+        {
             names[i] = selectors[i].Name;
-        Projection = new Projection(names);
+            if (selectors[i].Kind == SelectorKind.ColumnRef)
+            {
+                var aff = sourceProjection.GetAffinity(selectors[i].SourceIndex);
+                if (aff != ColumnTypeAffinity.None)
+                {
+                    affinities ??= new ColumnTypeAffinity[selectors.Length];
+                    affinities[i] = aff;
+                }
+            }
+        }
+        Projection = new Projection(names, affinities);
         Current = new DbValue[selectors.Length];
     }
 

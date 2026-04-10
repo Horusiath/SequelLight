@@ -40,11 +40,24 @@ public sealed class TableScan : IDbEnumerator
         _prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
         _columnCount = table.Columns.Length;
 
-        // Build projection from column names
+        // Build projection from column names + per-column logical type affinity so the data
+        // reader can surface DATE / DATETIME / TIMESTAMP columns as actual DateTime values
+        // instead of raw Int64 ticks. Affinity is resolved once here from the SQL type name;
+        // a non-date column gets ColumnTypeAffinity.None and the array stays null when no
+        // column is a date type (most tables).
         var names = new QualifiedName[_columnCount];
+        ColumnTypeAffinity[]? affinities = null;
         for (int i = 0; i < _columnCount; i++)
+        {
             names[i] = new QualifiedName(null, table.Columns[i].Name);
-        Projection = new Projection(names);
+            var affinity = TypeAffinity.ResolveAffinity(table.Columns[i].TypeName);
+            if (affinity != ColumnTypeAffinity.None)
+            {
+                affinities ??= new ColumnTypeAffinity[_columnCount];
+                affinities[i] = affinity;
+            }
+        }
+        Projection = new Projection(names, affinities);
 
         // Precompute PK and value column metadata
         int pkCount = 0, valCount = 0;

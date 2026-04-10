@@ -47,13 +47,31 @@ public sealed class MergeJoin : IDbEnumerator
         _leftWidth = left.Projection.ColumnCount;
         _rightWidth = right.Projection.ColumnCount;
 
-        var names = new QualifiedName[_leftWidth + _rightWidth];
+        int total = _leftWidth + _rightWidth;
+        var names = new QualifiedName[total];
+        ColumnTypeAffinity[]? affinities = null;
         for (int i = 0; i < _leftWidth; i++)
+        {
             names[i] = left.Projection.GetQualifiedName(i);
+            var aff = left.Projection.GetAffinity(i);
+            if (aff != ColumnTypeAffinity.None)
+            {
+                affinities ??= new ColumnTypeAffinity[total];
+                affinities[i] = aff;
+            }
+        }
         for (int i = 0; i < _rightWidth; i++)
+        {
             names[_leftWidth + i] = right.Projection.GetQualifiedName(i);
-        Projection = new Projection(names);
-        Current = new DbValue[_leftWidth + _rightWidth];
+            var aff = right.Projection.GetAffinity(i);
+            if (aff != ColumnTypeAffinity.None)
+            {
+                affinities ??= new ColumnTypeAffinity[total];
+                affinities[_leftWidth + i] = aff;
+            }
+        }
+        Projection = new Projection(names, affinities);
+        Current = new DbValue[total];
     }
 
     public async ValueTask<bool> NextAsync(CancellationToken ct = default)

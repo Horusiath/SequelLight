@@ -986,6 +986,15 @@ public sealed class QueryPlanner
 
                     if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
                     {
+                        // Coerce string literals to date ticks when the indexed column has
+                        // date affinity. The picker walks the raw predicate AST so the
+                        // ResolveColumns coercion path doesn't run here — apply it inline.
+                        var aff = TypeAffinity.ResolveAffinity(table.Columns[idxCols[ic]].TypeName);
+                        if (aff != ColumnTypeAffinity.None && value.Type == DbType.Text &&
+                            DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                        {
+                            value = DbValue.Integer(ticks);
+                        }
                         seekValues[matched] = value;
                         usedConjuncts.Add(ci);
                         found = true;
@@ -1178,6 +1187,13 @@ public sealed class QueryPlanner
                     if (usedConjuncts.Contains(ci)) continue;
                     if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
                     {
+                        // Same date-affinity coercion as the regular index picker.
+                        var aff = TypeAffinity.ResolveAffinity(table.Columns[idxCols[ic]].TypeName);
+                        if (aff != ColumnTypeAffinity.None && value.Type == DbType.Text &&
+                            DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                        {
+                            value = DbValue.Integer(ticks);
+                        }
                         seekValues[matched] = value;
                         usedConjuncts.Add(ci);
                         found = true;
@@ -1379,6 +1395,13 @@ public sealed class QueryPlanner
                     if (usedConjuncts.Contains(ci)) continue;
                     if (TryExtractEquality(conjuncts[ci], table.Columns[idxCols[ic]].Name, scanProjection, out var value))
                     {
+                        // Date affinity coercion (third picker — count-only path).
+                        var aff = TypeAffinity.ResolveAffinity(table.Columns[idxCols[ic]].TypeName);
+                        if (aff != ColumnTypeAffinity.None && value.Type == DbType.Text &&
+                            DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                        {
+                            value = DbValue.Integer(ticks);
+                        }
                         seekValues[matched] = value;
                         usedConjuncts.Add(ci);
                         found = true;
@@ -1833,27 +1856,35 @@ public sealed class QueryPlanner
             ResolvedColumnExpr => expr,
             ResolvedLiteralExpr => expr,
             UnaryExpr unary => unary with { Operand = ResolveColumns(unary.Operand, projection) },
-            BinaryExpr binary => binary with
-            {
-                Left = ResolveColumns(binary.Left, projection),
-                Right = ResolveColumns(binary.Right, projection),
-            },
+            BinaryExpr binary => RewriteBinary(binary, projection),
             IsExpr isExpr => isExpr with
             {
                 Left = ResolveColumns(isExpr.Left, projection),
                 Right = ResolveColumns(isExpr.Right, projection),
             },
             NullTestExpr nullTest => nullTest with { Operand = ResolveColumns(nullTest.Operand, projection) },
-            BetweenExpr between => between with
-            {
-                Operand = ResolveColumns(between.Operand, projection),
-                Low = ResolveColumns(between.Low, projection),
-                High = ResolveColumns(between.High, projection),
-            },
+            BetweenExpr between => RewriteBetween(between, projection),
             CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
             FunctionCallExpr func => ResolveFunctionColumns(func, projection),
             _ => expr,
         };
+    }
+
+    private SqlExpr RewriteBinary(BinaryExpr binary, Projection projection)
+    {
+        var left = ResolveColumns(binary.Left, projection);
+        var right = ResolveColumns(binary.Right, projection);
+        var (l, r) = CoerceComparisonLiteralForAffinity(binary.Op, left, right, projection);
+        return binary with { Left = l, Right = r };
+    }
+
+    private SqlExpr RewriteBetween(BetweenExpr between, Projection projection)
+    {
+        var v = ResolveColumns(between.Operand, projection);
+        var lo = ResolveColumns(between.Low, projection);
+        var hi = ResolveColumns(between.High, projection);
+        var (vv, ll, hh) = CoerceBetweenLiteralsForAffinity(v, lo, hi, projection);
+        return between with { Operand = vv, Low = ll, High = hh };
     }
 
     /// <summary>
@@ -1902,8 +1933,11 @@ public sealed class QueryPlanner
                 var lTask = ResolveColumnsAsync(binary.Left, projection, tx);
                 var rTask = ResolveColumnsAsync(binary.Right, projection, tx);
                 if (lTask.IsCompletedSuccessfully && rTask.IsCompletedSuccessfully)
-                    return new ValueTask<SqlExpr>(binary with { Left = lTask.Result, Right = rTask.Result });
-                return ResolveBinaryAsync(binary, lTask, rTask);
+                {
+                    var (l, r) = CoerceComparisonLiteralForAffinity(binary.Op, lTask.Result, rTask.Result, projection);
+                    return new ValueTask<SqlExpr>(binary with { Left = l, Right = r });
+                }
+                return ResolveBinaryAsync(binary, lTask, rTask, projection);
             }
             case IsExpr isExpr:
             {
@@ -1926,8 +1960,12 @@ public sealed class QueryPlanner
                 var loTask = ResolveColumnsAsync(between.Low, projection, tx);
                 var hiTask = ResolveColumnsAsync(between.High, projection, tx);
                 if (vTask.IsCompletedSuccessfully && loTask.IsCompletedSuccessfully && hiTask.IsCompletedSuccessfully)
-                    return new ValueTask<SqlExpr>(between with { Operand = vTask.Result, Low = loTask.Result, High = hiTask.Result });
-                return ResolveBetweenAsync(between, vTask, loTask, hiTask);
+                {
+                    var (v, lo, hi) = CoerceBetweenLiteralsForAffinity(
+                        vTask.Result, loTask.Result, hiTask.Result, projection);
+                    return new ValueTask<SqlExpr>(between with { Operand = v, Low = lo, High = hi });
+                }
+                return ResolveBetweenAsync(between, vTask, loTask, hiTask, projection);
             }
             case CastExpr cast:
             {
@@ -1950,11 +1988,12 @@ public sealed class QueryPlanner
         => transform(await pending.ConfigureAwait(false));
 
     private static async ValueTask<SqlExpr> ResolveBinaryAsync(
-        BinaryExpr binary, ValueTask<SqlExpr> lTask, ValueTask<SqlExpr> rTask)
+        BinaryExpr binary, ValueTask<SqlExpr> lTask, ValueTask<SqlExpr> rTask, Projection projection)
     {
         var left = lTask.IsCompletedSuccessfully ? lTask.Result : await lTask.ConfigureAwait(false);
         var right = rTask.IsCompletedSuccessfully ? rTask.Result : await rTask.ConfigureAwait(false);
-        return binary with { Left = left, Right = right };
+        var (l, r) = CoerceComparisonLiteralForAffinity(binary.Op, left, right, projection);
+        return binary with { Left = l, Right = r };
     }
 
     private static async ValueTask<SqlExpr> ResolveIsAsync(
@@ -1966,12 +2005,75 @@ public sealed class QueryPlanner
     }
 
     private static async ValueTask<SqlExpr> ResolveBetweenAsync(
-        BetweenExpr between, ValueTask<SqlExpr> vTask, ValueTask<SqlExpr> loTask, ValueTask<SqlExpr> hiTask)
+        BetweenExpr between, ValueTask<SqlExpr> vTask, ValueTask<SqlExpr> loTask, ValueTask<SqlExpr> hiTask, Projection projection)
     {
         var val = vTask.IsCompletedSuccessfully ? vTask.Result : await vTask.ConfigureAwait(false);
         var lo = loTask.IsCompletedSuccessfully ? loTask.Result : await loTask.ConfigureAwait(false);
         var hi = hiTask.IsCompletedSuccessfully ? hiTask.Result : await hiTask.ConfigureAwait(false);
-        return between with { Operand = val, Low = lo, High = hi };
+        var (v, l2, h2) = CoerceBetweenLiteralsForAffinity(val, lo, hi, projection);
+        return between with { Operand = v, Low = l2, High = h2 };
+    }
+
+    /// <summary>
+    /// When a comparison binary operator has a column reference into a date-affinity column
+    /// on one side and a string literal on the other, parse the literal as a date at plan
+    /// time and replace it with an Int64 ticks constant. This makes the runtime comparison
+    /// Int64 vs Int64 (correct semantics) and lets the index-scan picker recognize the
+    /// rewritten predicate as a usable range bound.
+    /// </summary>
+    private static (SqlExpr Left, SqlExpr Right) CoerceComparisonLiteralForAffinity(
+        BinaryOp op, SqlExpr left, SqlExpr right, Projection projection)
+    {
+        if (op is not (BinaryOp.Equal or BinaryOp.NotEqual or BinaryOp.LessThan
+            or BinaryOp.LessEqual or BinaryOp.GreaterThan or BinaryOp.GreaterEqual))
+            return (left, right);
+
+        if (left is ResolvedColumnExpr lc && right is ResolvedLiteralExpr rl)
+        {
+            var coerced = TryCoerceTextLiteralForAffinity(rl.Value, projection.GetAffinity(lc.Ordinal));
+            if (coerced is { } v)
+                return (left, new ResolvedLiteralExpr(v));
+        }
+        else if (left is ResolvedLiteralExpr ll && right is ResolvedColumnExpr rc)
+        {
+            var coerced = TryCoerceTextLiteralForAffinity(ll.Value, projection.GetAffinity(rc.Ordinal));
+            if (coerced is { } v)
+                return (new ResolvedLiteralExpr(v), right);
+        }
+        return (left, right);
+    }
+
+    /// <summary>
+    /// BETWEEN extension of <see cref="CoerceComparisonLiteralForAffinity"/>: when the
+    /// operand is a date column, parse string-literal Low/High bounds as dates.
+    /// </summary>
+    private static (SqlExpr Operand, SqlExpr Low, SqlExpr High) CoerceBetweenLiteralsForAffinity(
+        SqlExpr operand, SqlExpr low, SqlExpr high, Projection projection)
+    {
+        if (operand is not ResolvedColumnExpr col) return (operand, low, high);
+        var affinity = projection.GetAffinity(col.Ordinal);
+        if (affinity == ColumnTypeAffinity.None) return (operand, low, high);
+
+        if (low is ResolvedLiteralExpr lLow)
+        {
+            var coerced = TryCoerceTextLiteralForAffinity(lLow.Value, affinity);
+            if (coerced is { } v) low = new ResolvedLiteralExpr(v);
+        }
+        if (high is ResolvedLiteralExpr lHigh)
+        {
+            var coerced = TryCoerceTextLiteralForAffinity(lHigh.Value, affinity);
+            if (coerced is { } v) high = new ResolvedLiteralExpr(v);
+        }
+        return (operand, low, high);
+    }
+
+    private static DbValue? TryCoerceTextLiteralForAffinity(DbValue literal, ColumnTypeAffinity affinity)
+    {
+        if (affinity == ColumnTypeAffinity.None) return null;
+        if (literal.IsNull || literal.Type != DbType.Text) return null;
+        return DateTimeHelper.TryParseToTicks(literal.AsBytes().Span, out long ticks)
+            ? DbValue.Integer(ticks)
+            : null;
     }
 
     private async ValueTask<SqlExpr> ResolveFunctionColumnsAsync(

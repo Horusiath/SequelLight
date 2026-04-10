@@ -243,7 +243,7 @@ static async Task ExecuteAsync(SequelLightConnection connection, string sql, Can
                 {
                     cells[i] = reader.IsDBNull(i)
                         ? "[dim]NULL[/]"
-                        : Markup.Escape(reader.GetValue(i)?.ToString() ?? "");
+                        : Markup.Escape(FormatCell(reader.GetValue(i)));
                 }
                 table.AddRow(cells);
                 rowCount++;
@@ -284,4 +284,16 @@ static string FormatElapsed(TimeSpan elapsed)
     if (elapsed.TotalSeconds < 1)
         return $"{elapsed.TotalMilliseconds:F1}ms";
     return $"{elapsed.TotalSeconds:F2}s";
+}
+
+static string FormatCell(object? value)
+{
+    if (value is null) return "";
+    // Render dates in stable ISO format regardless of host culture. The data reader returns
+    // a DateTime for columns whose declared type has DATE / DATETIME / TIMESTAMP affinity.
+    if (value is DateTime dt)
+        return dt.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+    if (value is byte[] bytes)
+        return "0x" + Convert.ToHexString(bytes);
+    return value.ToString() ?? "";
 }

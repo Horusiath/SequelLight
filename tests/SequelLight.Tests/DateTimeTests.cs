@@ -253,4 +253,233 @@ public class DateTimeQueryTests : TempDirTest
         Assert.True(reader.IsDBNull(0));
         Assert.True(reader.IsDBNull(1));
     }
+
+    [Fact]
+    public async Task GetValue_Returns_DateTime_For_Datetime_Column()
+    {
+        // Regression: previously GetValue returned the raw Int64 ticks for date columns,
+        // which made CLI/ADO.NET callers print integers instead of formatted dates.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE events (id INTEGER PRIMARY KEY, ts DATETIME, label TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO events VALUES (1, '2024-06-15 14:30:45', 'launch')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id, ts, label FROM events";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        // GetValue should surface the date column as a DateTime, while id stays long and
+        // label stays string.
+        Assert.Equal(1L, reader.GetValue(0));
+        var ts = reader.GetValue(1);
+        Assert.IsType<DateTime>(ts);
+        Assert.Equal(new DateTime(2024, 6, 15, 14, 30, 45, DateTimeKind.Utc), (DateTime)ts);
+        Assert.Equal("launch", reader.GetValue(2));
+
+        // GetFieldType reflects the same.
+        Assert.Equal(typeof(long), reader.GetFieldType(0));
+        Assert.Equal(typeof(DateTime), reader.GetFieldType(1));
+        Assert.Equal(typeof(string), reader.GetFieldType(2));
+
+        // GetDataTypeName surfaces the SQL declared type.
+        Assert.Equal("DATETIME", reader.GetDataTypeName(1));
+    }
+
+    [Fact]
+    public async Task GetValue_Date_Type_Survives_Projection()
+    {
+        // SELECT ... ts FROM events should still surface ts as DateTime even after a
+        // Project node, because Select propagates declared types for column-ref selectors.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE events (id INTEGER PRIMARY KEY, ts DATE)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO events VALUES (1, '2024-06-15')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT ts FROM events";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        Assert.IsType<DateTime>(reader.GetValue(0));
+        Assert.Equal(new DateTime(2024, 6, 15), (DateTime)reader.GetValue(0));
+        Assert.Equal("DATE", reader.GetDataTypeName(0));
+    }
+
+    [Fact]
+    public async Task GetValue_Date_Type_Survives_Join()
+    {
+        // After a join, the right-side date column should still surface as DateTime.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE e (id INTEGER PRIMARY KEY, user_id INTEGER, ts DATETIME)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO u VALUES (1, 'alice')";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO e VALUES (10, 1, '2024-06-15 14:30:45')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT u.name, e.ts FROM u INNER JOIN e ON u.id = e.user_id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        Assert.Equal("alice", reader.GetValue(0));
+        var ts = reader.GetValue(1);
+        Assert.IsType<DateTime>(ts);
+        Assert.Equal(new DateTime(2024, 6, 15, 14, 30, 45, DateTimeKind.Utc), (DateTime)ts);
+    }
+
+    [Fact]
+    public async Task Where_String_Literal_Compared_Against_Date_Column_TableScan()
+    {
+        // SQLite-style: a date column compared against a string literal in WHERE should
+        // coerce the literal to a date value for the comparison. Verify both directions
+        // (>, <) over a table scan (no index).
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE orders (id INTEGER PRIMARY KEY, order_date DATE)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = @"INSERT INTO orders VALUES
+            (1, '1996-05-01'),
+            (2, '1996-07-15'),
+            (3, '1996-07-16'),
+            (4, '1996-07-17'),
+            (5, '1996-12-31'),
+            (6, '1997-01-01')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date > '1996-07-16' ORDER BY id";
+        var greater = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                greater.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 4, 5, 6 }, greater);
+
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date < '1996-07-16' ORDER BY id";
+        var less = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                less.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 1, 2 }, less);
+
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date = '1996-07-16'";
+        var equal = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                equal.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 3 }, equal);
+
+        cmd.CommandText = @"SELECT id FROM orders
+            WHERE order_date >= '1996-07-16' AND order_date <= '1996-12-31'
+            ORDER BY id";
+        var range = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                range.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 3, 4, 5 }, range);
+    }
+
+    [Fact]
+    public async Task Where_String_Literal_Compared_Against_Date_Column_IndexScan()
+    {
+        // Same as above but the date column has an index. Two things to verify:
+        //  1. An EQUALITY predicate against a string literal must be coerced to a date so the
+        //     index picker recognizes the predicate and uses the index for the seek. Verified
+        //     via EXPLAIN.
+        //  2. RANGE predicates against string literals must still produce the right rows
+        //     regardless of which scan strategy the planner picks (the current planner
+        //     doesn't do range index seeks for any column type, so this exercises the
+        //     filter-over-scan fallback — but the result must still be correct).
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE orders (id INTEGER PRIMARY KEY, order_date DATE)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_order_date ON orders (order_date)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = @"INSERT INTO orders VALUES
+            (1, '1996-05-01'),
+            (2, '1996-07-15'),
+            (3, '1996-07-16'),
+            (4, '1996-07-17'),
+            (5, '1996-12-31'),
+            (6, '1997-01-01')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Equality query: the planner must pick the index because the rewritten predicate
+        // is now `order_date = <ticks>`, which is the leading-equality form the picker
+        // recognizes. Without the date coercion this would be `order_date = '1996-07-16'`
+        // (Text literal), which the picker can't match against an Int64 index column.
+        cmd.CommandText = "EXPLAIN SELECT id FROM orders WHERE order_date = '1996-07-16'";
+        var planRows = new List<string>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                planRows.Add(reader.GetString(2));
+        Assert.Contains(planRows, p => p.Contains("INDEX", StringComparison.OrdinalIgnoreCase));
+
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date = '1996-07-16'";
+        var equal = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                equal.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 3 }, equal);
+
+        // Range queries: results must be correct. The planner currently has no range
+        // index seek support, so it falls back to filter-over-scan; that's fine, the
+        // important guarantee is that the date coercion makes the comparison correct.
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date > '1996-07-16' ORDER BY id";
+        var greater = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                greater.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 4, 5, 6 }, greater);
+
+        cmd.CommandText = "SELECT id FROM orders WHERE order_date < '1996-07-16' ORDER BY id";
+        var less = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                less.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 1, 2 }, less);
+
+        cmd.CommandText = @"SELECT id FROM orders
+            WHERE order_date >= '1996-07-16' AND order_date <= '1996-12-31'
+            ORDER BY id";
+        var range = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                range.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 3, 4, 5 }, range);
+    }
+
+    [Fact]
+    public async Task Where_String_Literal_Compared_Against_Date_Column_Between()
+    {
+        // BETWEEN with two string literal bounds against a date column must coerce both
+        // bounds to ticks. Exercises the BetweenExpr branch of the planner coercion.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE orders (id INTEGER PRIMARY KEY, order_date DATE)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = @"INSERT INTO orders VALUES
+            (1, '1996-05-01'),
+            (2, '1996-07-15'),
+            (3, '1996-07-16'),
+            (4, '1996-07-17'),
+            (5, '1996-12-31'),
+            (6, '1997-01-01')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = @"SELECT id FROM orders
+            WHERE order_date BETWEEN '1996-07-16' AND '1996-12-31'
+            ORDER BY id";
+        var rows = new List<long>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+            while (await reader.ReadAsync())
+                rows.Add(reader.GetInt64(0));
+        Assert.Equal(new long[] { 3, 4, 5 }, rows);
+    }
 }

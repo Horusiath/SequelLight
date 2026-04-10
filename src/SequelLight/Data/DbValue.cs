@@ -17,6 +17,21 @@ public enum DbType : byte
     Text = 11,
 }
 
+/// <summary>
+/// Logical type affinity attached to a projection column. Distinct from <see cref="DbType"/>:
+/// the physical type of a date column is <see cref="DbType.Int64"/> (ticks), but its logical
+/// affinity is one of the <c>Date</c> / <c>DateTime</c> / <c>Timestamp</c> values below so the
+/// data reader can surface it as a CLR <see cref="System.DateTime"/> instead of a raw long.
+/// One byte per projection column; <c>None</c> means "use the physical type as-is".
+/// </summary>
+public enum ColumnTypeAffinity : byte
+{
+    None = 0,
+    Date = 1,
+    DateTime = 2,
+    Timestamp = 3,
+}
+
 public static class DbTypeExtensions
 {
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -79,6 +94,22 @@ public static class TypeAffinity
         var span = typeName.AsSpan();
         return Contains(span, "DATETIME") || Contains(span, "TIMESTAMP")
             || (Contains(span, "DATE") && !Contains(span, "UP"));
+    }
+
+    /// <summary>
+    /// Maps a SQL declared type name to a <see cref="ColumnTypeAffinity"/> value. Used by
+    /// <see cref="SequelLight.Queries.TableScan"/> when building its output projection so the
+    /// data reader can later surface DATE / DATETIME / TIMESTAMP columns as CLR DateTime.
+    /// Returns <see cref="ColumnTypeAffinity.None"/> for non-date types or null input.
+    /// </summary>
+    public static ColumnTypeAffinity ResolveAffinity(string? typeName)
+    {
+        if (typeName is null) return ColumnTypeAffinity.None;
+        var span = typeName.AsSpan();
+        if (Contains(span, "DATETIME")) return ColumnTypeAffinity.DateTime;
+        if (Contains(span, "TIMESTAMP")) return ColumnTypeAffinity.Timestamp;
+        if (Contains(span, "DATE") && !Contains(span, "UP")) return ColumnTypeAffinity.Date;
+        return ColumnTypeAffinity.None;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

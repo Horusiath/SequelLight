@@ -51,6 +51,10 @@ public sealed class SequelLightDataReader : DbDataReader
         var value = GetDbValue(ordinal);
         if (value.IsNull) return DBNull.Value;
         var t = value.Type;
+        // DATETIME / DATE / TIMESTAMP columns are stored as Int64 ticks but should be
+        // surfaced as actual DateTime values to callers (CLI, ADO.NET consumers, etc.).
+        if (t.IsInteger() && _enumerator.Projection.GetAffinity(ordinal) != ColumnTypeAffinity.None)
+            return Data.DateTimeHelper.TicksToDateTime(value.AsInteger());
         if (t.IsInteger()) return value.AsInteger();
         if (t == DbType.Float64) return value.AsReal();
         if (t == DbType.Text) return Encoding.UTF8.GetString(value.AsText().Span);
@@ -100,6 +104,18 @@ public sealed class SequelLightDataReader : DbDataReader
 
     public override string GetDataTypeName(int ordinal)
     {
+        // Prefer the column's logical affinity when set so callers see "DATETIME" instead of
+        // the underlying physical type "Int64".
+        var affinity = _enumerator.Projection.GetAffinity(ordinal);
+        if (affinity != ColumnTypeAffinity.None)
+            return affinity switch
+            {
+                ColumnTypeAffinity.Date => "DATE",
+                ColumnTypeAffinity.DateTime => "DATETIME",
+                ColumnTypeAffinity.Timestamp => "TIMESTAMP",
+                _ => affinity.ToString(),
+            };
+
         if (!_hasRow) return "NULL";
         var value = _enumerator.Current[ordinal];
         return value.IsNull ? "NULL" : value.Type.ToString();
@@ -107,6 +123,9 @@ public sealed class SequelLightDataReader : DbDataReader
 
     public override Type GetFieldType(int ordinal)
     {
+        if (_enumerator.Projection.GetAffinity(ordinal) != ColumnTypeAffinity.None)
+            return typeof(DateTime);
+
         if (!_hasRow) return typeof(object);
         var value = _enumerator.Current[ordinal];
         if (value.IsNull) return typeof(object);
