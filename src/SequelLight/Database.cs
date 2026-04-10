@@ -1001,14 +1001,20 @@ public sealed class DatabasePool
     /// Acquires a reference to the database at the given directory.
     /// If no database is open for that path, one is created and opened in a thread-safe manner.
     /// The caller must call <see cref="ReleaseAsync"/> when done.
+    /// <para>
+    /// <paramref name="operatorMemoryBudgetBytes"/> sets the per-operator spill threshold for
+    /// the underlying LsmStore. A value of 0 falls back to the LsmStore default. Note: only the
+    /// first acquirer for a given directory wires the budget — subsequent acquirers share the
+    /// already-open store.
+    /// </para>
     /// </summary>
-    internal async ValueTask<Database> AcquireAsync(string directory, int queryCacheCapacity = 256)
+    internal async ValueTask<Database> AcquireAsync(string directory, int queryCacheCapacity = 256, long operatorMemoryBudgetBytes = 0)
     {
         var fullPath = Path.GetFullPath(directory);
 
         while (true)
         {
-            var slot = _databases.GetOrAdd(fullPath, path => new DatabaseSlot(path, queryCacheCapacity));
+            var slot = _databases.GetOrAdd(fullPath, path => new DatabaseSlot(path, queryCacheCapacity, operatorMemoryBudgetBytes));
             var acquired = slot.Acquire();
 
             if (acquired <= 0)
@@ -1058,14 +1064,16 @@ public sealed class DatabasePool
     {
         private readonly string _directory;
         private readonly int _queryCacheCapacity;
+        private readonly long _operatorMemoryBudgetBytes;
         private readonly TaskCompletionSource<Database> _initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _refCount;
         private int _initializing;
 
-        public DatabaseSlot(string directory, int queryCacheCapacity)
+        public DatabaseSlot(string directory, int queryCacheCapacity, long operatorMemoryBudgetBytes)
         {
             _directory = directory;
             _queryCacheCapacity = queryCacheCapacity;
+            _operatorMemoryBudgetBytes = operatorMemoryBudgetBytes;
         }
 
         /// <summary>
@@ -1090,7 +1098,14 @@ public sealed class DatabasePool
             {
                 try
                 {
-                    var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = _directory }).ConfigureAwait(false);
+                    var options = _operatorMemoryBudgetBytes > 0
+                        ? new LsmStoreOptions
+                        {
+                            Directory = _directory,
+                            OperatorMemoryBudgetBytes = _operatorMemoryBudgetBytes,
+                        }
+                        : new LsmStoreOptions { Directory = _directory };
+                    var store = await LsmStore.OpenAsync(options).ConfigureAwait(false);
                     var db = new Database(store, _directory, _queryCacheCapacity);
                     await db.LoadSchemaAsync().ConfigureAwait(false);
                     _initialized.TrySetResult(db);

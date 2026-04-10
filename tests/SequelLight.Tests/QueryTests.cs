@@ -2258,6 +2258,97 @@ public class OrderByTests : TempDirTest
         await using var reader = await cmd.ExecuteReaderAsync();
         Assert.False(await reader.ReadAsync());
     }
+
+    [Fact]
+    public async Task OrderBy_Spills_When_Operator_Memory_Budget_Is_Tiny()
+    {
+        // Force the SortEnumerator into its spill path by setting a 1 KiB per-operator budget.
+        // The result must still be globally sorted, with all rows preserved.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        const int N = 500;
+        // Insert in shuffled order; ORDER BY label ASC must produce alphabetic ordering
+        // regardless of insert order. Labels are unique-padded so the sort key is unambiguous.
+        var rng = new Random(1234);
+        var indices = Enumerable.Range(0, N).ToArray();
+        for (int i = indices.Length - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (indices[i], indices[j]) = (indices[j], indices[i]);
+        }
+        foreach (var k in indices)
+        {
+            cmd.CommandText = $"INSERT INTO t VALUES ({k}, 'lbl_{k:D4}')";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        cmd.CommandText = "SELECT id, label FROM t ORDER BY label ASC";
+        var rows = new List<(long, string)>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                rows.Add((reader.GetInt64(0), reader.GetString(1)));
+        }
+
+        Assert.Equal(N, rows.Count);
+        for (int i = 0; i < N; i++)
+        {
+            Assert.Equal((long)i, rows[i].Item1);
+            Assert.Equal($"lbl_{i:D4}", rows[i].Item2);
+        }
+
+        // After the reader is disposed, the SortEnumerator's spill files must be cleaned up.
+        var tmpDir = Path.Combine(TempDir, "tmp");
+        if (Directory.Exists(tmpDir))
+            Assert.Empty(Directory.GetFiles(tmpDir, "spill_*.sst"));
+    }
+
+    [Fact]
+    public async Task OrderBy_Spilling_Multi_Column_Composite_Desc()
+    {
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=512";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 200 rows across 4 groups, with shuffled name strings.
+        var rng = new Random(99);
+        for (int i = 0; i < 200; i++)
+        {
+            int grp = i % 4;
+            string name = $"n{rng.Next(0, 1000):D4}";
+            cmd.CommandText = $"INSERT INTO t VALUES ({i}, {grp}, '{name}')";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        // ORDER BY grp ASC, name DESC — composite, mixed direction.
+        cmd.CommandText = "SELECT grp, name FROM t ORDER BY grp ASC, name DESC";
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        var rows = new List<(long, string)>();
+        while (await reader.ReadAsync())
+            rows.Add((reader.GetInt64(0), reader.GetString(1)));
+
+        Assert.Equal(200, rows.Count);
+        for (int i = 1; i < rows.Count; i++)
+        {
+            // Within a group, name should be DESC. Across groups, grp should be ASC.
+            if (rows[i - 1].Item1 == rows[i].Item1)
+                Assert.True(string.CompareOrdinal(rows[i - 1].Item2, rows[i].Item2) >= 0,
+                    $"row {i - 1} name '{rows[i - 1].Item2}' should be >= row {i} name '{rows[i].Item2}' within group {rows[i].Item1}");
+            else
+                Assert.True(rows[i - 1].Item1 < rows[i].Item1, "groups should be ASC");
+        }
+    }
 }
 
 public class LimitTests : TempDirTest

@@ -18,6 +18,14 @@ public sealed class LsmStoreOptions
     /// subdirectory of <see cref="Directory"/>.
     /// </summary>
     public string? TempDirectory { get; init; }
+
+    /// <summary>
+    /// Per-operator memory budget for spilling consumers (sort, distinct, group-by, hash-join,
+    /// transaction overflow). Each <see cref="SpillBuffer"/> instance gets its own budget of
+    /// this size; queries with multiple concurrent spilling operators may use multiples.
+    /// Modeled after Postgres <c>work_mem</c>.
+    /// </summary>
+    public long OperatorMemoryBudgetBytes { get; init; } = 16 * 1024 * 1024; // 16 MiB
 }
 
 /// <summary>
@@ -63,11 +71,14 @@ public sealed class LsmStore : IAsyncDisposable
     /// Allocates a unique path under the temp directory for a new spill file. The caller owns
     /// the file and is responsible for deleting it when done.
     /// </summary>
-    internal string AllocateSpillFilePath()
+    public string AllocateSpillFilePath()
     {
         long id = Interlocked.Increment(ref _nextSpillId);
         return Path.Combine(_tempDirectory, $"spill_{id:D10}.sst");
     }
+
+    /// <summary>Per-operator memory budget for spilling operators. See <see cref="LsmStoreOptions.OperatorMemoryBudgetBytes"/>.</summary>
+    public long OperatorMemoryBudgetBytes => _options.OperatorMemoryBudgetBytes;
 
     public static async ValueTask<LsmStore> OpenAsync(LsmStoreOptions options)
     {
@@ -430,6 +441,12 @@ public class ReadOnlyTransaction : IDisposable, IAsyncDisposable
         Snapshot = snapshot;
         SSTables = sstables;
     }
+
+    /// <summary>
+    /// Access to the owning store. Used by physical operators to allocate spill files
+    /// and read the configured per-operator memory budget.
+    /// </summary>
+    internal LsmStore OwningStore => Store;
 
     public virtual async ValueTask<byte[]?> GetAsync(byte[] key)
         => await GetAsync(key.AsMemory()).ConfigureAwait(false);

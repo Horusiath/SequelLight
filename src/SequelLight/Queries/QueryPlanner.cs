@@ -422,7 +422,7 @@ public sealed class QueryPlanner
             long maxRows = 0;
             if (limitPlan is not null)
                 maxRows = EvaluateLimitForTopN(limitPlan);
-            result = BuildSortEnumerator(result, orderBy, maxRows);
+            result = BuildSortEnumerator(result, orderBy, maxRows, tx);
             return limitPlan is not null ? BuildLimitEnumerator(limitPlan, result) : result;
         }
 
@@ -438,7 +438,7 @@ public sealed class QueryPlanner
             long maxRows = 0;
             if (limitPlan is not null)
                 maxRows = EvaluateLimitForTopN(limitPlan);
-            source = BuildSortEnumerator(source, orderBy, maxRows);
+            source = BuildSortEnumerator(source, orderBy, maxRows, tx);
         }
 
         // Apply the final projection
@@ -2321,7 +2321,7 @@ public sealed class QueryPlanner
         return satisfied;
     }
 
-    private SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0)
+    private SortEnumerator BuildSortEnumerator(IDbEnumerator source, OrderingTerm[] orderBy, long maxRows = 0, ReadOnlyTransaction? tx = null)
     {
         var ordinals = new int[orderBy.Length];
         var orders = new SortOrder[orderBy.Length];
@@ -2341,7 +2341,18 @@ public sealed class QueryPlanner
             orders[i] = term.Order ?? SortOrder.Asc;
         }
 
-        return new SortEnumerator(source, ordinals, orders, maxRows);
+        // Top-N sorts use a bounded heap and never need to spill.
+        if (maxRows > 0 || tx is null)
+            return new SortEnumerator(source, ordinals, orders, maxRows);
+
+        var store = tx.OwningStore;
+        return new SortEnumerator(
+            source,
+            ordinals,
+            orders,
+            maxRows: 0,
+            memoryBudgetBytes: store.OperatorMemoryBudgetBytes,
+            allocateSpillPath: store.AllocateSpillFilePath);
     }
 
     private Selector ResolveExprSelector(ExprResultColumn exprCol, Projection sourceProjection, ReadOnlyTransaction? tx = null)

@@ -12,6 +12,7 @@ public sealed class SequelLightConnection : DbConnection
     private string _connectionString = string.Empty;
     private string _directory = string.Empty;
     private int _queryCacheSize = 256;
+    private long _operatorMemoryBudgetBytes;
     private Database? _database;
     private ConnectionState _state = ConnectionState.Closed;
 
@@ -35,6 +36,7 @@ public sealed class SequelLightConnection : DbConnection
             _connectionString = value ?? string.Empty;
             _directory = ParseDirectory(_connectionString);
             _queryCacheSize = ParseQueryCacheSize(_connectionString);
+            _operatorMemoryBudgetBytes = ParseOperatorMemoryBudget(_connectionString);
         }
     }
 
@@ -54,7 +56,7 @@ public sealed class SequelLightConnection : DbConnection
         _state = ConnectionState.Connecting;
         try
         {
-            _database = await DatabasePool.Shared.AcquireAsync(_directory, _queryCacheSize).ConfigureAwait(false);
+            _database = await DatabasePool.Shared.AcquireAsync(_directory, _queryCacheSize, _operatorMemoryBudgetBytes).ConfigureAwait(false);
             _state = ConnectionState.Open;
         }
         catch
@@ -187,5 +189,35 @@ public sealed class SequelLightConnection : DbConnection
         }
 
         return 256;
+    }
+
+    /// <summary>
+    /// Parses the per-operator memory budget (in bytes) from a connection string. Used by
+    /// spilling operators (sort, distinct, group-by, hash-join, transaction overflow) as the
+    /// in-memory threshold before spilling to disk. Supports
+    /// "Operator Memory Budget=N". A value of 0 (or unspecified) means "use the LsmStore
+    /// default" (see <see cref="Storage.LsmStoreOptions.OperatorMemoryBudgetBytes"/>).
+    /// </summary>
+    internal static long ParseOperatorMemoryBudget(string connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+            return 0;
+
+        foreach (var part in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = part.AsSpan().Trim();
+            var eqIdx = trimmed.IndexOf('=');
+            if (eqIdx < 0) continue;
+
+            var key = trimmed[..eqIdx].Trim();
+            var value = trimmed[(eqIdx + 1)..].Trim();
+
+            if (key.Equals("Operator Memory Budget", StringComparison.OrdinalIgnoreCase))
+            {
+                return long.TryParse(value, out long bytes) ? Math.Max(0, bytes) : 0;
+            }
+        }
+
+        return 0;
     }
 }
