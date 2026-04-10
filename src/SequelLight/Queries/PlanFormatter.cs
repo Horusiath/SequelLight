@@ -123,14 +123,36 @@ internal static class PlanFormatter
 
     private static string FormatScan(TableScan scan)
     {
-        // Check if projection has a qualified table alias that differs from the table name
+        // Discover the optional alias once — used by both the unbounded and the bounded
+        // formatting branches.
+        string? alias = null;
         if (scan.Projection.ColumnCount > 0)
         {
             var qn = scan.Projection.GetQualifiedName(0);
             if (qn.Table is not null && !string.Equals(qn.Table, scan.Table.Name, StringComparison.OrdinalIgnoreCase))
-                return $"SCAN {scan.Table.Name} AS {qn.Table}";
+                alias = qn.Table;
         }
-        return $"SCAN {scan.Table.Name}";
+
+        // Bounded scans (PK seek / PK range) are rendered with SQLite's "SEARCH ... USING"
+        // vocabulary so the EXPLAIN output is directly comparable across the two engines.
+        if (scan.IsBounded)
+        {
+            var sb = new StringBuilder("SEARCH ");
+            sb.Append(scan.Table.Name);
+            if (alias is not null) sb.Append(" AS ").Append(alias);
+            sb.Append(" USING PRIMARY KEY");
+            if (scan.BoundPredicate is not null)
+            {
+                sb.Append(" (");
+                SqlWriter.AppendExpr(sb, UnresolveExpr(scan.BoundPredicate, scan.Projection));
+                sb.Append(')');
+            }
+            return sb.ToString();
+        }
+
+        return alias is not null
+            ? $"SCAN {scan.Table.Name} AS {alias}"
+            : $"SCAN {scan.Table.Name}";
     }
 
     private static string FormatFilter(Filter filter)

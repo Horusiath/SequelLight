@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using SequelLight.Data;
+using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
 using SequelLight.Storage;
 
@@ -9,13 +10,33 @@ namespace SequelLight.Queries;
 /// Reads rows from a single table via Cursor. Seeks to the table's Oid prefix,
 /// iterates forward, decodes key+value into the reusable row buffer.
 /// Stops when the Oid prefix changes.
+/// <para>
+/// Optional bounds: when <paramref name="lowerBoundInclusive"/> is supplied (via the
+/// constructor) the scan starts at that key instead of the table prefix; when
+/// <paramref name="upperBoundExclusive"/> is supplied the scan terminates as soon as
+/// the cursor key is &gt;= that bound. The planner uses bounds to express PK seeks and
+/// PK range scans without a separate operator type — the iteration model is identical.
+/// </para>
 /// </summary>
 public sealed class TableScan : IDbEnumerator
 {
     private readonly Cursor _cursor;
     private readonly TableSchema _table;
     private readonly byte[] _prefix;
+    private readonly byte[] _seekStart;          // either _prefix or a caller-supplied lower bound
+    private readonly byte[]? _upperBoundExclusive;
     private bool _seeked;
+
+    /// <summary>
+    /// Original WHERE conjuncts that the planner folded into <see cref="_seekStart"/> /
+    /// <see cref="_upperBoundExclusive"/>. Used purely by EXPLAIN to render the bound as
+    /// a human-readable predicate (<c>SEARCH t USING PRIMARY KEY (id = 500)</c>). Null on
+    /// unbounded scans.
+    /// </summary>
+    internal SqlExpr? BoundPredicate { get; }
+
+    /// <summary>True iff this scan was constructed with a non-default lower or upper bound.</summary>
+    internal bool IsBounded => _upperBoundExclusive is not null || !ReferenceEquals(_seekStart, _prefix);
 
     // Precomputed encoding metadata
     private readonly int _columnCount;
@@ -33,11 +54,19 @@ public sealed class TableScan : IDbEnumerator
     public Projection Projection { get; }
     public DbValue[] Current { get; }
 
-    public TableScan(Cursor cursor, TableSchema table)
+    public TableScan(
+        Cursor cursor,
+        TableSchema table,
+        byte[]? lowerBoundInclusive = null,
+        byte[]? upperBoundExclusive = null,
+        SqlExpr? boundPredicate = null)
     {
         _cursor = cursor;
         _table = table;
         _prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
+        _seekStart = lowerBoundInclusive ?? _prefix;
+        _upperBoundExclusive = upperBoundExclusive;
+        BoundPredicate = boundPredicate;
         _columnCount = table.Columns.Length;
 
         // Build projection from column names. Per-value type information (including the
@@ -90,7 +119,7 @@ public sealed class TableScan : IDbEnumerator
         if (!_seeked)
         {
             _seeked = true;
-            advanceTask = _cursor.SeekAsync(_prefix);
+            advanceTask = _cursor.SeekAsync(_seekStart);
         }
         else
         {
@@ -111,6 +140,12 @@ public sealed class TableScan : IDbEnumerator
         while (_cursor.IsValid)
         {
             var key = _cursor.CurrentKey.Span;
+
+            // Upper bound check (PK range/point seeks). When set, terminate as soon as we
+            // reach a key at or past the exclusive upper bound — also subsumes the Oid
+            // prefix termination because the upper bound never crosses table boundaries.
+            if (_upperBoundExclusive is not null && key.SequenceCompareTo(_upperBoundExclusive) >= 0)
+                return new ValueTask<bool>(false);
 
             // Check Oid prefix still matches
             if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != _table.Oid.Value)
@@ -143,6 +178,9 @@ public sealed class TableScan : IDbEnumerator
         {
             var key = _cursor.CurrentKey.Span;
 
+            if (_upperBoundExclusive is not null && key.SequenceCompareTo(_upperBoundExclusive) >= 0)
+                return false;
+
             if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != _table.Oid.Value)
                 return false;
 
@@ -169,6 +207,9 @@ public sealed class TableScan : IDbEnumerator
         while (_cursor.IsValid)
         {
             var key = _cursor.CurrentKey.Span;
+
+            if (_upperBoundExclusive is not null && key.SequenceCompareTo(_upperBoundExclusive) >= 0)
+                return false;
 
             if (key.Length < 4 || BinaryPrimitives.ReadUInt32BigEndian(key) != _table.Oid.Value)
                 return false;

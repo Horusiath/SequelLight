@@ -638,13 +638,22 @@ public sealed class QueryPlanner
 
             case FilterPlan filter:
             {
-                // Try index scan when filtering a table scan
+                // 1. Try a primary-key bounded scan first — collapses `WHERE pk = X` and
+                //    `WHERE pk <range>` from a full table scan into a cursor seek.
+                if (filter.Source is ScanPlan scanForPk)
+                {
+                    var pkResult = TryBuildPrimaryKeyScan(scanForPk, filter, tx);
+                    if (pkResult is not null)
+                        return pkResult;
+                }
+                // 2. Then try a secondary index scan when one exists.
                 if (filter.Source is ScanPlan scanForIndex && scanForIndex.Table.IndexCount > 0)
                 {
                     var indexResult = TryBuildIndexScan(scanForIndex, filter, tx);
                     if (indexResult is not null)
                         return indexResult;
                 }
+                // 3. Fallback: full scan + filter.
                 var child = BuildPhysical(filter.Source, tx);
                 var resolved = ResolveColumnsSync(filter.Predicate, child.Projection, tx);
                 return new Filter(child, resolved);
@@ -1099,6 +1108,325 @@ public sealed class QueryPlanner
             eq.Left is LiteralExpr or ResolvedLiteralExpr)
         {
             value = eq.Left is ResolvedLiteralExpr rl2 ? rl2.Value : ExprEvaluator.EvaluateLiteral((LiteralExpr)eq.Left);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Tries to convert a WHERE filter on a table scan into a bounded <see cref="TableScan"/>
+    /// that uses the primary key for an exact-row seek or a key-range scan, instead of
+    /// scanning every row in the table and applying the filter.
+    /// <para>
+    /// Matches a leading run of equality conjuncts on PK columns; if every PK column has an
+    /// equality predicate the result is a single-row point seek. If the equality run stops
+    /// short and the next PK column has a comparison conjunct (<c>&lt;</c>, <c>&lt;=</c>,
+    /// <c>&gt;</c>, <c>&gt;=</c>), that becomes a half-/closed range. Conjuncts that don't
+    /// participate in the bound are kept as a residual <see cref="Filter"/> wrapping the
+    /// bounded scan.
+    /// </para>
+    /// </summary>
+    private IDbEnumerator? TryBuildPrimaryKeyScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        table.EnsureEncodingMetadata();
+        var pkIndices = table.PkColumnIndices;
+        var pkTypes = table.PkColumnTypes;
+        if (pkIndices.Length == 0)
+            return null;
+
+        // Build a projection over the table columns so the conjunct extractors can resolve
+        // column references.
+        var names = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(names);
+
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+
+        // Phase 1: leading equality match against the PK column prefix.
+        var eqValues = new DbValue[pkIndices.Length];
+        int eqMatched = 0;
+        // Tracks conjunct indices that have been folded into the bound (so they don't end
+        // up in the residual Filter).
+        Span<bool> usedConjuncts = conjuncts.Count <= 32
+            ? stackalloc bool[conjuncts.Count]
+            : new bool[conjuncts.Count];
+
+        for (int pk = 0; pk < pkIndices.Length; pk++)
+        {
+            var pkColName = table.Columns[pkIndices[pk]].Name;
+            bool found = false;
+            for (int ci = 0; ci < conjuncts.Count; ci++)
+            {
+                if (usedConjuncts[ci]) continue;
+                if (TryExtractEquality(conjuncts[ci], pkColName, scanProjection, out var value))
+                {
+                    if (TypeAffinity.IsDateAffinity(table.Columns[pkIndices[pk]].TypeName) &&
+                        value.Type == DbType.Text &&
+                        DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                    {
+                        value = DbValue.Integer(ticks);
+                    }
+                    if (!CanEncodeAsPkValue(value, pkTypes[pk]))
+                        return null;
+                    eqValues[eqMatched] = value;
+                    usedConjuncts[ci] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break;
+            eqMatched++;
+        }
+
+        // Phase 2: optional range conjuncts on the column right after the equality prefix.
+        // We accept up to two range conjuncts (e.g. `id >= lo AND id < hi`) on the same
+        // column, and combine them into [lower, upper) bounds.
+        DbValue? rangeLowValue = null;
+        bool rangeLowInclusive = true;
+        DbValue? rangeHighValue = null;
+        bool rangeHighInclusive = false;
+        DbType rangeColType = default;
+
+        if (eqMatched < pkIndices.Length)
+        {
+            int rangePkOrdinal = eqMatched;
+            var rangeColName = table.Columns[pkIndices[rangePkOrdinal]].Name;
+            rangeColType = pkTypes[rangePkOrdinal];
+
+            for (int ci = 0; ci < conjuncts.Count; ci++)
+            {
+                if (usedConjuncts[ci]) continue;
+                if (!TryExtractComparison(conjuncts[ci], rangeColName, scanProjection,
+                        out var op, out var rhs))
+                    continue;
+
+                if (TypeAffinity.IsDateAffinity(table.Columns[pkIndices[rangePkOrdinal]].TypeName) &&
+                    rhs.Type == DbType.Text &&
+                    DateTimeHelper.TryParseToTicks(rhs.AsText().Span, out long ticks))
+                {
+                    rhs = DbValue.Integer(ticks);
+                }
+                if (!CanEncodeAsPkValue(rhs, rangeColType))
+                    continue;
+
+                switch (op)
+                {
+                    case BinaryOp.GreaterEqual:
+                        if (rangeLowValue is null || DbValueComparer.Compare(rhs, rangeLowValue.Value) > 0)
+                        { rangeLowValue = rhs; rangeLowInclusive = true; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.GreaterThan:
+                        if (rangeLowValue is null || DbValueComparer.Compare(rhs, rangeLowValue.Value) >= 0)
+                        { rangeLowValue = rhs; rangeLowInclusive = false; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.LessEqual:
+                        if (rangeHighValue is null || DbValueComparer.Compare(rhs, rangeHighValue.Value) < 0)
+                        { rangeHighValue = rhs; rangeHighInclusive = true; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.LessThan:
+                        if (rangeHighValue is null || DbValueComparer.Compare(rhs, rangeHighValue.Value) <= 0)
+                        { rangeHighValue = rhs; rangeHighInclusive = false; }
+                        usedConjuncts[ci] = true;
+                        break;
+                }
+            }
+        }
+
+        bool haveBounds = eqMatched > 0 || rangeLowValue is not null || rangeHighValue is not null;
+        if (!haveBounds)
+            return null;
+
+        // Build the encoded bounds. The lower bound replaces the table-prefix seek; the
+        // upper bound is exclusive (so callers can express inclusive semantics by appending
+        // a single 0x00 byte to lex-order successor — works for any encoded type because
+        // every encoded column ends in a non-extending byte).
+        byte[] lowerBound;
+        byte[]? upperBound;
+
+        if (eqMatched == pkIndices.Length)
+        {
+            // Full equality match → single-row point seek.
+            lowerBound = RowKeyEncoder.Encode(table.Oid, eqValues, pkTypes);
+            upperBound = LexSuccessor(lowerBound);
+        }
+        else
+        {
+            // Partial prefix (eqMatched columns) plus optional range on the next column.
+            // Build the encoded equality prefix once and append the range bounds (or, when
+            // no range is present, use the prefix as both lower and (lex-successor) upper
+            // — this gives a "scan all rows whose first eqMatched PK columns equal these
+            // values" half-open range.
+            var eqPrefixTypes = pkTypes.AsSpan(0, eqMatched);
+            var eqPrefixValues = eqValues.AsSpan(0, eqMatched);
+            var prefixBytes = RowKeyEncoder.Encode(table.Oid, eqPrefixValues, eqPrefixTypes);
+
+            if (rangeLowValue is null && rangeHighValue is null)
+            {
+                // Pure equality prefix on a composite PK — bound the scan to "all rows
+                // sharing this leading-key prefix" via the lex successor.
+                lowerBound = prefixBytes;
+                upperBound = LexSuccessor(prefixBytes);
+            }
+            else
+            {
+                lowerBound = rangeLowValue is { } lv
+                    ? AppendEncodedColumn(prefixBytes, lv, rangeColType, rangeLowInclusive)
+                    : prefixBytes;
+
+                if (rangeHighValue is { } hv)
+                {
+                    upperBound = AppendEncodedColumnUpper(prefixBytes, hv, rangeColType, rangeHighInclusive);
+                }
+                else if (eqMatched > 0)
+                {
+                    // Open-ended high bound but the equality prefix still bounds us to
+                    // rows that share those leading PK values.
+                    upperBound = LexSuccessor(prefixBytes);
+                }
+                else
+                {
+                    // Open-ended high bound and no equality prefix — rely on TableScan's
+                    // built-in Oid-prefix termination to stop at the next table.
+                    upperBound = null;
+                }
+            }
+        }
+
+        // Build a "matched predicate" from the conjuncts we folded — purely for EXPLAIN,
+        // so users can tell which part of the WHERE was rolled into the seek bounds.
+        var matchedConjuncts = new List<SqlExpr>();
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (usedConjuncts[i]) matchedConjuncts.Add(conjuncts[i]);
+        var boundPredicate = matchedConjuncts.Count > 0
+            ? HeuristicOptimizer.CombineAnd(matchedConjuncts)
+            : null;
+
+        var cursor = tx.CreateCursor();
+        var bounded = new TableScan(cursor, table, lowerBound, upperBound, boundPredicate);
+
+        // Build the residual filter from any conjunct we didn't fold into the bound.
+        int residualCount = 0;
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (!usedConjuncts[i]) residualCount++;
+
+        if (residualCount == 0)
+            return bounded;
+
+        var residuals = new List<SqlExpr>(residualCount);
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (!usedConjuncts[i]) residuals.Add(conjuncts[i]);
+        var residual = HeuristicOptimizer.CombineAnd(residuals);
+        var resolved = ResolveColumns(residual, bounded.Projection);
+        return new Filter(bounded, resolved);
+    }
+
+    /// <summary>
+    /// Returns true if a constant value can be safely encoded as a PK key column of the
+    /// given declared type. Filters out type mismatches that would otherwise throw inside
+    /// the encoder (e.g. text constant against an INTEGER PK).
+    /// </summary>
+    private static bool CanEncodeAsPkValue(DbValue value, DbType pkType)
+    {
+        if (value.IsNull) return false;
+        if (pkType.IsInteger()) return value.Type.IsInteger();
+        if (pkType == DbType.Float64) return value.Type == DbType.Float64 || value.Type.IsInteger();
+        if (pkType.IsVariableLength()) return value.Type.IsVariableLength();
+        return false;
+    }
+
+    /// <summary>
+    /// Appends a single 0x00 byte to <paramref name="key"/> to produce a byte sequence that
+    /// is lexicographically greater than the original but less than any longer key sharing
+    /// the same prefix that has a non-zero next byte. Combined with the row encoding's
+    /// fixed-length integer/float columns and length-prefixed variable columns this works
+    /// as a universal exclusive successor.
+    /// </summary>
+    private static byte[] LexSuccessor(byte[] key)
+    {
+        var result = new byte[key.Length + 1];
+        Buffer.BlockCopy(key, 0, result, 0, key.Length);
+        return result;
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="value"/> as the next PK column of <paramref name="prefix"/>
+    /// and returns the new key. Used to build the lower bound of a range scan; if the
+    /// caller's predicate was strict (<c>&gt;</c>) the result is bumped via
+    /// <see cref="LexSuccessor"/> so seek skips the equal row.
+    /// </summary>
+    private static byte[] AppendEncodedColumn(byte[] prefix, DbValue value, DbType type, bool inclusive)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+        return inclusive ? combined : LexSuccessor(combined);
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="value"/> as the next PK column of <paramref name="prefix"/>
+    /// and returns it as the exclusive upper bound: the encoded key for an exclusive bound
+    /// (<c>&lt;</c>), or the encoded key plus a sentinel byte for an inclusive bound
+    /// (<c>&lt;=</c>).
+    /// </summary>
+    private static byte[] AppendEncodedColumnUpper(byte[] prefix, DbValue value, DbType type, bool inclusive)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+        return inclusive ? LexSuccessor(combined) : combined;
+    }
+
+    /// <summary>
+    /// Recognizes a binary comparison `column &lt; constant`, `column &gt; constant`, etc.
+    /// Returns the operator with the column normalized to the left-hand side, swapping the
+    /// operator direction when the literal is on the left.
+    /// </summary>
+    private static bool TryExtractComparison(SqlExpr expr, string columnName, Projection projection,
+        out BinaryOp op, out DbValue value)
+    {
+        op = default;
+        value = default;
+        if (expr is not BinaryExpr be) return false;
+        if (be.Op is not (BinaryOp.LessThan or BinaryOp.LessEqual
+                          or BinaryOp.GreaterThan or BinaryOp.GreaterEqual))
+            return false;
+
+        // column op constant
+        if (be.Left is ColumnRefExpr colL &&
+            string.Equals(colL.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            be.Right is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = be.Right is ResolvedLiteralExpr rl
+                ? rl.Value
+                : ExprEvaluator.EvaluateLiteral((LiteralExpr)be.Right);
+            op = be.Op;
+            return true;
+        }
+
+        // constant op column → flip the operator so the column is conceptually on the left
+        if (be.Right is ColumnRefExpr colR &&
+            string.Equals(colR.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            be.Left is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = be.Left is ResolvedLiteralExpr rl2
+                ? rl2.Value
+                : ExprEvaluator.EvaluateLiteral((LiteralExpr)be.Left);
+            op = be.Op switch
+            {
+                BinaryOp.LessThan => BinaryOp.GreaterThan,
+                BinaryOp.LessEqual => BinaryOp.GreaterEqual,
+                BinaryOp.GreaterThan => BinaryOp.LessThan,
+                BinaryOp.GreaterEqual => BinaryOp.LessEqual,
+                _ => be.Op,
+            };
             return true;
         }
 
