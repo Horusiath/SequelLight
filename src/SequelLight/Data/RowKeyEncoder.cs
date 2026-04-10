@@ -99,6 +99,25 @@ public static class RowKeyEncoder
         return offset;
     }
 
+    /// <summary>
+    /// Schema-aware variant: tags DATE / DATETIME / TIMESTAMP PK columns as
+    /// <see cref="DbValue.DateTime"/> so the value is self-describing for the data reader.
+    /// </summary>
+    public static int Decode(ReadOnlySpan<byte> src, out Oid oid, Span<DbValue> pkValues, SequelLight.Schema.ColumnSchema[] pkColumns)
+    {
+        oid = new Oid(BinaryPrimitives.ReadUInt32BigEndian(src));
+        int offset = OidSize;
+
+        for (int i = 0; i < pkColumns.Length; i++)
+        {
+            offset += DecodeColumn(src[offset..], pkColumns[i].ResolvedType, out pkValues[i]);
+            if (pkColumns[i].IsDateAffinity && pkValues[i].Type.IsInteger())
+                pkValues[i] = DbValue.DateTime(pkValues[i].AsInteger());
+        }
+
+        return offset;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int ColumnKeySize(DbValue value, DbType type)
     {

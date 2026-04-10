@@ -1,33 +1,20 @@
-using SequelLight.Data;
-
 namespace SequelLight.Queries;
 
 /// <summary>
 /// Maps output column names to ordinal indices. Used by every operator to describe its output schema.
-///
-/// <para>
-/// Optionally carries a per-column logical type affinity (<see cref="ColumnTypeAffinity"/>)
-/// so callers like the data reader can surface DATE / DATETIME / TIMESTAMP columns as CLR
-/// DateTime values rather than the underlying Int64 ticks. One byte per column. The array
-/// is null when no affinity info is available for any column (e.g. literal VALUES, all
-/// computed expressions); columns without affinity carry the <c>None</c> value.
-/// </para>
+/// Type information for individual values is carried by the values themselves via
+/// <see cref="SequelLight.Data.DbValue.Type"/> — see the bit-packed encoding in
+/// <see cref="SequelLight.Data.DbType"/>.
 /// </summary>
 public sealed class Projection
 {
     private readonly QualifiedName[] _names;
-    private readonly ColumnTypeAffinity[]? _affinities;
     private readonly Dictionary<QualifiedName, int> _index;
     private readonly Dictionary<string, int> _columnIndex; // column-name-only, case-insensitive, first-match wins
 
-    public Projection(QualifiedName[] names, ColumnTypeAffinity[]? affinities = null)
+    public Projection(QualifiedName[] names)
     {
-        if (affinities is not null && affinities.Length != names.Length)
-            throw new ArgumentException(
-                "affinities length must match names length", nameof(affinities));
-
         _names = names;
-        _affinities = affinities;
         _index = new Dictionary<QualifiedName, int>(names.Length);
         _columnIndex = new Dictionary<string, int>(names.Length, StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < names.Length; i++)
@@ -73,18 +60,6 @@ public sealed class Projection
             _index.TryAdd(_names[i], i);
             _columnIndex.TryAdd(_names[i].Column, i);
         }
-    }
-
-    /// <summary>
-    /// Returns the logical type affinity for the column. <see cref="ColumnTypeAffinity.None"/>
-    /// means "use the physical type as-is" (the default — the column has no special CLR
-    /// projection rules).
-    /// </summary>
-    public ColumnTypeAffinity GetAffinity(int ordinal)
-    {
-        if ((uint)ordinal >= (uint)_names.Length)
-            throw new ArgumentOutOfRangeException(nameof(ordinal));
-        return _affinities is null ? ColumnTypeAffinity.None : _affinities[ordinal];
     }
 
     public int ColumnCount => _names.Length;

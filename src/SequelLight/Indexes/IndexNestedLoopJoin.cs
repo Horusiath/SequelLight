@@ -39,7 +39,7 @@ internal sealed class IndexNestedLoopJoin : IDbEnumerator
     private readonly int _rightColumnCount;
     private readonly DbValue[] _pkBuf;
     private readonly DbValue[] _valueBuf;
-    private readonly DbType[] _pkColumnTypes;
+    private readonly ColumnSchema[] _pkColumns;
     private readonly int[] _pkColumnIndices;
     private readonly ColumnSchema[] _valueColumns;
     private readonly int[] _valueColumnOutputIndices;
@@ -102,7 +102,7 @@ internal sealed class IndexNestedLoopJoin : IDbEnumerator
         }
 
         _pkColumnIndices = new int[pkCount];
-        _pkColumnTypes = new DbType[pkCount];
+        _pkColumns = new ColumnSchema[pkCount];
         _valueColumns = new ColumnSchema[valCount];
         _valueColumnOutputIndices = new int[valCount];
 
@@ -112,7 +112,7 @@ internal sealed class IndexNestedLoopJoin : IDbEnumerator
             if (table.Columns[i].IsPrimaryKey)
             {
                 _pkColumnIndices[pk] = i;
-                _pkColumnTypes[pk] = table.Columns[i].ResolvedType;
+                _pkColumns[pk] = table.Columns[i];
                 pk++;
             }
             else
@@ -295,8 +295,8 @@ internal sealed class IndexNestedLoopJoin : IDbEnumerator
             if (rowValue is null)
                 continue;
 
-            // Decode right-side row
-            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumnTypes);
+            // Decode right-side row (schema-aware: tags date PKs as DbValue.DateTime)
+            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumns);
             RowValueEncoder.Decode((ReadOnlyMemory<byte>)rowValue, _valueBuf, _valueColumns);
 
             // Write combined row: left + right

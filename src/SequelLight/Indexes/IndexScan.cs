@@ -25,7 +25,7 @@ internal sealed class IndexScan : IDbEnumerator
     private readonly int _columnCount;
     private readonly DbValue[] _pkBuf;
     private readonly DbValue[] _valueBuf;
-    private readonly DbType[] _pkColumnTypes;
+    private readonly ColumnSchema[] _pkColumns;
     private readonly int[] _pkColumnIndices;
     private readonly ColumnSchema[] _valueColumns;
     private readonly int[] _valueColumnOutputIndices;
@@ -75,7 +75,7 @@ internal sealed class IndexScan : IDbEnumerator
         }
 
         _pkColumnIndices = new int[pkCount];
-        _pkColumnTypes = new DbType[pkCount];
+        _pkColumns = new ColumnSchema[pkCount];
         _valueColumns = new ColumnSchema[valCount];
         _valueColumnOutputIndices = new int[valCount];
 
@@ -85,7 +85,7 @@ internal sealed class IndexScan : IDbEnumerator
             if (table.Columns[i].IsPrimaryKey)
             {
                 _pkColumnIndices[pk] = i;
-                _pkColumnTypes[pk] = table.Columns[i].ResolvedType;
+                _pkColumns[pk] = table.Columns[i];
                 pk++;
             }
             else
@@ -164,8 +164,8 @@ internal sealed class IndexScan : IDbEnumerator
             if (rowValue is null)
                 continue;
 
-            // Decode PK columns from table key
-            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumnTypes);
+            // Decode PK columns from table key (schema-aware: tags date PKs as DbValue.DateTime)
+            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumns);
 
             // Decode value columns — zero-copy: text/blob reference the returned byte[]
             var rowValueMem = (ReadOnlyMemory<byte>)rowValue;

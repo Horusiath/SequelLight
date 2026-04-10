@@ -20,7 +20,7 @@ public sealed class TableScan : IDbEnumerator
     // Precomputed encoding metadata
     private readonly int _columnCount;
     private readonly int[] _pkColumnIndices;
-    private readonly DbType[] _pkColumnTypes;
+    private readonly ColumnSchema[] _pkColumns;
     private readonly ColumnSchema[] _valueColumns;
     private readonly int[] _valueColumnOutputIndices;
 
@@ -40,24 +40,14 @@ public sealed class TableScan : IDbEnumerator
         _prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
         _columnCount = table.Columns.Length;
 
-        // Build projection from column names + per-column logical type affinity so the data
-        // reader can surface DATE / DATETIME / TIMESTAMP columns as actual DateTime values
-        // instead of raw Int64 ticks. Affinity is resolved once here from the SQL type name;
-        // a non-date column gets ColumnTypeAffinity.None and the array stays null when no
-        // column is a date type (most tables).
+        // Build projection from column names. Per-value type information (including the
+        // DateTime affinity bit) is carried by the values themselves — the row decoder
+        // produces DbValue.DateTime for date columns inline, so no projection-level type
+        // metadata is needed.
         var names = new QualifiedName[_columnCount];
-        ColumnTypeAffinity[]? affinities = null;
         for (int i = 0; i < _columnCount; i++)
-        {
             names[i] = new QualifiedName(null, table.Columns[i].Name);
-            var affinity = TypeAffinity.ResolveAffinity(table.Columns[i].TypeName);
-            if (affinity != ColumnTypeAffinity.None)
-            {
-                affinities ??= new ColumnTypeAffinity[_columnCount];
-                affinities[i] = affinity;
-            }
-        }
-        Projection = new Projection(names, affinities);
+        Projection = new Projection(names);
 
         // Precompute PK and value column metadata
         int pkCount = 0, valCount = 0;
@@ -68,7 +58,7 @@ public sealed class TableScan : IDbEnumerator
         }
 
         _pkColumnIndices = new int[pkCount];
-        _pkColumnTypes = new DbType[pkCount];
+        _pkColumns = new ColumnSchema[pkCount];
         _valueColumns = new ColumnSchema[valCount];
         _valueColumnOutputIndices = new int[valCount];
 
@@ -78,7 +68,7 @@ public sealed class TableScan : IDbEnumerator
             if (table.Columns[i].IsPrimaryKey)
             {
                 _pkColumnIndices[pk] = i;
-                _pkColumnTypes[pk] = table.Columns[i].ResolvedType;
+                _pkColumns[pk] = table.Columns[i];
                 pk++;
             }
             else
@@ -199,8 +189,8 @@ public sealed class TableScan : IDbEnumerator
 
     private void DecodeRow(ReadOnlySpan<byte> key)
     {
-        // Decode PK columns from key
-        RowKeyEncoder.Decode(key, out _, _pkBuf, _pkColumnTypes);
+        // Decode PK columns from key (schema-aware: tags date PKs as DbValue.DateTime)
+        RowKeyEncoder.Decode(key, out _, _pkBuf, _pkColumns);
 
         // Decode value columns
         var valueSpan = _cursor.CurrentValue.Span;

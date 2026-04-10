@@ -111,6 +111,7 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
         Name = name;
         TypeName = typeName;
         ResolvedType = Data.TypeAffinity.Resolve(typeName);
+        IsDateAffinity = Data.TypeAffinity.IsDateAffinity(typeName);
         Flags = flags;
         PrimaryKeyOrder = primaryKeyOrder;
         Collation = collation;
@@ -124,6 +125,12 @@ public sealed class ColumnSchema : IEquatable<ColumnSchema>
     public string Name { get; internal set; }
     public string? TypeName { get; }
     public Data.DbType ResolvedType { get; }
+    /// <summary>
+    /// True iff the declared SQL type has DATE / DATETIME / TIMESTAMP affinity. Cached at
+    /// construction so row decoders can convert integer storage values to
+    /// <see cref="Data.DbValue.DateTime"/> with a single field access.
+    /// </summary>
+    public bool IsDateAffinity { get; }
     public ColumnFlags Flags { get; }
     public SortOrder? PrimaryKeyOrder { get; }
     public string? Collation { get; }
@@ -287,9 +294,11 @@ public sealed class TableSchema : IEquatable<TableSchema>
     private ColumnSchema[]? _encodingColumns;
     internal int[]? _pkColumnIndices;
     internal DbType[]? _pkColumnTypes;
+    internal ColumnSchema[]? _pkColumns;
 
     internal int[] PkColumnIndices { get { EnsureEncodingMetadata(); return _pkColumnIndices!; } }
     internal DbType[] PkColumnTypes { get { EnsureEncodingMetadata(); return _pkColumnTypes!; } }
+    internal ColumnSchema[] PkColumns { get { EnsureEncodingMetadata(); return _pkColumns!; } }
     private int[]? _valueColumnIndices;
     private ushort[]? _valueColumnSeqNos;
     private DbType[]? _valueColumnTypes;
@@ -308,6 +317,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
 
         var pkIndices = new int[pkCount];
         var pkTypes = new DbType[pkCount];
+        var pkCols = new ColumnSchema[pkCount];
         var valIndices = new int[valCount];
         var valSeqNos = new ushort[valCount];
         var valTypes = new DbType[valCount];
@@ -319,6 +329,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
             {
                 pkIndices[pk] = i;
                 pkTypes[pk] = Columns[i].ResolvedType;
+                pkCols[pk] = Columns[i];
                 pk++;
             }
             else
@@ -332,6 +343,7 @@ public sealed class TableSchema : IEquatable<TableSchema>
 
         _pkColumnIndices = pkIndices;
         _pkColumnTypes = pkTypes;
+        _pkColumns = pkCols;
         _valueColumnIndices = valIndices;
         _valueColumnSeqNos = valSeqNos;
         _valueColumnTypes = valTypes;
@@ -366,7 +378,8 @@ public sealed class TableSchema : IEquatable<TableSchema>
         EnsureEncodingMetadata();
         var row = new DbValue[Columns.Length];
         var pkBuf = new DbValue[_pkColumnIndices!.Length];
-        RowKeyEncoder.Decode(key, out _, pkBuf, _pkColumnTypes!);
+        // Schema-aware: tags date PKs as DbValue.DateTime.
+        RowKeyEncoder.Decode(key, out _, pkBuf, _pkColumns!);
         for (int i = 0; i < _pkColumnIndices.Length; i++)
             row[_pkColumnIndices[i]] = pkBuf[i];
 

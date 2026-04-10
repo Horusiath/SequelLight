@@ -79,31 +79,13 @@ public sealed class HashJoin : IDbEnumerator
         _allocateSpillPath = allocateSpillPath;
         _blockCache = blockCache;
 
-        int total = _leftWidth + _rightWidth;
-        var names = new QualifiedName[total];
-        ColumnTypeAffinity[]? affinities = null;
+        var names = new QualifiedName[_leftWidth + _rightWidth];
         for (int i = 0; i < _leftWidth; i++)
-        {
             names[i] = left.Projection.GetQualifiedName(i);
-            var aff = left.Projection.GetAffinity(i);
-            if (aff != ColumnTypeAffinity.None)
-            {
-                affinities ??= new ColumnTypeAffinity[total];
-                affinities[i] = aff;
-            }
-        }
         for (int i = 0; i < _rightWidth; i++)
-        {
             names[_leftWidth + i] = right.Projection.GetQualifiedName(i);
-            var aff = right.Projection.GetAffinity(i);
-            if (aff != ColumnTypeAffinity.None)
-            {
-                affinities ??= new ColumnTypeAffinity[total];
-                affinities[_leftWidth + i] = aff;
-            }
-        }
-        Projection = new Projection(names, affinities);
-        _hashCurrent = new DbValue[total];
+        Projection = new Projection(names);
+        _hashCurrent = new DbValue[_leftWidth + _rightWidth];
     }
 
     public ValueTask<bool> NextAsync(CancellationToken ct = default)

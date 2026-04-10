@@ -236,7 +236,7 @@ internal static class SortRowEncoder
             case DbType.UInt32 or DbType.Int32:
                 BinaryPrimitives.WriteInt32LittleEndian(data, (int)v.AsInteger());
                 return 1 + 4;
-            case DbType.UInt64 or DbType.Int64:
+            case DbType.UInt64 or DbType.Int64 or DbType.DateTime:
                 BinaryPrimitives.WriteInt64LittleEndian(data, v.AsInteger());
                 return 1 + 8;
             case DbType.Float64:
@@ -288,6 +288,9 @@ internal static class SortRowEncoder
                 return 1 + 4;
             case DbType.UInt64 or DbType.Int64:
                 value = DbValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(data));
+                return 1 + 8;
+            case DbType.DateTime:
+                value = DbValue.DateTime(BinaryPrimitives.ReadInt64LittleEndian(data));
                 return 1 + 8;
             case DbType.Float64:
                 value = DbValue.Real(BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(data)));

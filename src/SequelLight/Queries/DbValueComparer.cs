@@ -22,7 +22,8 @@ public static class DbValueComparer
         var lt = left.Type;
         var rt = right.Type;
 
-        // Both integers
+        // Both integers (covers DateTime vs Int64, DateTime vs DateTime — DateTime is
+        // self-described and stored as integer ticks, so .IsInteger() returns true).
         if (lt.IsInteger() && rt.IsInteger())
             return left.AsInteger().CompareTo(right.AsInteger());
 
@@ -35,6 +36,16 @@ public static class DbValueComparer
             return ((double)left.AsInteger()).CompareTo(right.AsReal());
         if (lt == DbType.Float64 && rt.IsInteger())
             return left.AsReal().CompareTo((double)right.AsInteger());
+
+        // DateTime ↔ Text: parse the text as a date and compare as ticks. This is what
+        // makes `WHERE order_date > '1996-07-16'` work at runtime — no plan-time
+        // coercion needed.
+        if (lt.IsDateTime() && rt == DbType.Text &&
+            Data.DateTimeHelper.TryParseToTicks(right.AsBytes().Span, out long rightTicks))
+            return left.AsInteger().CompareTo(rightTicks);
+        if (rt.IsDateTime() && lt == DbType.Text &&
+            Data.DateTimeHelper.TryParseToTicks(left.AsBytes().Span, out long leftTicks))
+            return leftTicks.CompareTo(right.AsInteger());
 
         // Text/blob: ordinal byte comparison
         if (lt.IsVariableLength() && rt.IsVariableLength())

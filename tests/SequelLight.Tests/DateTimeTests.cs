@@ -436,8 +436,9 @@ public class DateTimeQueryTests : TempDirTest
     [Fact]
     public async Task GetValue_Date_Type_Survives_Projection()
     {
-        // SELECT ... ts FROM events should still surface ts as DateTime even after a
-        // Project node, because Select propagates declared types for column-ref selectors.
+        // SELECT ... ts FROM events should still surface ts as DateTime after a Project,
+        // because the value is self-describing — the row decoder tags it as DbValue.DateTime
+        // and that flows unchanged through projections, joins, etc.
         await using var conn = await OpenConnectionAsync();
         var cmd = conn.CreateCommand();
         cmd.CommandText = "CREATE TABLE events (id INTEGER PRIMARY KEY, ts DATE)";
@@ -451,7 +452,10 @@ public class DateTimeQueryTests : TempDirTest
 
         Assert.IsType<DateTime>(reader.GetValue(0));
         Assert.Equal(new DateTime(2024, 6, 15), (DateTime)reader.GetValue(0));
-        Assert.Equal("DATE", reader.GetDataTypeName(0));
+        // The new bit-packed DbType encoding has a single DATETIME affinity bit and does
+        // not distinguish DATE / DATETIME / TIMESTAMP at the value level. All three are
+        // surfaced as "DATETIME" by GetDataTypeName.
+        Assert.Equal("DATETIME", reader.GetDataTypeName(0));
     }
 
     [Fact]

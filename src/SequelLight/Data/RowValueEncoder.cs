@@ -194,7 +194,12 @@ public static class RowValueEncoder
             ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(2 + seqNo * 2));
             if (fieldOffset == 0) continue;
 
-            values[i] = DecodeField(src, fieldOffset, columns[i].ResolvedType);
+            var v = DecodeField(src, fieldOffset, columns[i].ResolvedType);
+            // Tag DATE / DATETIME / TIMESTAMP storage values as DbValue.DateTime so the
+            // value is self-describing for the data reader and downstream consumers.
+            if (columns[i].IsDateAffinity && v.Type.IsInteger())
+                v = DbValue.DateTime(v.AsInteger());
+            values[i] = v;
         }
     }
 
@@ -271,7 +276,10 @@ public static class RowValueEncoder
             ushort fieldOffset = BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(2 + seqNo * 2));
             if (fieldOffset == 0) continue;
 
-            values[i] = DecodeFieldZeroCopy(src, span, fieldOffset, columns[i].ResolvedType);
+            var v = DecodeFieldZeroCopy(src, span, fieldOffset, columns[i].ResolvedType);
+            if (columns[i].IsDateAffinity && v.Type.IsInteger())
+                v = DbValue.DateTime(v.AsInteger());
+            values[i] = v;
         }
     }
 
