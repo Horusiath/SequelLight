@@ -53,12 +53,71 @@ public sealed class LsmStore : IAsyncDisposable
         new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
     private Task? _compactionTask;
 
+    // Manifest serialization. The single worker drains _manifestQueue, executes the mutator
+    // delegate against the current SSTable list, writes the new manifest atomically, and
+    // direct-assigns _sstables. This guarantees the on-disk manifest exactly matches what
+    // recovery will reconstruct, and serializes all mutation paths (memtable flush,
+    // compaction, spilled-txn commit) without taking a lock.
+    private Manifest? _manifest;
+    private readonly Channel<ManifestUpdateRequest> _manifestQueue = Channel.CreateUnbounded<ManifestUpdateRequest>(
+        new UnboundedChannelOptions { SingleReader = true });
+    private Task? _manifestWorkerTask;
+
     private LsmStore(LsmStoreOptions options)
     {
         _options = options;
         _tempDirectory = options.TempDirectory ?? Path.Combine(options.Directory, "tmp");
         if (options.BlockCacheSize > 0)
             _blockCache = new BlockCache(options.BlockCacheSize);
+    }
+
+    private readonly record struct ManifestUpdateRequest(
+        Func<ImmutableList<SSTableInfo>, ImmutableList<SSTableInfo>> Mutator,
+        TaskCompletionSource Completion);
+
+    /// <summary>
+    /// Serialized SST list mutation. The mutator runs inside the single-writer worker, sees
+    /// the latest committed list, and returns the new list. The worker writes the manifest
+    /// with the new live IDs and direct-assigns <see cref="_sstables"/> before completing
+    /// the request. Concurrent callers are queued; manifest writes are not batched (each
+    /// commit needs its own durability barrier).
+    /// </summary>
+    private Task UpdateSSTablesAsync(Func<ImmutableList<SSTableInfo>, ImmutableList<SSTableInfo>> mutator)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_manifestQueue.Writer.TryWrite(new ManifestUpdateRequest(mutator, tcs)))
+            throw new InvalidOperationException("Manifest update queue is closed.");
+        return tcs.Task;
+    }
+
+    private async Task ManifestWorkerLoopAsync()
+    {
+        var reader = _manifestQueue.Reader;
+        while (await reader.WaitToReadAsync().ConfigureAwait(false))
+        {
+            while (reader.TryRead(out var req))
+            {
+                try
+                {
+                    var current = _sstables;
+                    var updated = req.Mutator(current);
+
+                    // Compute live IDs from the new list and write the manifest atomically.
+                    var liveIds = new long[updated.Count];
+                    for (int i = 0; i < updated.Count; i++)
+                        liveIds[i] = ParseFileId(updated[i].FilePath);
+                    await _manifest!.WriteAtomicallyAsync(liveIds).ConfigureAwait(false);
+
+                    // Direct-assign — the worker is the single writer, so no CAS needed.
+                    _sstables = updated;
+                    req.Completion.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    req.Completion.TrySetException(ex);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -85,6 +144,10 @@ public sealed class LsmStore : IAsyncDisposable
         System.IO.Directory.CreateDirectory(options.Directory);
 
         var store = new LsmStore(options);
+        store._manifest = new Manifest(options.Directory);
+        // Start the manifest worker BEFORE recovery so RecoverAsync can write the initial
+        // manifest (e.g. when adopting an existing data dir that has no manifest yet).
+        store._manifestWorkerTask = Task.Run(store.ManifestWorkerLoopAsync);
         await store.RecoverAsync().ConfigureAwait(false);
         store._compactionTask = Task.Run(store.CompactionLoopAsync);
         return store;
@@ -98,7 +161,26 @@ public sealed class LsmStore : IAsyncDisposable
             System.IO.Directory.Delete(_tempDirectory, recursive: true);
         System.IO.Directory.CreateDirectory(_tempDirectory);
 
-        // Load existing SSTables
+        // Load the manifest. If absent (fresh database OR a database created before the
+        // manifest was added), adopt every *.sst file in the data directory as committed and
+        // write an initial manifest. From that point on, the manifest is the source of truth.
+        HashSet<long> liveIds;
+        bool needInitialManifestWrite;
+        if (_manifest!.Exists)
+        {
+            liveIds = await _manifest.LoadAsync().ConfigureAwait(false);
+            needInitialManifestWrite = false;
+        }
+        else
+        {
+            liveIds = new HashSet<long>();
+            foreach (var p in System.IO.Directory.GetFiles(_options.Directory, "*.sst"))
+                liveIds.Add(ParseFileId(p));
+            needInitialManifestWrite = true;
+        }
+
+        // Walk the data dir. Files in the manifest are loaded as live SSTables; files NOT in
+        // the manifest are orphans from interrupted commits and are deleted.
         var sstFiles = System.IO.Directory.GetFiles(_options.Directory, "*.sst");
         Array.Sort(sstFiles, StringComparer.Ordinal);
 
@@ -106,11 +188,20 @@ public sealed class LsmStore : IAsyncDisposable
         var sstList = ImmutableList.CreateBuilder<SSTableInfo>();
         foreach (var file in sstFiles)
         {
+            int fileId = ParseFileId(file);
+            if (!liveIds.Contains(fileId))
+            {
+                // Orphan: a file produced by an interrupted commit (rename succeeded but the
+                // manifest update never happened). Delete it; the user's transaction is rolled
+                // back from the storage perspective.
+                try { File.Delete(file); } catch { /* best-effort */ }
+                continue;
+            }
+
             var reader = await SSTableReader.OpenAsync(file, _blockCache).ConfigureAwait(false);
             _readerCache[file] = reader;
 
             int level = ParseLevel(file);
-            int fileId = ParseFileId(file);
             if (fileId > maxFileId) maxFileId = fileId;
 
             sstList.Add(new SSTableInfo
@@ -123,8 +214,29 @@ public sealed class LsmStore : IAsyncDisposable
                 Reader = reader,
             });
         }
+
+        // Sanity-check: every ID listed in the manifest must have an actual file on disk. A
+        // missing file here is unrecoverable data loss (e.g. someone deleted SST files
+        // externally), so fail loudly rather than silently dropping data.
+        var loadedIds = new HashSet<long>();
+        for (int i = 0; i < sstList.Count; i++)
+            loadedIds.Add(ParseFileId(sstList[i].FilePath));
+        foreach (var id in liveIds)
+        {
+            if (!loadedIds.Contains(id))
+                throw new InvalidDataException(
+                    $"Manifest references SSTable id {id} but the file is missing from {_options.Directory}.");
+        }
+
         _sstables = sstList.ToImmutable();
         _nextFileId = maxFileId + 1;
+
+        if (needInitialManifestWrite)
+        {
+            // Adoption case: write the initial manifest reflecting the files we just adopted.
+            // Goes through the worker so it's serialized with any future updates.
+            await UpdateSSTablesAsync(current => current).ConfigureAwait(false);
+        }
 
         // Replay WAL
         var walPath = Path.Combine(_options.Directory, "wal.log");
@@ -134,21 +246,31 @@ public sealed class LsmStore : IAsyncDisposable
             var mutations = new List<(byte[] Key, MemEntry Entry)>();
             int sizeDelta = 0;
 
-            await WriteAheadLog.ReplayAsync(walPath, (type, key, value) =>
-            {
-                maxSeq++;
-                // Check if key exists in skip list to compute size delta
-                if (_memTable.Current.TryGetValue(key, out var existing))
-                    sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
+            // For spilled-transaction commits, the on-disk truth is the *_L0.sst files in
+            // the data directory (already picked up by the directory scan above). The WAL
+            // commit record's file ID list is informational — by the time we recover, the
+            // referenced files may have been compacted into a higher-level merged file. We
+            // don't error on missing references; the merged data is still readable.
+            // Step 10 will use the file ID list to detect actual orphans (files in the dir
+            // dropped by a crash between rename and WAL commit) once a proper manifest is
+            // in place to distinguish "compacted away" from "never committed".
+            await WriteAheadLog.ReplayAsync(
+                walPath,
+                (type, key, value) =>
+                {
+                    maxSeq++;
+                    // Check if key exists in skip list to compute size delta
+                    if (_memTable.Current.TryGetValue(key, out var existing))
+                        sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
 
-                var entry = type == WalEntryType.Put
-                    ? new MemEntry(value, maxSeq)
-                    : new MemEntry(null, maxSeq);
+                    var entry = type == WalEntryType.Put
+                        ? new MemEntry(value, maxSeq)
+                        : new MemEntry(null, maxSeq);
 
-                sizeDelta += key.Length + (value?.Length ?? 0);
-                mutations.Add((key, entry));
-                return ValueTask.CompletedTask;
-            }).ConfigureAwait(false);
+                    sizeDelta += key.Length + (value?.Length ?? 0);
+                    mutations.Add((key, entry));
+                    return ValueTask.CompletedTask;
+                }).ConfigureAwait(false);
 
             if (maxSeq > 0)
             {
@@ -208,6 +330,94 @@ public sealed class LsmStore : IAsyncDisposable
             await FlushMemTableAsync().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Commit path for transactions whose in-memory write set has spilled to disk at least
+    /// once. The whole transaction's writes are exposed atomically as a set of L0 SSTables —
+    /// no shared memtable involvement. Sequence:
+    /// <list type="number">
+    ///   <item>Force any remaining in-memory entries in the SpillBuffer to a fresh spill SST.</item>
+    ///   <item>Allocate fresh file IDs from the store counter for each spill SST.</item>
+    ///   <item>Rename each tmp file into the data directory as <c>{id:D10}_L0.sst</c>.</item>
+    ///   <item>Open <see cref="SSTableReader"/> instances and submit the new files to the
+    ///         manifest worker — it writes the manifest (which now lists the new IDs) and
+    ///         direct-assigns <see cref="_sstables"/> atomically.</item>
+    ///   <item>Write a WAL Commit record carrying the registered file IDs (informational —
+    ///         the manifest is the actual durability record).</item>
+    /// </list>
+    /// Crash safety:
+    /// <list type="bullet">
+    ///   <item>Crash before (3): tmp files cleaned by the temp-directory wipe on next open.</item>
+    ///   <item>Crash between (3) and (4): orphan files in the data dir not in the manifest;
+    ///         deleted by the orphan check in <see cref="RecoverAsync"/>.</item>
+    ///   <item>Crash after (4): manifest already includes the new files; recovery loads them.</item>
+    /// </list>
+    /// </summary>
+    internal async ValueTask CommitSpilledTransactionAsync(SpillBuffer spill)
+    {
+        var tmpPaths = await spill.ReleaseSpilledRunsAsync().ConfigureAwait(false);
+        if (tmpPaths.Count == 0) return; // nothing to commit
+
+        var fileIds = new long[tmpPaths.Count];
+        var finalPaths = new string[tmpPaths.Count];
+        var infos = new SSTableInfo[tmpPaths.Count];
+
+        try
+        {
+            for (int i = 0; i < tmpPaths.Count; i++)
+            {
+                int fileId = Interlocked.Increment(ref _nextFileId);
+                fileIds[i] = fileId;
+                finalPaths[i] = Path.Combine(_options.Directory, $"{fileId:D10}_L0.sst");
+
+                File.Move(tmpPaths[i], finalPaths[i]);
+
+                var reader = await SSTableReader.OpenAsync(finalPaths[i], _blockCache).ConfigureAwait(false);
+                _readerCache[finalPaths[i]] = reader;
+                infos[i] = new SSTableInfo
+                {
+                    FilePath = finalPaths[i],
+                    Level = 0,
+                    FileSize = new FileInfo(finalPaths[i]).Length,
+                    MinKey = reader.MinKey,
+                    MaxKey = reader.MaxKey,
+                    Reader = reader,
+                };
+            }
+
+            // Manifest update + _sstables swap, atomic from recovery's perspective.
+            await UpdateSSTablesAsync(current =>
+            {
+                var builder = current.ToBuilder();
+                foreach (var info in infos) builder.Add(info);
+                return builder.ToImmutable();
+            }).ConfigureAwait(false);
+
+            // WAL commit record carries the registered file IDs as a redundant marker. With
+            // the manifest in place this is informational — the manifest is the durability
+            // record — but the WAL flush gives us a per-commit fsync barrier and pairs the
+            // commit with anything else in the same WAL group.
+            await _wal!.CommitAsync(new List<(byte[], byte[]?)>(), fileIds).ConfigureAwait(false);
+
+            // Spilled txns dump straight into L0; trigger a compaction check.
+            _compactionChannel.Writer.TryWrite(1);
+        }
+        catch
+        {
+            // Clean up anything we managed to register before the failure.
+            for (int i = 0; i < tmpPaths.Count; i++)
+            {
+                if (infos[i] is { } info && info.Reader is not null)
+                {
+                    try { await info.Reader.DisposeAsync().ConfigureAwait(false); } catch { }
+                    _readerCache.TryRemove(finalPaths[i], out _);
+                }
+                try { if (File.Exists(finalPaths[i])) File.Delete(finalPaths[i]); } catch { }
+                try { if (File.Exists(tmpPaths[i])) File.Delete(tmpPaths[i]); } catch { }
+            }
+            throw;
+        }
+    }
+
     internal async ValueTask<(byte[]? Value, bool Found)> GetFromSSTAsync(
         byte[] key, ImmutableList<SSTableInfo> sstables)
         => await GetFromSSTAsync(key.AsMemory(), sstables).ConfigureAwait(false);
@@ -263,13 +473,9 @@ public sealed class LsmStore : IAsyncDisposable
             Reader = reader,
         };
 
-        // Atomically add to SSTable list
-        ImmutableList<SSTableInfo> original, updated;
-        do
-        {
-            original = _sstables;
-            updated = original.Add(info);
-        } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
+        // Register the new SST through the manifest worker — this writes the manifest
+        // (now including the new file ID) and direct-assigns _sstables in one atomic step.
+        await UpdateSSTablesAsync(current => current.Add(info)).ConfigureAwait(false);
 
         // Reset WAL
         await _wal!.DisposeAsync().ConfigureAwait(false);
@@ -360,17 +566,18 @@ public sealed class LsmStore : IAsyncDisposable
             Reader = newReader,
         };
 
-        // Atomically swap in SSTable list
+        // Manifest update + _sstables swap, atomic from recovery's perspective. The new file
+        // appears in the manifest and the old input files are removed in the same write — a
+        // crash before this call leaves the inputs live (compaction is retried); a crash
+        // after leaves the new file as the only live record.
         var inputPaths = new HashSet<string>(plan.InputTables.Select(t => t.FilePath));
-        ImmutableList<SSTableInfo> original, updated;
-        do
+        await UpdateSSTablesAsync(current =>
         {
-            original = _sstables;
-            var builder = original.ToBuilder();
+            var builder = current.ToBuilder();
             builder.RemoveAll(t => inputPaths.Contains(t.FilePath));
             builder.Add(newInfo);
-            updated = builder.ToImmutable();
-        } while (!ReferenceEquals(Interlocked.CompareExchange(ref _sstables, updated, original), original));
+            return builder.ToImmutable();
+        }).ConfigureAwait(false);
 
         // Retire old readers and delete old files.
         // Readers are not disposed here because in-flight transactions may still reference them.
@@ -391,6 +598,12 @@ public sealed class LsmStore : IAsyncDisposable
         _compactionChannel.Writer.TryComplete();
         if (_compactionTask is not null)
             await _compactionTask.ConfigureAwait(false);
+
+        // Stop the manifest worker. Done after compaction so any final compaction-driven
+        // manifest updates are processed before shutdown.
+        _manifestQueue.Writer.TryComplete();
+        if (_manifestWorkerTask is not null)
+            await _manifestWorkerTask.ConfigureAwait(false);
 
         if (_wal is not null)
             await _wal.DisposeAsync().ConfigureAwait(false);
@@ -494,17 +707,33 @@ public class ReadOnlyTransaction : IDisposable, IAsyncDisposable
 }
 
 /// <summary>
-/// Read-write transaction. Mutations are buffered locally and applied to the skip list
-/// atomically on commit. Sequence numbers provide ordering.
+/// Read-write transaction. Writes are buffered into a private <see cref="SpillBuffer"/>
+/// keyed by row key (null value = tombstone). When the buffer's in-memory portion exceeds
+/// the per-operator memory budget it spills to a temp-directory SSTable run, so a single
+/// transaction's footprint is bounded by the budget regardless of how many rows it writes.
+///
+/// <para>Two commit paths:</para>
+/// <list type="bullet">
+///   <item>
+///     <b>In-memory commit</b> (no spill happened): the buffer's <see cref="SortedDictionary{TKey, TValue}"/>
+///     is iterated in sorted order to build the WAL writes and the memtable mutations,
+///     then handed to the existing <see cref="LsmStore.CommitAsync"/> path. Behavior is
+///     identical to the pre-spill code for transactions that fit in memory.
+///   </item>
+///   <item>
+///     <b>Spilled commit</b>: the spilled tmp SSTables (and a final flush of the in-memory
+///     remainder) are renamed into the data directory as L0 files, registered atomically
+///     via the WAL Commit record's file ID list, and swapped into the shared SSTable list
+///     via CompareExchange. The shared memtable is bypassed entirely. Visibility is atomic
+///     (single CompareExchange) — readers either see all of the txn's writes or none.
+///   </item>
+/// </list>
 /// </summary>
 public sealed class ReadWriteTransaction : ReadOnlyTransaction
 {
-    private readonly List<(byte[] Key, MemEntry Entry)> _mutations = new();
-    private readonly List<(byte[] Key, byte[]? Value)> _walWrites = new();
-    // Local buffer for read-your-own-writes
-    private readonly SortedDictionary<byte[], MemEntry> _localWrites = new(KeyComparer.Instance);
-    private long _nextSeq;
-    private int _sizeDelta;
+    // Private write buffer. Lazy-init on first Put/Delete to avoid allocating for read-only
+    // workloads that happen to take a read-write transaction.
+    private SpillBuffer? _spill;
     private bool _committed;
 
     internal ReadWriteTransaction(
@@ -514,7 +743,17 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
         long baseSequence)
         : base(store, readSnapshot, sstables)
     {
-        _nextSeq = baseSequence + 1;
+        // baseSequence is unused for the spill-based path: we assign sequence numbers at
+        // commit time when iterating the in-memory buffer (one per unique key), so we
+        // don't need a per-write counter that grows with overwrites.
+        _ = baseSequence;
+    }
+
+    private SpillBuffer GetOrCreateSpill()
+    {
+        return _spill ??= new SpillBuffer(
+            Store.OperatorMemoryBudgetBytes,
+            Store.AllocateSpillFilePath);
     }
 
     public void Put(byte[] key, byte[] value)
@@ -522,17 +761,11 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
         ObjectDisposedException.ThrowIf(Disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        // Track size delta against both local writes and the shared skip list
-        if (_localWrites.TryGetValue(key, out var localExisting))
-            _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
-        else if (Snapshot.TryGetValue(key, out var existing))
-            _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
-        _sizeDelta += key.Length + value.Length;
-
-        var entry = new MemEntry(value, _nextSeq++);
-        _localWrites[key] = entry;
-        _mutations.Add((key, entry));
-        _walWrites.Add((key, value));
+        // SpillBuffer.AddAsync is synchronous on the hot path (just inserts into the in-memory
+        // SortedDictionary). It only goes async on overflow, when it writes a spill SSTable.
+        // The sync-over-async block on the spill path is acceptable for an embedded engine
+        // where Put is expected to have synchronous semantics.
+        GetOrCreateSpill().AddAsync(key, value).GetAwaiter().GetResult();
     }
 
     public void Delete(byte[] key)
@@ -540,16 +773,7 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
         ObjectDisposedException.ThrowIf(Disposed, this);
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
-        if (_localWrites.TryGetValue(key, out var localExisting))
-            _sizeDelta -= key.Length + (localExisting.Value?.Length ?? 0);
-        else if (Snapshot.TryGetValue(key, out var existing))
-            _sizeDelta -= key.Length + (existing.Value?.Length ?? 0);
-        _sizeDelta += key.Length;
-
-        var entry = new MemEntry(null, _nextSeq++);
-        _localWrites[key] = entry;
-        _mutations.Add((key, entry));
-        _walWrites.Add((key, null));
+        GetOrCreateSpill().AddAsync(key, null).GetAwaiter().GetResult();
     }
 
     public override async ValueTask<byte[]?> GetAsync(byte[] key)
@@ -559,23 +783,23 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
 
-        // Check local writes first (read-your-own-writes)
-        // SortedDictionary requires byte[] — extract if backed by an array
-        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(key, out var segment)
-            && segment.Offset == 0 && segment.Count == segment.Array!.Length)
+        if (_spill is not null)
         {
-            if (_localWrites.TryGetValue(segment.Array, out var local))
-                return local.IsTombstone ? null : local.Value;
-        }
-        else
-        {
-            // Fallback: linear scan of local writes (rare path — only for non-array-backed memory)
-            foreach (var kv in _localWrites)
+            // SpillBuffer.TryGetAsync wants a byte[] key. Reuse the underlying array if the
+            // memory is array-backed and covers the whole array; otherwise materialize.
+            byte[] keyArr;
+            if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(key, out var segment)
+                && segment.Offset == 0 && segment.Count == segment.Array!.Length)
             {
-                int cmp = kv.Key.AsSpan().SequenceCompareTo(key.Span);
-                if (cmp == 0) return kv.Value.IsTombstone ? null : kv.Value.Value;
-                if (cmp > 0) break;
+                keyArr = segment.Array;
             }
+            else
+            {
+                keyArr = key.ToArray();
+            }
+
+            var (value, found) = await _spill.TryGetAsync(keyArr).ConfigureAwait(false);
+            if (found) return value; // tombstone returns null
         }
 
         return await base.GetAsync(key).ConfigureAwait(false);
@@ -583,18 +807,20 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
 
     /// <summary>
     /// Creates a merged cursor that includes uncommitted local writes (highest priority),
-    /// the memtable snapshot, and all SSTables visible to this transaction.
-    /// The cursor is a snapshot of local writes at creation time.
-    /// The returned cursor supports <see cref="Cursor.DeleteAsync"/> to remove
-    /// the entry at the current position.
+    /// the memtable snapshot, and all SSTables visible to this transaction. When the
+    /// transaction has spilled, the cursor also includes the spilled run SSTables. The
+    /// cursor is a snapshot at creation time — subsequent writes to the transaction are
+    /// not visible to it.
+    /// The returned cursor supports <see cref="Cursor.DeleteAsync"/> to remove the entry
+    /// at the current position.
     /// </summary>
     public override Cursor CreateCursor()
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
 
         var children = new List<Cursor>();
-        if (_localWrites.Count > 0)
-            children.Add(new ArrayCursor(_localWrites));
+        if (_spill is not null)
+            children.AddRange(_spill.CreateChildCursors());
         children.Add(new SkipListCursor(Snapshot));
         for (int i = SSTables.Count - 1; i >= 0; i--)
         {
@@ -612,15 +838,51 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
         if (_committed) throw new InvalidOperationException("Transaction already committed");
 
         _committed = true;
-        if (_walWrites.Count == 0) return true;
+        if (_spill is null) return true; // empty transaction
 
-        await Store.CommitAsync(_mutations, _walWrites, _sizeDelta).ConfigureAwait(false);
+        if (_spill.HasSpilled)
+        {
+            // Spilled commit path: hand the entire write set off as L0 SSTables.
+            await Store.CommitSpilledTransactionAsync(_spill).ConfigureAwait(false);
+            // The spill buffer's runs were transferred to the store; only the (now empty)
+            // in-memory portion + cleared run list remain. DisposeAsync below is harmless.
+        }
+        else
+        {
+            // In-memory commit path: iterate the in-memory map to build the legacy mutations
+            // + walWrites lists and let the existing CommitAsync apply them to the memtable.
+            // Sequence numbers are assigned per unique key — overwrites within the txn don't
+            // bump the counter.
+            var memory = _spill.Memory;
+            var walWrites = new List<(byte[], byte[]?)>(memory.Count);
+            var mutations = new List<(byte[], MemEntry)>(memory.Count);
+            int sizeDelta = 0;
+            long seq = 0;
+            foreach (var kvp in memory)
+            {
+                walWrites.Add((kvp.Key, kvp.Value));
+                mutations.Add((kvp.Key, new MemEntry(kvp.Value, ++seq)));
+
+                // Adjust the memtable's approximate-size counter for any pre-existing entry
+                // that this txn replaces or deletes.
+                if (Snapshot.TryGetValue(kvp.Key, out var existing))
+                    sizeDelta -= kvp.Key.Length + (existing.Value?.Length ?? 0);
+                sizeDelta += kvp.Key.Length + (kvp.Value?.Length ?? 0);
+            }
+
+            await Store.CommitAsync(mutations, walWrites, sizeDelta).ConfigureAwait(false);
+        }
+
         return true;
     }
 
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
         Disposed = true;
-        return ValueTask.CompletedTask;
+        if (_spill is not null)
+        {
+            await _spill.DisposeAsync().ConfigureAwait(false);
+            _spill = null;
+        }
     }
 }

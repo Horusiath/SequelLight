@@ -370,6 +370,18 @@ internal sealed class ArrayCursor : Cursor
             _entries[i++] = (kvp.Key, kvp.Value.Value);
     }
 
+    /// <summary>
+    /// Snapshots a sorted dictionary that already stores nullable values directly
+    /// (used by the transaction spill buffer's in-memory portion).
+    /// </summary>
+    public ArrayCursor(SortedDictionary<byte[], byte[]?> source)
+    {
+        _entries = new (byte[], byte[]?)[source.Count];
+        int i = 0;
+        foreach (var kvp in source)
+            _entries[i++] = (kvp.Key, kvp.Value);
+    }
+
     public override bool IsValid => _pos >= 0 && _pos < _entries.Length;
     public override ReadOnlyMemory<byte> CurrentKey => _entries[_pos].Key;
     public override ReadOnlyMemory<byte> CurrentValue => _entries[_pos].Value;

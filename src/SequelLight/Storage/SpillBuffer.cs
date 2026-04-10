@@ -69,6 +69,57 @@ public sealed class SpillBuffer : IAsyncDisposable
     public bool HasSpilled => _runs.Count > 0;
 
     /// <summary>
+    /// Direct access to the in-memory portion. Used by the transaction commit path to
+    /// iterate the not-yet-spilled writes without going through the merger.
+    /// </summary>
+    internal SortedDictionary<byte[], byte[]?> Memory => _memory;
+
+    /// <summary>
+    /// Forces any pending in-memory entries to a fresh spilled run, releases the spill
+    /// readers (closes file handles so the files can be moved on Windows), and returns the
+    /// list of spill file paths in chronological (oldest-first) order.
+    /// <para>
+    /// After this call the SpillBuffer no longer owns the files; the caller is responsible
+    /// for renaming or deleting them. Subsequent <see cref="DisposeAsync"/> is a no-op for
+    /// the released runs.
+    /// </para>
+    /// </summary>
+    internal async ValueTask<List<string>> ReleaseSpilledRunsAsync()
+    {
+        if (_memory.Count > 0)
+            await FreezeAndSpillAsync().ConfigureAwait(false);
+
+        // _runs is newest-first; reverse to chronological so the caller can assign
+        // monotonically-increasing file IDs (older → smaller, newer → larger).
+        var paths = new List<string>(_runs.Count);
+        for (int i = _runs.Count - 1; i >= 0; i--)
+        {
+            await _runs[i].Reader.DisposeAsync().ConfigureAwait(false);
+            paths.Add(_runs[i].Path);
+        }
+
+        // Caller now owns the files — clear so DisposeAsync doesn't try to delete them.
+        _runs.Clear();
+        return paths;
+    }
+
+    /// <summary>
+    /// Builds cursor children for the transaction CreateCursor path: a snapshot of the
+    /// in-memory portion (highest priority) followed by one cursor per spilled run in
+    /// newest-first order. Caller wraps the result in a <see cref="MergingCursor"/>.
+    /// </summary>
+    internal Cursor[] CreateChildCursors()
+    {
+        var children = new List<Cursor>(_runs.Count + 1);
+        if (_memory.Count > 0)
+            children.Add(new ArrayCursor(_memory));
+        // _runs is already newest-first.
+        foreach (var run in _runs)
+            children.Add(run.Reader.CreateCursor());
+        return children.ToArray();
+    }
+
+    /// <summary>
     /// Inserts or overwrites <paramref name="key"/>. Pass <c>null</c> for <paramref name="value"/>
     /// to record a tombstone. Spills the in-memory portion to a new run if the budget is exceeded.
     /// </summary>

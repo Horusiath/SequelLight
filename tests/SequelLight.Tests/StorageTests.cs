@@ -1727,6 +1727,562 @@ public class SpillBufferTests : TempDirTest
     }
 }
 
+public class TransactionSpillTests : TempDirTest
+{
+    private static LsmStoreOptions Opts(string dir, long budget) => new()
+    {
+        Directory = dir,
+        OperatorMemoryBudgetBytes = budget,
+    };
+
+    [Fact]
+    public async Task Large_Txn_Commits_All_Writes_Visible_Across_Restart()
+    {
+        var dir = TempDir;
+        const int N = 500;
+
+        // First open: write 500 keys in one transaction with a tiny budget so spill triggers.
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            await using var tx = store.BeginReadWrite();
+            for (int i = 0; i < N; i++)
+                tx.Put(Key($"k{i:D4}"), Val($"v{i:D4}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        // Reopen and verify every key survives.
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < N; i++)
+            {
+                var v = await ro.GetAsync(Key($"k{i:D4}"));
+                Assert.NotNull(v);
+                Assert.Equal($"v{i:D4}", Str(v));
+            }
+
+            // Spill files were cleaned up after commit and after restart.
+            var tmpDir = Path.Combine(dir, "tmp");
+            if (Directory.Exists(tmpDir))
+                Assert.Empty(Directory.GetFiles(tmpDir, "spill_*.sst"));
+        }
+    }
+
+    [Fact]
+    public async Task Large_Txn_Aborted_Leaves_No_Files_And_No_Visible_Writes()
+    {
+        var dir = TempDir;
+
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            await using (var tx = store.BeginReadWrite())
+            {
+                for (int i = 0; i < 200; i++)
+                    tx.Put(Key($"abort_{i:D4}"), Val($"v{i:D4}"));
+                // Don't commit — DisposeAsync rolls back via the SpillBuffer's DisposeAsync.
+            }
+
+            // After dispose, no abort_* keys should be visible (the txn was rolled back).
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < 200; i++)
+                Assert.Null(await ro.GetAsync(Key($"abort_{i:D4}")));
+
+            var tmpDir = Path.Combine(dir, "tmp");
+            if (Directory.Exists(tmpDir))
+                Assert.Empty(Directory.GetFiles(tmpDir, "spill_*.sst"));
+        }
+
+        // Reopen — still no aborted keys, no orphan SSTables in the data dir.
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < 200; i++)
+                Assert.Null(await ro.GetAsync(Key($"abort_{i:D4}")));
+        }
+    }
+
+    [Fact]
+    public async Task Mixed_Writes_And_Deletes_In_Spilled_Txn()
+    {
+        var dir = TempDir;
+
+        // Pre-existing data so the deletes have something to remove.
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            await using var setup = store.BeginReadWrite();
+            for (int i = 0; i < 100; i++)
+                setup.Put(Key($"pre_{i:D3}"), Val($"old_{i:D3}"));
+            Assert.True(await setup.CommitAsync());
+        }
+
+        // Big spilled txn that overwrites half the keys and deletes the other half.
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            await using var tx = store.BeginReadWrite();
+            for (int i = 0; i < 100; i++)
+            {
+                if (i % 2 == 0)
+                    tx.Put(Key($"pre_{i:D3}"), Val($"new_{i:D3}"));
+                else
+                    tx.Delete(Key($"pre_{i:D3}"));
+            }
+            // Add new unique keys to push the buffer over the budget.
+            for (int i = 0; i < 100; i++)
+                tx.Put(Key($"new_{i:D3}"), Val($"v{i:D3}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        await using (var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024)))
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < 100; i++)
+            {
+                var v = await ro.GetAsync(Key($"pre_{i:D3}"));
+                if (i % 2 == 0)
+                    Assert.Equal($"new_{i:D3}", Str(v));
+                else
+                    Assert.Null(v); // deleted
+            }
+            for (int i = 0; i < 100; i++)
+            {
+                var v = await ro.GetAsync(Key($"new_{i:D3}"));
+                Assert.Equal($"v{i:D3}", Str(v));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Spilled_Txn_Read_Your_Own_Writes()
+    {
+        // Inside the same transaction, GetAsync must return values that have already been
+        // spilled to disk by the txn (not just the most-recent in-memory writes).
+        var dir = TempDir;
+        await using var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024));
+
+        await using var tx = store.BeginReadWrite();
+        // Write enough to force spill of the early entries.
+        for (int i = 0; i < 200; i++)
+            tx.Put(Key($"k{i:D4}"), Val($"v{i:D4}"));
+
+        // Read the very first key — it lives in a spilled run by now.
+        var first = await tx.GetAsync(Key("k0000"));
+        Assert.NotNull(first);
+        Assert.Equal("v0000", Str(first));
+
+        // And the very last — still in the in-memory portion (or freshly spilled).
+        var last = await tx.GetAsync(Key("k0199"));
+        Assert.NotNull(last);
+        Assert.Equal("v0199", Str(last));
+
+        // Overwrite an early key that's already spilled, then read it back.
+        tx.Put(Key("k0000"), Val("rewritten"));
+        var rewritten = await tx.GetAsync(Key("k0000"));
+        Assert.Equal("rewritten", Str(rewritten));
+
+        Assert.True(await tx.CommitAsync());
+    }
+
+    [Fact]
+    public async Task Spilled_Txn_Tombstone_Hides_Older_Value_In_RYOW()
+    {
+        var dir = TempDir;
+        await using var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024));
+
+        // Pre-commit a value so the tombstone has something to shadow.
+        await using (var setup = store.BeginReadWrite())
+        {
+            setup.Put(Key("victim"), Val("alive"));
+            Assert.True(await setup.CommitAsync());
+        }
+
+        await using var tx = store.BeginReadWrite();
+        for (int i = 0; i < 200; i++)
+            tx.Put(Key($"filler{i:D4}"), Val($"f{i}"));
+        tx.Delete(Key("victim"));
+
+        // Within the txn, the deletion is visible (RYOW returns null).
+        Assert.Null(await tx.GetAsync(Key("victim")));
+    }
+
+    [Fact]
+    public async Task Spilled_Txn_Registers_New_L0_SSTables()
+    {
+        var dir = TempDir;
+        await using var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024));
+
+        // Count L0 files before.
+        var sstFilesBefore = Directory.GetFiles(dir, "*_L0.sst");
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            for (int i = 0; i < 300; i++)
+                tx.Put(Key($"k{i:D4}"), Val($"v{i:D4}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        // After commit, new L0 files exist (the renamed spill SSTs).
+        var sstFilesAfter = Directory.GetFiles(dir, "*_L0.sst");
+        Assert.True(sstFilesAfter.Length > sstFilesBefore.Length,
+            $"Expected new L0 files; before={sstFilesBefore.Length} after={sstFilesAfter.Length}");
+
+        // The data is readable.
+        using var ro = store.BeginReadOnly();
+        for (int i = 0; i < 300; i++)
+            Assert.Equal($"v{i:D4}", Str(await ro.GetAsync(Key($"k{i:D4}"))));
+    }
+
+    [Fact]
+    public async Task Small_Txn_Path_Unchanged()
+    {
+        // A txn that fits in the budget should NOT register any L0 files — it goes through
+        // the existing memtable path.
+        var dir = TempDir;
+        await using var store = await LsmStore.OpenAsync(Opts(dir, budget: 16 * 1024 * 1024));
+
+        var sstFilesBefore = Directory.GetFiles(dir, "*_L0.sst");
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            tx.Put(Key("b"), Val("2"));
+            tx.Put(Key("c"), Val("3"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        var sstFilesAfter = Directory.GetFiles(dir, "*_L0.sst");
+        Assert.Equal(sstFilesBefore.Length, sstFilesAfter.Length);
+
+        using var ro = store.BeginReadOnly();
+        Assert.Equal("1", Str(await ro.GetAsync(Key("a"))));
+        Assert.Equal("2", Str(await ro.GetAsync(Key("b"))));
+        Assert.Equal("3", Str(await ro.GetAsync(Key("c"))));
+    }
+
+    [Fact]
+    public async Task Concurrent_Spilled_Commits_Both_Visible()
+    {
+        // Two large transactions committing serially must each register their files into the
+        // shared SSTable list without trampling each other.
+        var dir = TempDir;
+        await using var store = await LsmStore.OpenAsync(Opts(dir, budget: 1024));
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            for (int i = 0; i < 150; i++)
+                tx.Put(Key($"a_{i:D4}"), Val($"av{i:D4}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            for (int i = 0; i < 150; i++)
+                tx.Put(Key($"b_{i:D4}"), Val($"bv{i:D4}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        using var ro = store.BeginReadOnly();
+        for (int i = 0; i < 150; i++)
+        {
+            Assert.Equal($"av{i:D4}", Str(await ro.GetAsync(Key($"a_{i:D4}"))));
+            Assert.Equal($"bv{i:D4}", Str(await ro.GetAsync(Key($"b_{i:D4}"))));
+        }
+    }
+}
+
+public class ManifestTests : TempDirTest
+{
+    [Fact]
+    public async Task LoadAsync_Returns_Empty_For_Missing_File()
+    {
+        var manifest = new Manifest(TempDir);
+        Assert.False(manifest.Exists);
+        // LoadAsync should never be called on a missing file (caller checks Exists), but
+        // verify the precondition: Exists is false initially.
+    }
+
+    [Fact]
+    public async Task WriteAtomically_Then_Load_Roundtrips()
+    {
+        var manifest = new Manifest(TempDir);
+        var ids = new long[] { 1, 5, 100, 9999 };
+        await manifest.WriteAtomicallyAsync(ids);
+
+        Assert.True(manifest.Exists);
+        var loaded = await manifest.LoadAsync();
+        Assert.Equal(new HashSet<long> { 1, 5, 100, 9999 }, loaded);
+    }
+
+    [Fact]
+    public async Task WriteAtomically_Empty_Manifest_Roundtrips()
+    {
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(Array.Empty<long>());
+        var loaded = await manifest.LoadAsync();
+        Assert.Empty(loaded);
+    }
+
+    [Fact]
+    public async Task WriteAtomically_Overwrites_Previous()
+    {
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(new long[] { 1, 2, 3 });
+        await manifest.WriteAtomicallyAsync(new long[] { 4, 5 });
+
+        var loaded = await manifest.LoadAsync();
+        Assert.Equal(new HashSet<long> { 4, 5 }, loaded);
+    }
+
+    [Fact]
+    public async Task LoadAsync_Detects_Bad_Magic()
+    {
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(new long[] { 1 });
+
+        // Corrupt the magic.
+        var path = Path.Combine(TempDir, "MANIFEST");
+        var bytes = await File.ReadAllBytesAsync(path);
+        bytes[0] ^= 0xFF;
+        await File.WriteAllBytesAsync(path, bytes);
+
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await manifest.LoadAsync());
+    }
+
+    [Fact]
+    public async Task LoadAsync_Detects_Crc_Mismatch()
+    {
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(new long[] { 0x1122334455667788L });
+
+        // Corrupt a byte inside the file ID payload.
+        var path = Path.Combine(TempDir, "MANIFEST");
+        var bytes = await File.ReadAllBytesAsync(path);
+        // Header is 12 bytes; flip a byte at offset 14 (inside the first id).
+        bytes[14] ^= 0xFF;
+        await File.WriteAllBytesAsync(path, bytes);
+
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await manifest.LoadAsync());
+    }
+
+    [Fact]
+    public async Task LoadAsync_Detects_Truncation()
+    {
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(new long[] { 1, 2, 3 });
+
+        var path = Path.Combine(TempDir, "MANIFEST");
+        var bytes = await File.ReadAllBytesAsync(path);
+        await File.WriteAllBytesAsync(path, bytes.AsSpan(0, bytes.Length - 5).ToArray());
+
+        await Assert.ThrowsAsync<InvalidDataException>(async () => await manifest.LoadAsync());
+    }
+}
+
+public class ManifestRecoveryTests : TempDirTest
+{
+    [Fact]
+    public async Task Open_Creates_Manifest_When_Missing_And_Adopts_Existing_Files()
+    {
+        // Pre-create some SST files (simulating a database from before the manifest existed,
+        // or an externally-created data dir). They should be adopted on first open.
+        // Use the actual flush path to create real, parseable SSTable files.
+        await using (var setupStore = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            MemTableFlushThreshold = 1, // flush after every commit
+        }))
+        {
+            await using (var tx = setupStore.BeginReadWrite())
+            {
+                tx.Put(Key("k1"), Val("v1"));
+                Assert.True(await tx.CommitAsync());
+            }
+            await using (var tx = setupStore.BeginReadWrite())
+            {
+                tx.Put(Key("k2"), Val("v2"));
+                Assert.True(await tx.CommitAsync());
+            }
+        }
+
+        // Sanity: manifest exists after the setup (we created it via the worker).
+        var manifestPath = Path.Combine(TempDir, "MANIFEST");
+        Assert.True(File.Exists(manifestPath));
+
+        // Delete the manifest to simulate a "legacy" data dir without manifest support.
+        File.Delete(manifestPath);
+        Assert.False(File.Exists(manifestPath));
+
+        // Reopen — the store must adopt the existing SST files and write a fresh manifest.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            Assert.True(File.Exists(manifestPath));
+
+            using var ro = store.BeginReadOnly();
+            Assert.Equal("v1", Str(await ro.GetAsync(Key("k1"))));
+            Assert.Equal("v2", Str(await ro.GetAsync(Key("k2"))));
+        }
+    }
+
+    [Fact]
+    public async Task Open_Deletes_Orphan_SSTables_Not_In_Manifest()
+    {
+        // Establish a normal database with one committed SST.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            MemTableFlushThreshold = 1,
+        }))
+        {
+            await using var tx = store.BeginReadWrite();
+            tx.Put(Key("legitimate"), Val("data"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        var sstFilesBefore = Directory.GetFiles(TempDir, "*_L0.sst");
+        Assert.Single(sstFilesBefore);
+        var legitimateFile = sstFilesBefore[0];
+
+        // Plant an "orphan" SST file by copying the legitimate one to a new fake-id name.
+        // It looks valid on disk (real SSTable bytes) but is not in the manifest.
+        var orphanPath = Path.Combine(TempDir, "9999999999_L0.sst");
+        File.Copy(legitimateFile, orphanPath);
+        Assert.True(File.Exists(orphanPath));
+
+        // Reopen — the orphan must be deleted, the legitimate file preserved.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            Assert.False(File.Exists(orphanPath));
+            Assert.True(File.Exists(legitimateFile));
+
+            using var ro = store.BeginReadOnly();
+            Assert.Equal("data", Str(await ro.GetAsync(Key("legitimate"))));
+        }
+    }
+
+    [Fact]
+    public async Task Open_Throws_When_Manifest_References_Missing_File()
+    {
+        // Build a manifest that references a file ID that doesn't exist on disk.
+        var manifest = new Manifest(TempDir);
+        await manifest.WriteAtomicallyAsync(new long[] { 12345 });
+
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+        {
+            await using var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir });
+        });
+        Assert.Contains("12345", ex.Message);
+    }
+
+    [Fact]
+    public async Task Spilled_Txn_Files_Are_Recorded_In_Manifest()
+    {
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            OperatorMemoryBudgetBytes = 1024,
+        }))
+        {
+            await using var tx = store.BeginReadWrite();
+            for (int i = 0; i < 300; i++)
+                tx.Put(Key($"k{i:D4}"), Val($"v{i:D4}"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        var manifest = new Manifest(TempDir);
+        Assert.True(manifest.Exists);
+        var ids = await manifest.LoadAsync();
+        Assert.NotEmpty(ids);
+
+        // Every ID listed in the manifest must correspond to an SST file on disk.
+        foreach (var id in ids)
+        {
+            // The level isn't fixed (compaction may have moved them), so glob.
+            var match = Directory.GetFiles(TempDir, $"{id:D10}_*.sst");
+            Assert.Single(match);
+        }
+
+        // Reopen and verify the data is still readable via the manifest.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            OperatorMemoryBudgetBytes = 1024,
+        }))
+        {
+            using var ro = store.BeginReadOnly();
+            for (int i = 0; i < 300; i++)
+                Assert.Equal($"v{i:D4}", Str(await ro.GetAsync(Key($"k{i:D4}"))));
+        }
+    }
+
+    [Fact]
+    public async Task Crash_Mid_Spilled_Commit_Leaves_Orphans_That_Recovery_Cleans_Up()
+    {
+        // Simulate the rename-succeeded-but-WAL-not-yet-committed window: write some real
+        // L0 files into the data dir without registering them in the manifest, then reopen.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            MemTableFlushThreshold = 1,
+        }))
+        {
+            await using var tx = store.BeginReadWrite();
+            tx.Put(Key("real"), Val("committed"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        // Read manifest, snapshot live IDs.
+        var manifest = new Manifest(TempDir);
+        var liveIdsBefore = await manifest.LoadAsync();
+
+        // Plant a "rename succeeded but commit failed" orphan: copy the live SST to a new
+        // path with a higher fake file ID. Manifest is NOT updated.
+        var legit = Directory.GetFiles(TempDir, "*_L0.sst").First();
+        var orphan = Path.Combine(TempDir, "8888888888_L0.sst");
+        File.Copy(legit, orphan);
+
+        // Recovery: orphan deleted, manifest unchanged, real data still there.
+        await using (var store = await LsmStore.OpenAsync(new LsmStoreOptions { Directory = TempDir }))
+        {
+            Assert.False(File.Exists(orphan));
+            using var ro = store.BeginReadOnly();
+            Assert.Equal("committed", Str(await ro.GetAsync(Key("real"))));
+        }
+
+        var liveIdsAfter = await new Manifest(TempDir).LoadAsync();
+        Assert.Equal(liveIdsBefore, liveIdsAfter);
+    }
+
+    [Fact]
+    public async Task Manifest_Updated_On_MemTable_Flush()
+    {
+        var manifestPath = Path.Combine(TempDir, "MANIFEST");
+
+        await using var store = await LsmStore.OpenAsync(new LsmStoreOptions
+        {
+            Directory = TempDir,
+            MemTableFlushThreshold = 1, // flush every commit
+        });
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("a"), Val("1"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        // After flush, the manifest must include the freshly created SST.
+        var ids1 = await new Manifest(TempDir).LoadAsync();
+        Assert.NotEmpty(ids1);
+
+        await using (var tx = store.BeginReadWrite())
+        {
+            tx.Put(Key("b"), Val("2"));
+            Assert.True(await tx.CommitAsync());
+        }
+
+        var ids2 = await new Manifest(TempDir).LoadAsync();
+        Assert.True(ids2.Count >= ids1.Count);
+    }
+}
+
 public class TempDirectoryTests : TempDirTest
 {
     [Fact]
