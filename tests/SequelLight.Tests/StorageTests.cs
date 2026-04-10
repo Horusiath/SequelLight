@@ -854,6 +854,230 @@ public class BlockCacheTests : TempDirTest
     }
 }
 
+public class KWayMergerTests
+{
+    /// <summary>
+    /// In-memory IMergeSource over a list of (key, value-or-null) tuples for unit tests.
+    /// A null value encodes a tombstone.
+    /// </summary>
+    private sealed class InMemorySource : IMergeSource<byte[], byte[]>
+    {
+        private readonly (byte[] Key, byte[] Value, bool Tombstone)[] _entries;
+        private int _idx = -1;
+
+        public InMemorySource(IEnumerable<(string, string?)> entries)
+        {
+            _entries = entries
+                .Select(e => (
+                    Encoding.UTF8.GetBytes(e.Item1),
+                    e.Item2 is null ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(e.Item2),
+                    e.Item2 is null))
+                .ToArray();
+        }
+
+        public ValueTask<bool> MoveNextAsync()
+        {
+            _idx++;
+            return ValueTask.FromResult(_idx < _entries.Length);
+        }
+
+        public byte[] CurrentKey => _entries[_idx].Key;
+        public byte[] CurrentValue => _entries[_idx].Value;
+        public bool CurrentIsTombstone => _entries[_idx].Tombstone;
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private static IReadOnlyList<IMergeSource<byte[], byte[]>> Sources(
+        params IEnumerable<(string, string?)>[] entryLists)
+        => entryLists.Select(l => (IMergeSource<byte[], byte[]>)new InMemorySource(l)).ToList();
+
+    private static async Task<List<(string Key, string? Value)>> Drain(KWayMerger<byte[], byte[]> merger)
+    {
+        var result = new List<(string, string?)>();
+        while (await merger.MoveNextAsync())
+        {
+            result.Add((
+                Encoding.UTF8.GetString(merger.CurrentKey),
+                merger.CurrentIsTombstone ? null : Encoding.UTF8.GetString(merger.CurrentValue)));
+        }
+        return result;
+    }
+
+    [Fact]
+    public async Task SingleSource_YieldsAllInOrder()
+    {
+        var sources = Sources(new (string, string?)[] { ("a", "1"), ("b", "2"), ("c", "3") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.Equal(
+            new (string, string?)[] { ("a", "1"), ("b", "2"), ("c", "3") },
+            await Drain(merger));
+    }
+
+    [Fact]
+    public async Task TwoSources_InterleavedByKey()
+    {
+        var sources = Sources(
+            new (string, string?)[] { ("a", "A"), ("c", "C") },
+            new (string, string?)[] { ("b", "B"), ("d", "D") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.Equal(
+            new (string, string?)[] { ("a", "A"), ("b", "B"), ("c", "C"), ("d", "D") },
+            await Drain(merger));
+    }
+
+    [Fact]
+    public async Task DuplicateKeys_NewerSourceWins()
+    {
+        // Source 0 is "newest" by convention; on a tie, its value wins.
+        var sources = Sources(
+            new (string, string?)[] { ("k", "new") },
+            new (string, string?)[] { ("k", "old") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.Equal(new (string, string?)[] { ("k", "new") }, await Drain(merger));
+    }
+
+    [Fact]
+    public async Task NewerTombstoneShadowsOlderLive()
+    {
+        var sources = Sources(
+            new (string, string?)[] { ("k", null) },
+            new (string, string?)[] { ("k", "old") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        var result = await Drain(merger);
+        Assert.Single(result);
+        Assert.Equal("k", result[0].Key);
+        Assert.Null(result[0].Value);
+    }
+
+    [Fact]
+    public async Task NewerLiveShadowsOlderTombstone()
+    {
+        var sources = Sources(
+            new (string, string?)[] { ("k", "resurrected") },
+            new (string, string?)[] { ("k", null) });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.Equal(new (string, string?)[] { ("k", "resurrected") }, await Drain(merger));
+    }
+
+    [Fact]
+    public async Task EmptySources_Skipped()
+    {
+        var sources = Sources(
+            Array.Empty<(string, string?)>(),
+            new (string, string?)[] { ("a", "A") },
+            Array.Empty<(string, string?)>());
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.Equal(new (string, string?)[] { ("a", "A") }, await Drain(merger));
+    }
+
+    [Fact]
+    public async Task AllEmpty_ReturnsFalseImmediately()
+    {
+        var sources = Sources(
+            Array.Empty<(string, string?)>(),
+            Array.Empty<(string, string?)>());
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        Assert.False(await merger.MoveNextAsync());
+    }
+
+    [Fact]
+    public async Task ManySourcesInterleaved_FullySorted()
+    {
+        // Three sources, each contributing every third key in [0..30).
+        static IEnumerable<(string, string?)> Stride(int offset) =>
+            Enumerable.Range(0, 10).Select(i =>
+                ((string, string?))($"k{i * 3 + offset:D2}", $"v{i * 3 + offset}"));
+
+        var sources = Sources(Stride(0), Stride(1), Stride(2));
+        await using var merger = KWayMerger<byte[], byte[]>.Create(sources, KeyComparer.Instance);
+
+        var result = await Drain(merger);
+        Assert.Equal(30, result.Count);
+        for (int i = 0; i < 30; i++)
+        {
+            Assert.Equal($"k{i:D2}", result[i].Key);
+            Assert.Equal($"v{i}", result[i].Value);
+        }
+    }
+
+    [Fact]
+    public async Task Combiner_FoldsValuesForSameKey()
+    {
+        // Sum integer values across sources keyed by string. valueCloner is identity for byte[].
+        var sources = Sources(
+            new (string, string?)[] { ("a", "1"), ("b", "10"), ("c", "100") },
+            new (string, string?)[] { ("a", "2"), ("b", "20") },
+            new (string, string?)[] { ("a", "3") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(
+            sources,
+            KeyComparer.Instance,
+            combiner: (l, r) => Encoding.UTF8.GetBytes(
+                (int.Parse(Encoding.UTF8.GetString(l)) + int.Parse(Encoding.UTF8.GetString(r))).ToString()),
+            valueCloner: v => v);
+
+        Assert.Equal(
+            new (string, string?)[] { ("a", "6"), ("b", "30"), ("c", "100") },
+            await Drain(merger));
+    }
+
+    [Fact]
+    public void Combiner_WithoutCloner_Throws()
+    {
+        var sources = Sources(new (string, string?)[] { ("a", "1") });
+        Assert.Throws<ArgumentException>(() =>
+            KWayMerger<byte[], byte[]>.Create(
+                sources,
+                KeyComparer.Instance,
+                combiner: (l, r) => l));
+    }
+
+    [Fact]
+    public async Task Combiner_SkipsTombstones_FoldsLiveOnly()
+    {
+        var sources = Sources(
+            new (string, string?)[] { ("a", "1"), ("b", null) },
+            new (string, string?)[] { ("a", "2"), ("b", "10") },
+            new (string, string?)[] { ("b", "20") });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(
+            sources,
+            KeyComparer.Instance,
+            combiner: (l, r) => Encoding.UTF8.GetBytes(
+                (int.Parse(Encoding.UTF8.GetString(l)) + int.Parse(Encoding.UTF8.GetString(r))).ToString()),
+            valueCloner: v => v);
+
+        // 'a': 1 + 2 = 3. 'b': null tombstone is skipped, live values 10 + 20 = 30.
+        Assert.Equal(
+            new (string, string?)[] { ("a", "3"), ("b", "30") },
+            await Drain(merger));
+    }
+
+    [Fact]
+    public async Task Combiner_AllTombstonesForKey_EmitsTombstone()
+    {
+        var sources = Sources(
+            new (string, string?)[] { ("a", null) },
+            new (string, string?)[] { ("a", null) });
+        await using var merger = KWayMerger<byte[], byte[]>.Create(
+            sources,
+            KeyComparer.Instance,
+            combiner: (l, r) => l,
+            valueCloner: v => v);
+
+        var result = await Drain(merger);
+        Assert.Single(result);
+        Assert.Equal("a", result[0].Key);
+        Assert.Null(result[0].Value);
+    }
+}
+
 public class CompactionTests
 {
     [Fact]

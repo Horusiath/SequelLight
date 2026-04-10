@@ -268,73 +268,39 @@ public sealed class LsmStore : IAsyncDisposable
         int fileId = Interlocked.Increment(ref _nextFileId);
         string outputPath = Path.Combine(_options.Directory, $"{fileId:D10}_L{plan.TargetLevel}.sst");
         int maxLevel = _options.CompactionStrategy.MaxLevels - 1;
+        bool dropTombstones = plan.TargetLevel == maxLevel;
 
-        // Sort inputs: newest (highest file ID) first so they win on duplicate keys
+        // Sort inputs: newest (highest file ID) first so they win on duplicate keys.
         var sortedInputs = plan.InputTables.OrderByDescending(t => ParseFileId(t.FilePath)).ToList();
 
-        // Use SSTableScanner for efficient iteration: keys are allocated per entry (needed by
-        // PQ and writer), but value buffers are pooled and reused across entries.
-        var scanners = new SSTableScanner?[sortedInputs.Count];
-        try
+        // Wrap each SSTable scanner as a merge source. Scanners reuse pooled value buffers
+        // across entries; the merger borrows the value memory and we hand it directly to the
+        // writer before advancing, so no copy is needed in dedup mode.
+        var sources = new List<IMergeSource<byte[], ReadOnlyMemory<byte>>>(sortedInputs.Count);
+        foreach (var input in sortedInputs)
         {
-            for (int i = 0; i < sortedInputs.Count; i++)
+            if (input.Reader is not null)
+                sources.Add(new SSTableMergeSource(input.Reader.CreateScanner()));
+        }
+
+        await using (var merger = KWayMerger<byte[], ReadOnlyMemory<byte>>.Create(sources, KeyComparer.Instance))
+        await using (var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize))
+        {
+            while (await merger.MoveNextAsync().ConfigureAwait(false))
             {
-                var inputReader = sortedInputs[i].Reader;
-                if (inputReader is not null)
-                    scanners[i] = inputReader.CreateScanner();
-            }
-
-            // Seed priority queue: (sourceIndex) ordered by (key, sourceIndex)
-            var pq = new PriorityQueue<int, MergeKey>(new MergeKeyComparer());
-            for (int i = 0; i < scanners.Length; i++)
-            {
-                if (scanners[i] is not null && await scanners[i]!.MoveNextAsync().ConfigureAwait(false))
-                    pq.Enqueue(i, new MergeKey(scanners[i]!.CurrentKey, i));
-            }
-
-            await using var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize);
-            byte[]? prevKey = null;
-
-            while (pq.TryDequeue(out int srcIdx, out _))
-            {
-                var scanner = scanners[srcIdx]!;
-                var key = scanner.CurrentKey;
-                bool isTombstone = scanner.IsTombstone;
-
-                // Check for duplicate keys BEFORE writing — skip entries already emitted
-                // from a newer source.
-                bool isDuplicate = prevKey is not null &&
-                    key.AsSpan().SequenceCompareTo(prevKey) == 0;
-
-                if (!isDuplicate)
+                if (merger.CurrentIsTombstone)
                 {
-                    prevKey = key;
-
-                    // Write entry while scanner's value buffer is still valid (before advance).
-                    // Drop tombstones at max level.
-                    if (!(isTombstone && plan.TargetLevel == maxLevel))
-                    {
-                        if (isTombstone)
-                            await writer.WriteEntryAsync(key, null).ConfigureAwait(false);
-                        else
-                            await writer.WriteEntryAsync(key, scanner.CurrentValueMemory, isTombstone).ConfigureAwait(false);
-                    }
+                    if (dropTombstones) continue;
+                    await writer.WriteEntryAsync(merger.CurrentKey, null).ConfigureAwait(false);
                 }
-
-                // Advance source AFTER the value has been consumed by the writer
-                if (await scanner.MoveNextAsync().ConfigureAwait(false))
-                    pq.Enqueue(srcIdx, new MergeKey(scanner.CurrentKey, srcIdx));
+                else
+                {
+                    await writer.WriteEntryAsync(merger.CurrentKey, merger.CurrentValue, isTombstone: false)
+                        .ConfigureAwait(false);
+                }
             }
 
             await writer.FinishAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            foreach (var s in scanners)
-            {
-                if (s is not null)
-                    await s.DisposeAsync().ConfigureAwait(false);
-            }
         }
 
         // Open reader for new SSTable
@@ -397,16 +363,6 @@ public sealed class LsmStore : IAsyncDisposable
         _blockCache?.Dispose();
     }
 
-    private readonly record struct MergeKey(byte[] Key, int SourceIndex);
-
-    private sealed class MergeKeyComparer : IComparer<MergeKey>
-    {
-        public int Compare(MergeKey x, MergeKey y)
-        {
-            int cmp = x.Key.AsSpan().SequenceCompareTo(y.Key);
-            return cmp != 0 ? cmp : x.SourceIndex.CompareTo(y.SourceIndex);
-        }
-    }
 }
 
 /// <summary>
