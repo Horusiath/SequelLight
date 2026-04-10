@@ -1596,8 +1596,13 @@ public sealed class QueryPlanner
             }
             else
             {
-                // HashJoin — no sort needed, O(n+m) average
-                result = new HashJoin(left, right, leftKeyIndices, rightKeyIndices, join.Kind);
+                // HashJoin — no sort needed, O(n+m) average. With a spill context configured
+                // it will pivot to sort-merge at runtime if the build side overflows the budget.
+                var store = tx.OwningStore;
+                result = new HashJoin(
+                    left, right, leftKeyIndices, rightKeyIndices, join.Kind,
+                    memoryBudgetBytes: store.OperatorMemoryBudgetBytes,
+                    allocateSpillPath: store.AllocateSpillFilePath);
                 outputOrder = Array.Empty<SortKey>();
             }
 

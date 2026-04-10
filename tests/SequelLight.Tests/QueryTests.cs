@@ -1977,6 +1977,195 @@ public class HashJoinTests : TempDirTest
     }
 }
 
+public class HashJoinSpillFallbackTests : TempDirTest
+{
+    [Fact]
+    public async Task HashJoin_Pivots_To_SortMerge_When_Build_Side_Overflows_Budget()
+    {
+        // Tiny budget forces the build phase to overflow mid-drain. The operator must pivot
+        // to sort-merge and produce the same result a regular hash join would.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 200 left rows, 200 right rows. fk values 0..199 — every left row matches exactly one
+        // right row. The right side is the build side; with budget 1024 and ~256 B per row
+        // overhead, the pivot triggers after about 4 rows.
+        for (int i = 0; i < 200; i++)
+        {
+            cmd.CommandText = $"INSERT INTO a VALUES ({i}, {i}, 'lv{i:D3}')";
+            await cmd.ExecuteNonQueryAsync();
+            cmd.CommandText = $"INSERT INTO b VALUES ({i}, {i}, 'rv{i:D3}')";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        // Join on fk (non-PK on both) — planner picks HashJoin, which then pivots.
+        cmd.CommandText = "SELECT a.val, b.info FROM a INNER JOIN b ON a.fk = b.fk";
+        var pairs = new List<(string, string)>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                pairs.Add((reader.GetString(0), reader.GetString(1)));
+        }
+
+        Assert.Equal(200, pairs.Count);
+        for (int i = 0; i < 200; i++)
+            Assert.Contains(($"lv{i:D3}", $"rv{i:D3}"), pairs);
+
+        // Spill files cleaned up after dispose.
+        var tmpDir = Path.Combine(TempDir, "tmp");
+        if (Directory.Exists(tmpDir))
+            Assert.Empty(Directory.GetFiles(tmpDir, "spill_*.sst"));
+    }
+
+    [Fact]
+    public async Task HashJoin_Pivot_Preserves_Left_Join_Semantics()
+    {
+        // LEFT JOIN under spill fallback: the merge join must still emit unmatched left rows
+        // with NULL right columns.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 100 left rows with fk = id. b only has fk values for even ids → odd left rows are
+        // unmatched and should appear with NULL info under LEFT JOIN.
+        for (int i = 0; i < 100; i++)
+        {
+            cmd.CommandText = $"INSERT INTO a VALUES ({i}, {i}, 'lv{i:D3}')";
+            await cmd.ExecuteNonQueryAsync();
+            if (i % 2 == 0)
+            {
+                cmd.CommandText = $"INSERT INTO b VALUES ({i}, {i}, 'rv{i:D3}')";
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+
+        cmd.CommandText = "SELECT a.val, b.info FROM a LEFT JOIN b ON a.fk = b.fk";
+        var pairs = new List<(string Val, string? Info)>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                pairs.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+        }
+
+        Assert.Equal(100, pairs.Count);
+        int matched = pairs.Count(p => p.Info is not null);
+        int unmatched = pairs.Count(p => p.Info is null);
+        Assert.Equal(50, matched);   // even ids
+        Assert.Equal(50, unmatched); // odd ids
+        for (int i = 0; i < 100; i++)
+        {
+            string lv = $"lv{i:D3}";
+            string? expectedRight = i % 2 == 0 ? $"rv{i:D3}" : null;
+            Assert.Contains((lv, expectedRight), pairs);
+        }
+    }
+
+    [Fact]
+    public async Task HashJoin_Pivot_Handles_OneToMany_Right_Side()
+    {
+        // Many-to-many with duplicates on the build side: each left row matches multiple
+        // right rows. The merge join's right-buffer logic must still produce the cross product.
+        var connStr = $"Data Source={TempDir};Operator Memory Budget=1024";
+        await using var conn = new SequelLightConnection(connStr);
+        await conn.OpenAsync();
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 50 left rows with unique fk. Each fk has 4 matching right rows.
+        // Total expected output: 50 * 4 = 200 pairs.
+        int rid = 0;
+        for (int i = 0; i < 50; i++)
+        {
+            cmd.CommandText = $"INSERT INTO a VALUES ({i}, {i})";
+            await cmd.ExecuteNonQueryAsync();
+            for (int j = 0; j < 4; j++)
+            {
+                cmd.CommandText = $"INSERT INTO b VALUES ({rid++}, {i}, 'r{i:D2}_{j}')";
+                await cmd.ExecuteNonQueryAsync();
+            }
+        }
+
+        cmd.CommandText = "SELECT a.fk, b.info FROM a INNER JOIN b ON a.fk = b.fk";
+        var pairs = new List<(long, string)>();
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+                pairs.Add((reader.GetInt64(0), reader.GetString(1)));
+        }
+
+        Assert.Equal(200, pairs.Count);
+        // Each (fk, info) appears exactly once.
+        var distinctPairs = new HashSet<(long, string)>(pairs);
+        Assert.Equal(200, distinctPairs.Count);
+        for (int i = 0; i < 50; i++)
+            for (int j = 0; j < 4; j++)
+                Assert.Contains(((long)i, $"r{i:D2}_{j}"), distinctPairs);
+    }
+
+    [Fact]
+    public async Task HashJoin_Spilled_Result_Matches_Default()
+    {
+        // Same join executed under default budget vs tiny budget — results must agree exactly.
+        var data = new List<(int aId, int aFk, string aVal, int bId, int bFk, string bInfo)>();
+        var rng = new Random(13);
+        for (int i = 0; i < 150; i++)
+        {
+            int fk = rng.Next(0, 30);
+            data.Add((i, fk, $"av{i:D3}", i, fk, $"bv{i:D3}"));
+        }
+
+        async Task<List<(string a, string b)>> RunQuery(string connStr)
+        {
+            var subdir = Path.Combine(TempDir, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(subdir);
+            await using var conn = new SequelLightConnection(connStr.Replace(TempDir, subdir));
+            await conn.OpenAsync();
+            var c = conn.CreateCommand();
+            c.CommandText = "CREATE TABLE a (id INTEGER PRIMARY KEY, fk INTEGER, val TEXT)";
+            await c.ExecuteNonQueryAsync();
+            c.CommandText = "CREATE TABLE b (id INTEGER PRIMARY KEY, fk INTEGER, info TEXT)";
+            await c.ExecuteNonQueryAsync();
+            foreach (var (aId, aFk, aVal, bId, bFk, bInfo) in data)
+            {
+                c.CommandText = $"INSERT INTO a VALUES ({aId}, {aFk}, '{aVal}')";
+                await c.ExecuteNonQueryAsync();
+                c.CommandText = $"INSERT INTO b VALUES ({bId}, {bFk}, '{bInfo}')";
+                await c.ExecuteNonQueryAsync();
+            }
+            c.CommandText = "SELECT a.val, b.info FROM a INNER JOIN b ON a.fk = b.fk";
+            var rows = new List<(string, string)>();
+            await using var rd = await c.ExecuteReaderAsync();
+            while (await rd.ReadAsync())
+                rows.Add((rd.GetString(0), rd.GetString(1)));
+            return rows;
+        }
+
+        var inMem = await RunQuery($"Data Source={TempDir}");
+        var spill = await RunQuery($"Data Source={TempDir};Operator Memory Budget=512");
+
+        // Same multiset of (a.val, b.info) pairs regardless of operator chosen.
+        Assert.Equal(inMem.Count, spill.Count);
+        Assert.Equal(new HashSet<(string, string)>(inMem), new HashSet<(string, string)>(spill));
+    }
+}
+
 public class ProjectionPushdownIntegrationTests : TempDirTest
 {
     private async Task<SequelLightConnection> OpenConnectionAsync()
