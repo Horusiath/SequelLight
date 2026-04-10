@@ -2,19 +2,54 @@ using System.Runtime.CompilerServices;
 
 namespace SequelLight.Data;
 
+/// <summary>
+/// Storage type tag, encoded as a single byte where each bit carries semantic meaning so
+/// classification predicates compile to single bit-AND operations.
+///
+/// <para>Bit layout (big-endian for readability):</para>
+/// <code>
+///   bit 7   non-null flag       (0 = NULL)
+///   bit 6   datetime flag       (1 = logical DateTime; storage is still integer ticks)
+///   bits 5-4 variable-length tag (00 = fixed, 01 = bytes, 10 = text, 11 = json)
+///   bit 3   float64 flag        (1 = REAL; mutually exclusive with var-length tags)
+///   bit 2   signed-integer flag (1 = signed)
+///   bits 1-0 integer width      (00 = 8, 01 = 16, 10 = 32, 11 = 64)
+/// </code>
+///
+/// <para>
+/// Predicate masks (see <see cref="DbTypeExtensions"/>):
+/// </para>
+/// <list type="bullet">
+///   <item><c>IsInteger</c>: <c>(t &amp; 0b1011_1000) == 0b1000_0000</c> — non-null + no float + no var-length. Includes <see cref="DateTime"/> because its storage IS integer ticks.</item>
+///   <item><c>IsNumeric</c>: <c>(t &amp; 0b1011_0000) == 0b1000_0000</c> — non-null + no var-length. Includes int, float, datetime.</item>
+///   <item><c>IsVariableLength</c>: <c>(t &amp; 0b0011_0000) != 0</c> — bytes/text/json.</item>
+///   <item><c>IsDateTime</c>: <c>(t &amp; 0b0100_0000) != 0</c> — bit 6 set.</item>
+///   <item><c>FixedByteWidth</c>: <c>1 &lt;&lt; (t &amp; 0b0000_0011)</c> for any numeric type.</item>
+/// </list>
+///
+/// <para>
+/// <see cref="Float64"/> sets the low 2 bits to 11 (matching the 64-bit width index for
+/// integers) so <c>FixedByteWidth</c> works uniformly across all numeric types — no special
+/// case for floats. <see cref="DateTime"/> reuses <see cref="UInt64"/>'s low bits (storage
+/// IS UInt64 ticks) and adds the datetime bit.
+/// </para>
+/// </summary>
 public enum DbType : byte
 {
-    UInt8 = 1,
-    UInt16 = 2,
-    UInt32 = 3,
-    UInt64 = 4,
-    Int8 = 5,
-    Int16 = 6,
-    Int32 = 7,
-    Int64 = 8,
-    Float64 = 9,
-    Bytes = 10,
-    Text = 11,
+    Null     = 0b0000_0000,
+    UInt8    = 0b1000_0000,
+    UInt16   = 0b1000_0001,
+    UInt32   = 0b1000_0010,
+    UInt64   = 0b1000_0011,
+    Int8     = 0b1000_0100,
+    Int16    = 0b1000_0101,
+    Int32    = 0b1000_0110,
+    Int64    = 0b1000_0111,
+    Float64  = 0b1000_1011,
+    Bytes    = 0b1001_0000,
+    Text     = 0b1010_0000,
+    Json     = 0b1011_0000,
+    DateTime = 0b1100_0011,
 }
 
 /// <summary>
@@ -24,6 +59,12 @@ public enum DbType : byte
 /// data reader can surface it as a CLR <see cref="System.DateTime"/> instead of a raw long.
 /// One byte per projection column; <c>None</c> means "use the physical type as-is".
 /// </summary>
+/// <remarks>
+/// TODO (step 2 of the DbType refactor): once row decoders construct
+/// <see cref="DbValue.DateTime"/> values directly for DATE / DATETIME / TIMESTAMP columns,
+/// this enum and the projection-level affinity propagation can be removed entirely. The
+/// data reader will check <see cref="DbType.DateTime"/> on the value itself.
+/// </remarks>
 public enum ColumnTypeAffinity : byte
 {
     None = 0,
@@ -34,27 +75,62 @@ public enum ColumnTypeAffinity : byte
 
 public static class DbTypeExtensions
 {
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool IsInteger(this DbType type) => type >= DbType.UInt8 && type <= DbType.Int64;
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool IsUnsigned(this DbType type) => type >= DbType.UInt8 && type <= DbType.UInt64;
-
     /// <summary>
-    /// Returns the fixed byte size for scalar types, or -1 for variable-length (<see cref="DbType.Bytes"/>, <see cref="DbType.Text"/>).
+    /// True for any value stored as an integer at the storage layer, including
+    /// <see cref="DbType.DateTime"/> (whose storage IS Int64 ticks). Single bit-AND.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int FixedSize(this DbType type) => type switch
-    {
-        DbType.UInt8 or DbType.Int8 => 1,
-        DbType.UInt16 or DbType.Int16 => 2,
-        DbType.UInt32 or DbType.Int32 => 4,
-        DbType.UInt64 or DbType.Int64 or DbType.Float64 => 8,
-        _ => -1,
-    };
+    public static bool IsInteger(this DbType type)
+        => ((byte)type & 0b1011_1000) == 0b1000_0000;
 
+    /// <summary>True iff the type is an unsigned integer (<see cref="UInt8"/>..<see cref="UInt64"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool IsVariableLength(this DbType type) => type == DbType.Bytes || type == DbType.Text;
+    public static bool IsUnsigned(this DbType type)
+        => IsInteger(type) && ((byte)type & 0b0000_0100) == 0;
+
+    /// <summary>True iff the type is a signed integer (<see cref="Int8"/>..<see cref="Int64"/>).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsSigned(this DbType type)
+        => IsInteger(type) && ((byte)type & 0b0000_0100) != 0;
+
+    /// <summary>True iff the type is <see cref="DbType.Float64"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsFloat(this DbType type) => type == DbType.Float64;
+
+    /// <summary>
+    /// True for any numeric storage type — integer (including DateTime) or float.
+    /// Single bit-AND.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsNumeric(this DbType type)
+        => ((byte)type & 0b1011_0000) == 0b1000_0000;
+
+    /// <summary>True iff the type carries the datetime affinity bit (logical DateTime).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsDateTime(this DbType type)
+        => ((byte)type & 0b0100_0000) != 0;
+
+    /// <summary>True for variable-length types: bytes, text, json.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsVariableLength(this DbType type)
+        => ((byte)type & 0b0011_0000) != 0;
+
+    /// <summary>True for text-like variable-length types: text or json.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsTextLike(this DbType type)
+        => ((byte)type & 0b0010_0000) != 0;
+
+    /// <summary>
+    /// Returns the fixed byte width for any numeric type (1, 2, 4, or 8), or <c>-1</c>
+    /// for null and variable-length types. Computed by mask + shift — single instruction
+    /// path on numeric inputs.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int FixedSize(this DbType type)
+    {
+        if (!IsNumeric(type)) return -1;
+        return 1 << ((byte)type & 0b0000_0011);
+    }
 }
 
 public static class TypeAffinity
@@ -132,7 +208,7 @@ public readonly struct DbValue : IEquatable<DbValue>
         _bytes = bytes;
     }
 
-    public bool IsNull => _type == 0;
+    public bool IsNull => _type == DbType.Null;
     public DbType Type => _type;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -146,6 +222,15 @@ public readonly struct DbValue : IEquatable<DbValue>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static DbValue Blob(ReadOnlyMemory<byte> data) => new(DbType.Bytes, 0, data);
+
+    /// <summary>
+    /// Constructs a DateTime value backed by ticks. The storage representation is identical
+    /// to <see cref="Integer"/> — same long bits — but the type tag carries the datetime
+    /// affinity bit so the data reader can surface it as a CLR <see cref="System.DateTime"/>.
+    /// Step 2 of the DbType refactor will switch row decoders to use this for date columns.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static DbValue DateTime(long ticks) => new(DbType.DateTime, ticks, default);
 
     public long AsInteger()
     {
@@ -180,12 +265,13 @@ public readonly struct DbValue : IEquatable<DbValue>
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void ThrowTypeMismatch(string expected)
-        => throw new InvalidOperationException($"Expected {expected}, but value is {(_type == 0 ? "Null" : _type.ToString())}");
+        => throw new InvalidOperationException($"Expected {expected}, but value is {(_type == DbType.Null ? "Null" : _type.ToString())}");
 
     public bool Equals(DbValue other)
     {
         if (_type != other._type) return false;
-        if (_type == 0) return true;
+        if (_type == DbType.Null) return true;
+        // IsInteger now includes DateTime since both are stored as long ticks.
         if (_type.IsInteger() || _type == DbType.Float64)
             return _bits == other._bits;
         return _bytes.Span.SequenceEqual(other._bytes.Span);
@@ -195,7 +281,7 @@ public readonly struct DbValue : IEquatable<DbValue>
 
     public override int GetHashCode()
     {
-        if (_type == 0) return 0;
+        if (_type == DbType.Null) return 0;
         if (_type.IsInteger() || _type == DbType.Float64)
             return HashCode.Combine(_type, _bits);
         var h = new HashCode();
@@ -209,10 +295,11 @@ public readonly struct DbValue : IEquatable<DbValue>
 
     public override string ToString() => _type switch
     {
-        0 => "NULL",
+        DbType.Null => "NULL",
         DbType.Float64 => BitConverter.Int64BitsToDouble(_bits).ToString(),
         DbType.Text => $"'{System.Text.Encoding.UTF8.GetString(_bytes.Span)}'",
         DbType.Bytes => $"x'{Convert.ToHexString(_bytes.Span)}'",
+        DbType.DateTime => DateTimeHelper.FormatDateTime(_bits),
         _ when _type.IsInteger() => _bits.ToString(),
         _ => "?",
     };

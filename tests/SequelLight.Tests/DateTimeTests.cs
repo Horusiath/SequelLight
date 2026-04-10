@@ -2,6 +2,152 @@ using SequelLight.Data;
 
 namespace SequelLight.Tests;
 
+public class DbTypeBitEncodingTests
+{
+    // Snapshot the exact byte values to catch accidental rebases of the bit layout.
+    [Theory]
+    [InlineData(DbType.Null, 0b0000_0000)]
+    [InlineData(DbType.UInt8, 0b1000_0000)]
+    [InlineData(DbType.UInt16, 0b1000_0001)]
+    [InlineData(DbType.UInt32, 0b1000_0010)]
+    [InlineData(DbType.UInt64, 0b1000_0011)]
+    [InlineData(DbType.Int8, 0b1000_0100)]
+    [InlineData(DbType.Int16, 0b1000_0101)]
+    [InlineData(DbType.Int32, 0b1000_0110)]
+    [InlineData(DbType.Int64, 0b1000_0111)]
+    [InlineData(DbType.Float64, 0b1000_1011)]
+    [InlineData(DbType.Bytes, 0b1001_0000)]
+    [InlineData(DbType.Text, 0b1010_0000)]
+    [InlineData(DbType.Json, 0b1011_0000)]
+    [InlineData(DbType.DateTime, 0b1100_0011)]
+    public void Underlying_Byte_Matches_Spec(DbType type, byte expected)
+        => Assert.Equal(expected, (byte)type);
+
+    [Theory]
+    [InlineData(DbType.UInt8, true)]
+    [InlineData(DbType.UInt16, true)]
+    [InlineData(DbType.UInt32, true)]
+    [InlineData(DbType.UInt64, true)]
+    [InlineData(DbType.Int8, true)]
+    [InlineData(DbType.Int16, true)]
+    [InlineData(DbType.Int32, true)]
+    [InlineData(DbType.Int64, true)]
+    [InlineData(DbType.DateTime, true)] // storage IS integer
+    [InlineData(DbType.Float64, false)]
+    [InlineData(DbType.Bytes, false)]
+    [InlineData(DbType.Text, false)]
+    [InlineData(DbType.Json, false)]
+    [InlineData(DbType.Null, false)]
+    public void IsInteger_Storage_Level(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsInteger());
+
+    [Theory]
+    [InlineData(DbType.UInt8, true)]
+    [InlineData(DbType.UInt16, true)]
+    [InlineData(DbType.UInt32, true)]
+    [InlineData(DbType.UInt64, true)]
+    [InlineData(DbType.Int8, false)]
+    [InlineData(DbType.Int64, false)]
+    [InlineData(DbType.DateTime, true)] // shares low bits with UInt64 → unsigned in this scheme
+    [InlineData(DbType.Float64, false)]
+    [InlineData(DbType.Text, false)]
+    public void IsUnsigned(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsUnsigned());
+
+    [Theory]
+    [InlineData(DbType.Int8, true)]
+    [InlineData(DbType.Int16, true)]
+    [InlineData(DbType.Int32, true)]
+    [InlineData(DbType.Int64, true)]
+    [InlineData(DbType.UInt8, false)]
+    [InlineData(DbType.UInt64, false)]
+    [InlineData(DbType.DateTime, false)]
+    [InlineData(DbType.Float64, false)]
+    [InlineData(DbType.Text, false)]
+    public void IsSigned(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsSigned());
+
+    [Theory]
+    [InlineData(DbType.Float64, true)]
+    [InlineData(DbType.Int64, false)]
+    [InlineData(DbType.DateTime, false)]
+    [InlineData(DbType.Bytes, false)]
+    [InlineData(DbType.Null, false)]
+    public void IsFloat(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsFloat());
+
+    [Theory]
+    [InlineData(DbType.UInt8, true)]
+    [InlineData(DbType.Int64, true)]
+    [InlineData(DbType.Float64, true)]
+    [InlineData(DbType.DateTime, true)]
+    [InlineData(DbType.Bytes, false)]
+    [InlineData(DbType.Text, false)]
+    [InlineData(DbType.Json, false)]
+    [InlineData(DbType.Null, false)]
+    public void IsNumeric(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsNumeric());
+
+    [Theory]
+    [InlineData(DbType.DateTime, true)]
+    [InlineData(DbType.Int64, false)]
+    [InlineData(DbType.Float64, false)]
+    [InlineData(DbType.Text, false)]
+    [InlineData(DbType.Null, false)]
+    public void IsDateTime(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsDateTime());
+
+    [Theory]
+    [InlineData(DbType.Bytes, true)]
+    [InlineData(DbType.Text, true)]
+    [InlineData(DbType.Json, true)]
+    [InlineData(DbType.UInt8, false)]
+    [InlineData(DbType.Int64, false)]
+    [InlineData(DbType.Float64, false)]
+    [InlineData(DbType.DateTime, false)]
+    [InlineData(DbType.Null, false)]
+    public void IsVariableLength(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsVariableLength());
+
+    [Theory]
+    [InlineData(DbType.Text, true)]
+    [InlineData(DbType.Json, true)]
+    [InlineData(DbType.Bytes, false)]
+    [InlineData(DbType.Int64, false)]
+    public void IsTextLike(DbType type, bool expected)
+        => Assert.Equal(expected, type.IsTextLike());
+
+    [Theory]
+    [InlineData(DbType.UInt8, 1)]
+    [InlineData(DbType.Int8, 1)]
+    [InlineData(DbType.UInt16, 2)]
+    [InlineData(DbType.Int16, 2)]
+    [InlineData(DbType.UInt32, 4)]
+    [InlineData(DbType.Int32, 4)]
+    [InlineData(DbType.UInt64, 8)]
+    [InlineData(DbType.Int64, 8)]
+    [InlineData(DbType.Float64, 8)] // low 2 bits encode width 64-bit
+    [InlineData(DbType.DateTime, 8)] // shares UInt64 low bits
+    [InlineData(DbType.Bytes, -1)]
+    [InlineData(DbType.Text, -1)]
+    [InlineData(DbType.Json, -1)]
+    [InlineData(DbType.Null, -1)]
+    public void FixedSize(DbType type, int expected)
+        => Assert.Equal(expected, type.FixedSize());
+
+    [Fact]
+    public void DateTime_Factory_Stores_Ticks_With_DateTime_Type()
+    {
+        var dt = new System.DateTime(2024, 6, 15, 14, 30, 45, System.DateTimeKind.Utc);
+        var v = DbValue.DateTime(dt.Ticks);
+        Assert.Equal(DbType.DateTime, v.Type);
+        Assert.True(v.Type.IsDateTime());
+        Assert.True(v.Type.IsInteger()); // storage-level: yes
+        // AsInteger works because DateTime is integer-storage.
+        Assert.Equal(dt.Ticks, v.AsInteger());
+    }
+}
+
 public class DateTimeTypeAffinityTests
 {
     [Theory]
