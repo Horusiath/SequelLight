@@ -254,6 +254,175 @@ public class WalTests : TempDirTest
         Assert.Equal("key1", entries[0]);
     }
 
+    [Fact]
+    public async Task Commit_With_FileIds_Roundtrips()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync(
+                new List<(byte[], byte[]?)> { (Key("k"), Val("v")) },
+                registeredFileIds: new long[] { 100, 200, 300 });
+        }
+
+        var entries = new List<string>();
+        var commits = new List<long[]?>();
+        await WriteAheadLog.ReplayAsync(
+            path,
+            (type, key, value) =>
+            {
+                entries.Add(Str(key));
+                return ValueTask.CompletedTask;
+            },
+            ids =>
+            {
+                commits.Add(ids);
+                return ValueTask.CompletedTask;
+            });
+
+        Assert.Single(entries);
+        Assert.Equal("k", entries[0]);
+        Assert.Single(commits);
+        Assert.Equal(new long[] { 100, 200, 300 }, commits[0]);
+    }
+
+    [Fact]
+    public async Task Commit_Without_FileIds_Yields_Null_Callback()
+    {
+        // The common case: ordinary commits register no SSTables. The replay callback must
+        // receive null (not an empty array) so the no-files path stays allocation-free.
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync(new List<(byte[], byte[]?)> { (Key("k"), Val("v")) });
+        }
+
+        var commits = new List<long[]?>();
+        await WriteAheadLog.ReplayAsync(
+            path,
+            (_, _, _) => ValueTask.CompletedTask,
+            ids =>
+            {
+                commits.Add(ids);
+                return ValueTask.CompletedTask;
+            });
+
+        Assert.Single(commits);
+        Assert.Null(commits[0]);
+    }
+
+    [Fact]
+    public async Task Commit_With_FileIds_Only_No_Writes()
+    {
+        // A transaction may register SSTables without any per-row writes (all writes were
+        // spilled into the registered SSTable). The WAL must still emit a commit record so
+        // the file IDs are recorded.
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync(
+                new List<(byte[], byte[]?)>(),
+                registeredFileIds: new long[] { 42 });
+        }
+
+        var entries = new List<string>();
+        var commits = new List<long[]?>();
+        await WriteAheadLog.ReplayAsync(
+            path,
+            (_, key, _) =>
+            {
+                entries.Add(Str(key));
+                return ValueTask.CompletedTask;
+            },
+            ids =>
+            {
+                commits.Add(ids);
+                return ValueTask.CompletedTask;
+            });
+
+        Assert.Empty(entries);
+        Assert.Single(commits);
+        Assert.Equal(new long[] { 42 }, commits[0]);
+    }
+
+    [Fact]
+    public async Task Mixed_Commits_With_And_Without_FileIds()
+    {
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync(new List<(byte[], byte[]?)> { (Key("k1"), Val("v1")) });
+            await wal.CommitAsync(
+                new List<(byte[], byte[]?)> { (Key("k2"), Val("v2")) },
+                registeredFileIds: new long[] { 7 });
+            await wal.CommitAsync(
+                new List<(byte[], byte[]?)> { (Key("k3"), Val("v3")) },
+                registeredFileIds: new long[] { 8, 9 });
+        }
+
+        var commits = new List<long[]?>();
+        await WriteAheadLog.ReplayAsync(
+            path,
+            (_, _, _) => ValueTask.CompletedTask,
+            ids =>
+            {
+                commits.Add(ids);
+                return ValueTask.CompletedTask;
+            });
+
+        Assert.Equal(3, commits.Count);
+        Assert.Null(commits[0]);
+        Assert.Equal(new long[] { 7 }, commits[1]);
+        Assert.Equal(new long[] { 8, 9 }, commits[2]);
+    }
+
+    [Fact]
+    public async Task Commit_FileIds_Are_Covered_By_CRC()
+    {
+        // Tampering with any byte of the file ID list (or the count field) must invalidate
+        // the commit's CRC, causing the entire transaction to be discarded on replay.
+        var path = Path.Combine(TempDir, "test.wal");
+
+        await using (var wal = WriteAheadLog.Create(path))
+        {
+            await wal.CommitAsync(
+                new List<(byte[], byte[]?)> { (Key("k"), Val("v")) },
+                registeredFileIds: new long[] { 0x1122_3344_5566_7788L });
+        }
+
+        var bytes = await File.ReadAllBytesAsync(path);
+
+        // Locate the commit record. Put entry: [4 len][1 type][4 keylen][1 key][4 vallen][1 val][4 crc] = 19.
+        // Commit body = [1 type][4 count=1][8 fileId] = 13. Commit total = 4 + 13 + 4 = 21.
+        // The 8-byte file ID lives at offset 19 + 4 + 1 + 4 = 28 (Put entry size + commit length + commit type byte + count).
+        const int fileIdByteOffset = 19 + 4 + 1 + 4;
+        bytes[fileIdByteOffset] ^= 0xFF; // flip a byte inside the file ID
+        await File.WriteAllBytesAsync(path, bytes);
+
+        var entries = new List<string>();
+        var commits = new List<long[]?>();
+        await WriteAheadLog.ReplayAsync(
+            path,
+            (_, key, _) =>
+            {
+                entries.Add(Str(key));
+                return ValueTask.CompletedTask;
+            },
+            ids =>
+            {
+                commits.Add(ids);
+                return ValueTask.CompletedTask;
+            });
+
+        // The commit's CRC is invalid → the whole transaction (including its put) is dropped.
+        Assert.Empty(entries);
+        Assert.Empty(commits);
+    }
+
     private static uint WriteRawPut(BinaryWriter writer, byte[] key, byte[] value, uint prevCrc)
     {
         int bodyLen = 1 + 4 + key.Length + 4 + value.Length;
@@ -279,10 +448,13 @@ public class WalTests : TempDirTest
 
     private static void WriteRawCommit(BinaryWriter writer, uint prevCrc)
     {
-        const int bodyLen = 1;
-        writer.Write(bodyLen + 4); // entry length = 5
+        // Current format: [type=Commit][u32 count=0]. CRC covers both bytes ranges.
+        const int bodyLen = 1 + 4;
+        writer.Write(bodyLen + 4); // entry length
 
-        byte[] body = [(byte)WalEntryType.Commit];
+        byte[] body = new byte[bodyLen];
+        body[0] = (byte)WalEntryType.Commit;
+        // bytes [1..5) already zero — count = 0
         writer.Write(body);
 
         uint crc = TestRollingCrc(body, prevCrc);

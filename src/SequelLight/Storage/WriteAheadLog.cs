@@ -27,14 +27,22 @@ public enum WalEntryType : byte
 ///   [4 bytes: rolling CRC32 = CRC32(prevCrc ++ body)]
 ///
 /// Format per commit entry:
-///   [4 bytes: total entry length (excluding this field) = 5]
+///   [4 bytes: total entry length (excluding this field)]
 ///   [1 byte: entry type (Commit=3)]
+///   [4 bytes: registered file ID count]
+///   [8 × count bytes: registered SSTable file IDs (LittleEndian Int64)]
 ///   [4 bytes: rolling CRC32 = CRC32(prevCrc ++ body)]
+///
+/// The CRC is computed over the entire body — type byte, count, and file IDs — so any
+/// tampering with the registered file ID list is detected on replay.
 ///
 /// The rolling CRC chains entries within a transaction: each entry's CRC is computed
 /// over its body bytes prepended with the previous entry's CRC (or 0 for the first entry).
 /// A Commit entry signals the end of a transaction. During replay, only entries from
-/// transactions with a valid Commit record are delivered.
+/// transactions with a valid Commit record are delivered. The optional registered file
+/// IDs let large transactions register pre-built L0 SSTables atomically with their commit
+/// (used by the transaction spill path — see step 9). Most commits register no files;
+/// the per-commit on-disk overhead in the no-files case is the 4-byte count field.
 ///
 /// Group commit: multiple concurrent callers submit batches to CommitAsync.
 /// A single background flusher collects all pending batches, writes them to the PipeWriter,
@@ -84,10 +92,14 @@ public sealed class WriteAheadLog : IAsyncDisposable
     /// Submits a batch of writes to the WAL and waits for the group flush to complete.
     /// Multiple concurrent callers' writes are batched into a single fsync.
     /// </summary>
-    public Task CommitAsync(List<(byte[] Key, byte[]? Value)> writes)
+    /// <param name="writes">Per-row writes (Put/Delete) to record before the commit marker.</param>
+    /// <param name="registeredFileIds">Optional list of SSTable file IDs that this commit
+    /// registers as L0 tables (used by transaction spill — the files must already exist on
+    /// disk under the data directory before this call). May be null or empty.</param>
+    public Task CommitAsync(List<(byte[] Key, byte[]? Value)> writes, long[]? registeredFileIds = null)
     {
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _commitQueue.Writer.TryWrite(new WalCommitBatch(writes, tcs));
+        _commitQueue.Writer.TryWrite(new WalCommitBatch(writes, registeredFileIds, tcs));
         return tcs.Task;
     }
 
@@ -103,7 +115,8 @@ public sealed class WriteAheadLog : IAsyncDisposable
             // Collect all pending batches
             while (reader.TryRead(out var batch))
             {
-                if (batch.Writes.Count > 0)
+                bool hasFileIds = batch.FileIds is { Length: > 0 };
+                if (batch.Writes.Count > 0 || hasFileIds)
                 {
                     uint rollingCrc = 0;
                     foreach (var (key, value) in batch.Writes)
@@ -112,7 +125,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
                             ? AppendPut(key, value, rollingCrc)
                             : AppendDelete(key, rollingCrc);
                     }
-                    AppendCommit(rollingCrc);
+                    AppendCommit(rollingCrc, batch.FileIds ?? Array.Empty<long>());
                 }
                 pending.Add(batch.Completion);
             }
@@ -195,10 +208,11 @@ public sealed class WriteAheadLog : IAsyncDisposable
         return crc;
     }
 
-    private void AppendCommit(uint prevCrc)
+    private void AppendCommit(uint prevCrc, ReadOnlySpan<long> registeredFileIds)
     {
-        const int bodyLen = 1;
-        const int totalLen = 4 + bodyLen + 4;
+        // body = [1 byte type][4 bytes count][8 bytes × count]
+        int bodyLen = 1 + 4 + 8 * registeredFileIds.Length;
+        int totalLen = 4 + bodyLen + 4;
 
         var span = _writer.GetSpan(totalLen);
         int offset = 0;
@@ -208,6 +222,14 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
         int crcStart = offset;
         span[offset++] = (byte)WalEntryType.Commit;
+
+        BinaryPrimitives.WriteInt32LittleEndian(span[offset..], registeredFileIds.Length);
+        offset += 4;
+        for (int i = 0; i < registeredFileIds.Length; i++)
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(span[offset..], registeredFileIds[i]);
+            offset += 8;
+        }
 
         uint crc = ComputeRollingCrc(span[crcStart..offset], prevCrc);
         BinaryPrimitives.WriteUInt32LittleEndian(span[offset..], crc);
@@ -227,11 +249,21 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
     /// <summary>
     /// Replays committed transactions from a WAL file. Only entries belonging to transactions
-    /// that have a valid Commit record are delivered to the callback. Incomplete transactions
-    /// (missing or corrupted Commit record) are silently discarded.
+    /// that have a valid Commit record are delivered to <paramref name="onEntry"/>. Incomplete
+    /// transactions (missing or corrupted Commit record) are silently discarded.
+    /// <para>
+    /// If <paramref name="onCommitFiles"/> is supplied, it is invoked once per committed
+    /// transaction with the SSTable file IDs that the transaction registered. The argument
+    /// is <c>null</c> when no files were registered (the common case) — no allocation
+    /// happens on the empty path. Used by recovery to attach pre-built L0 SSTables emitted
+    /// by the transaction spill path.
+    /// </para>
     /// Returns the file offset immediately after the last complete transaction.
     /// </summary>
-    public static async ValueTask<long> ReplayAsync(string filePath, Func<WalEntryType, byte[], byte[]?, ValueTask> onEntry)
+    public static async ValueTask<long> ReplayAsync(
+        string filePath,
+        Func<WalEntryType, byte[], byte[]?, ValueTask> onEntry,
+        Func<long[]?, ValueTask>? onCommitFiles = null)
     {
         if (!File.Exists(filePath)) return 0;
 
@@ -252,7 +284,7 @@ public sealed class WriteAheadLog : IAsyncDisposable
                 var buffer = readResult.Buffer;
 
                 while (TryReadEntry(ref buffer, rollingCrc, out var entryType, out var key,
-                    out var value, out var entryCrc, out int bytesConsumed))
+                    out var value, out var commitFileIds, out var entryCrc, out int bytesConsumed))
                 {
                     position += bytesConsumed;
 
@@ -263,6 +295,9 @@ public sealed class WriteAheadLog : IAsyncDisposable
                         pendingEntries.Clear();
                         rollingCrc = 0;
                         lastCommitPosition = position;
+
+                        if (onCommitFiles is not null)
+                            await onCommitFiles(commitFileIds).ConfigureAwait(false);
                     }
                     else
                     {
@@ -296,12 +331,13 @@ public sealed class WriteAheadLog : IAsyncDisposable
     }
 
     private static bool TryReadEntry(ref ReadOnlySequence<byte> buffer, uint prevCrc,
-        out WalEntryType entryType, out byte[] key, out byte[]? value, out uint entryCrc,
-        out int bytesConsumed)
+        out WalEntryType entryType, out byte[] key, out byte[]? value,
+        out long[]? commitFileIds, out uint entryCrc, out int bytesConsumed)
     {
         entryType = default;
         key = Array.Empty<byte>();
         value = null;
+        commitFileIds = null;
         entryCrc = 0;
         bytesConsumed = 0;
 
@@ -328,7 +364,23 @@ public sealed class WriteAheadLog : IAsyncDisposable
             int offset = 0;
             entryType = (WalEntryType)span[offset++];
 
-            if (entryType != WalEntryType.Commit)
+            if (entryType == WalEntryType.Commit)
+            {
+                int count = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
+                offset += 4;
+                // Allocate only when there are file IDs to read; the common case
+                // (no registered files) leaves commitFileIds as null.
+                if (count > 0)
+                {
+                    commitFileIds = new long[count];
+                    for (int i = 0; i < count; i++)
+                    {
+                        commitFileIds[i] = BinaryPrimitives.ReadInt64LittleEndian(span[offset..]);
+                        offset += 8;
+                    }
+                }
+            }
+            else
             {
                 int keyLen = BinaryPrimitives.ReadInt32LittleEndian(span[offset..]);
                 offset += 4;
@@ -369,5 +421,6 @@ public sealed class WriteAheadLog : IAsyncDisposable
 
     private readonly record struct WalCommitBatch(
         List<(byte[] Key, byte[]? Value)> Writes,
+        long[]? FileIds,
         TaskCompletionSource Completion);
 }
