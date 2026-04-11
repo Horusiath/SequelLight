@@ -44,6 +44,9 @@ public static class ExprEvaluator
             case BetweenExpr between:
                 return EvaluateBetween(between, row, projection);
 
+            case InExpr inExpr:
+                return EvaluateIn(inExpr, row, projection);
+
             case CastExpr cast:
                 return EvaluateCast(cast, row, projection);
 
@@ -389,6 +392,95 @@ public static class ExprEvaluator
         bool result = DbValueComparer.Compare(val, low) >= 0 && DbValueComparer.Compare(val, high) <= 0;
         if (negated) result = !result;
         return DbValue.Integer(result ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Evaluates <c>operand [NOT] IN (e1, e2, ...)</c>. SQL three-valued logic:
+    /// - If <paramref name="inExpr"/>'s operand is NULL → NULL.
+    /// - If any list element equals the operand → 1 (or 0 if NOT IN).
+    /// - If no element matches and any list element is NULL → NULL.
+    /// - Otherwise 0 (or 1 if NOT IN).
+    /// Empty list is always 0 (or 1 if NOT IN), even when the operand is NULL —
+    /// matches SQLite/PostgreSQL behavior.
+    /// </summary>
+    private static ValueTask<DbValue> EvaluateIn(InExpr inExpr, DbValue[] row, Projection projection)
+    {
+        if (inExpr.Target is not InExprList list)
+            throw new NotSupportedException($"IN target '{inExpr.Target.GetType().Name}' is not supported.");
+
+        var elements = list.Expressions;
+        if (elements.Length == 0)
+            return new ValueTask<DbValue>(DbValue.Integer(inExpr.Negated ? 1 : 0));
+
+        var operandTask = Evaluate(inExpr.Operand, row, projection);
+        if (!operandTask.IsCompletedSuccessfully)
+            return EvaluateInOperandSlow(operandTask, elements, inExpr.Negated, row, projection);
+
+        var operand = operandTask.Result;
+        if (operand.IsNull) return new ValueTask<DbValue>(DbValue.Null);
+
+        bool sawNull = false;
+        for (int i = 0; i < elements.Length; i++)
+        {
+            var elemTask = Evaluate(elements[i], row, projection);
+            if (!elemTask.IsCompletedSuccessfully)
+                return EvaluateInElementsSlow(elemTask, elements, i + 1, sawNull, operand, inExpr.Negated, row, projection);
+
+            var elem = elemTask.Result;
+            if (elem.IsNull) { sawNull = true; continue; }
+            if (DbValueComparer.Compare(operand, elem) == 0)
+                return new ValueTask<DbValue>(DbValue.Integer(inExpr.Negated ? 0 : 1));
+        }
+
+        if (sawNull) return new ValueTask<DbValue>(DbValue.Null);
+        return new ValueTask<DbValue>(DbValue.Integer(inExpr.Negated ? 1 : 0));
+    }
+
+    /// <summary>Async fallback when the IN operand needs awaiting.</summary>
+    private static async ValueTask<DbValue> EvaluateInOperandSlow(
+        ValueTask<DbValue> operandPending, SqlExpr[] elements, bool negated,
+        DbValue[] row, Projection projection)
+    {
+        var operand = await operandPending.ConfigureAwait(false);
+        if (operand.IsNull) return DbValue.Null;
+
+        bool sawNull = false;
+        for (int i = 0; i < elements.Length; i++)
+        {
+            var elem = await Evaluate(elements[i], row, projection).ConfigureAwait(false);
+            if (elem.IsNull) { sawNull = true; continue; }
+            if (DbValueComparer.Compare(operand, elem) == 0)
+                return DbValue.Integer(negated ? 0 : 1);
+        }
+
+        if (sawNull) return DbValue.Null;
+        return DbValue.Integer(negated ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Async fallback when an IN list element needs awaiting. Picks up after the
+    /// pending element completes and continues scanning the remaining list.
+    /// </summary>
+    private static async ValueTask<DbValue> EvaluateInElementsSlow(
+        ValueTask<DbValue> pendingElement, SqlExpr[] elements, int nextIndex,
+        bool sawNull, DbValue operand, bool negated,
+        DbValue[] row, Projection projection)
+    {
+        var first = await pendingElement.ConfigureAwait(false);
+        if (first.IsNull) sawNull = true;
+        else if (DbValueComparer.Compare(operand, first) == 0)
+            return DbValue.Integer(negated ? 0 : 1);
+
+        for (int i = nextIndex; i < elements.Length; i++)
+        {
+            var elem = await Evaluate(elements[i], row, projection).ConfigureAwait(false);
+            if (elem.IsNull) { sawNull = true; continue; }
+            if (DbValueComparer.Compare(operand, elem) == 0)
+                return DbValue.Integer(negated ? 0 : 1);
+        }
+
+        if (sawNull) return DbValue.Null;
+        return DbValue.Integer(negated ? 1 : 0);
     }
 
     private static ValueTask<DbValue> EvaluateCast(CastExpr cast, DbValue[] row, Projection projection)

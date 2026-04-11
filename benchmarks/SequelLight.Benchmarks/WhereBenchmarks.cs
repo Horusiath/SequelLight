@@ -298,6 +298,40 @@ public class WhereBenchmarks
         return count;
     }
 
+    // ---- IN-list benchmarks ----
+    // The IN-list path is the planner-aware variant of same-column OR. The recursive
+    // multi-index planner expands `col IN (v1, v2, ...)` into N union leaves on the
+    // same single-column index — structurally identical to writing the OR by hand.
+    //
+    // - `category IN (3, 5)` alone is the union case (~2000 rows).
+    // - `category IN (3, 5) AND score = 21` exercises the same-column-OR-inside-AND
+    //   shape that's the documented regression: the recursive plan walks the union
+    //   first then intersects with score=21 (10 rows). The IN form should produce
+    //   the SAME plan as the hand-written OR — confirming that IN integration is
+    //   purely a syntactic feature and does NOT fix the regression by itself.
+
+    [Benchmark(Description = "WHERE col IN (v1, v2) — single index")]
+    public async Task<int> Where_InList()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category IN (3, 5)", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE col IN (v1, v2) AND other = ? (regression shape)")]
+    public async Task<int> Where_InListAndSelective()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category IN (3, 5) AND score = 21", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
     // ---- SQLite baseline benchmarks ----
 
     [Benchmark(Baseline = true, Description = "SQLite: Full scan (no WHERE)")]
@@ -429,6 +463,28 @@ public class WhereBenchmarks
     {
         using var cmd = _sqlite.CreateCommand();
         cmd.CommandText = "SELECT * FROM t WHERE (category = 3 OR category = 5) AND score = 21";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE col IN (v1, v2)")]
+    public int Sqlite_Where_InList()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category IN (3, 5)";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE col IN (v1, v2) AND other = ?")]
+    public int Sqlite_Where_InListAndSelective()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category IN (3, 5) AND score = 21";
         using var reader = cmd.ExecuteReader();
         int count = 0;
         while (reader.Read()) count++;

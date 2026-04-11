@@ -356,9 +356,22 @@ internal static class PlanFormatter
             Low = UnresolveExpr(bt.Low, projection),
             High = UnresolveExpr(bt.High, projection),
         },
+        InExpr inExpr => UnresolveIn(inExpr, projection),
         CastExpr c => c with { Operand = UnresolveExpr(c.Operand, projection) },
         _ => expr,
     };
+
+    private static InExpr UnresolveIn(InExpr inExpr, Projection projection)
+    {
+        var operand = UnresolveExpr(inExpr.Operand, projection);
+        if (inExpr.Target is not InExprList list)
+            return inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        for (int i = 0; i < list.Expressions.Length; i++)
+            elements[i] = UnresolveExpr(list.Expressions[i], projection);
+        return new InExpr(operand, inExpr.Negated, new InExprList(elements));
+    }
 
     private static LiteralExpr UnresolveLiteral(DbValue value)
     {

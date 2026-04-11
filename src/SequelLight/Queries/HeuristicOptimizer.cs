@@ -224,6 +224,35 @@ public static class HeuristicOptimizer
                     : new BetweenExpr(operand, between.Negated, low, high);
             }
 
+            case InExpr inExpr:
+            {
+                // Only InExprList targets fold here. Subquery / table / table-function
+                // targets are out of scope for the optimizer pass.
+                if (inExpr.Target is not InExprList list)
+                    return expr;
+
+                var operand = FoldConstants(inExpr.Operand);
+                var elements = new SqlExpr[list.Expressions.Length];
+                bool changed = !ReferenceEquals(operand, inExpr.Operand);
+                bool allConst = operand is ResolvedLiteralExpr;
+                for (int i = 0; i < list.Expressions.Length; i++)
+                {
+                    elements[i] = FoldConstants(list.Expressions[i]);
+                    if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+                    if (elements[i] is not ResolvedLiteralExpr) allConst = false;
+                }
+
+                if (allConst)
+                {
+                    var folded = TryEvaluate(new InExpr(operand, inExpr.Negated, new InExprList(elements)));
+                    if (folded is not null) return folded;
+                }
+
+                return changed
+                    ? new InExpr(operand, inExpr.Negated, new InExprList(elements))
+                    : expr;
+            }
+
             case CastExpr cast:
             {
                 var operand = FoldConstants(cast.Operand);
@@ -549,6 +578,12 @@ public static class HeuristicOptimizer
                 CollectColumnRefsRecursive(between.Low, result);
                 CollectColumnRefsRecursive(between.High, result);
                 break;
+            case InExpr inExpr:
+                CollectColumnRefsRecursive(inExpr.Operand, result);
+                if (inExpr.Target is InExprList inList)
+                    foreach (var e in inList.Expressions)
+                        CollectColumnRefsRecursive(e, result);
+                break;
             case CastExpr cast:
                 CollectColumnRefsRecursive(cast.Operand, result);
                 break;
@@ -743,6 +778,12 @@ public static class HeuristicOptimizer
                 CollectExprColumnNames(between.Operand, result);
                 CollectExprColumnNames(between.Low, result);
                 CollectExprColumnNames(between.High, result);
+                break;
+            case InExpr inExpr:
+                CollectExprColumnNames(inExpr.Operand, result);
+                if (inExpr.Target is InExprList inList)
+                    foreach (var e in inList.Expressions)
+                        CollectExprColumnNames(e, result);
                 break;
             case CastExpr cast:
                 CollectExprColumnNames(cast.Operand, result);

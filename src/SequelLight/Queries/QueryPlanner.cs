@@ -348,10 +348,27 @@ public sealed class QueryPlanner
                 Low = ResolveParamExpr(bt.Low, paramMap)!,
                 High = ResolveParamExpr(bt.High, paramMap)!,
             },
+            InExpr inExpr => ResolveParamExprInIn(inExpr, paramMap),
             CastExpr c => c with { Operand = ResolveParamExpr(c.Operand, paramMap)! },
             FunctionCallExpr func => ResolveParamExprInFunction(func, paramMap),
             _ => expr,
         };
+    }
+
+    private static InExpr ResolveParamExprInIn(InExpr inExpr, Dictionary<string, int> paramMap)
+    {
+        var operand = ResolveParamExpr(inExpr.Operand, paramMap)!;
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = ResolveParamExpr(list.Expressions[i], paramMap)!;
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     private static FunctionCallExpr ResolveParamExprInFunction(FunctionCallExpr func, Dictionary<string, int> paramMap)
@@ -586,6 +603,12 @@ public sealed class QueryPlanner
             BinaryExpr b => ContainsAggregateExpr(b.Left) || ContainsAggregateExpr(b.Right),
             UnaryExpr u => ContainsAggregateExpr(u.Operand),
             CastExpr c => ContainsAggregateExpr(c.Operand),
+            BetweenExpr bt => ContainsAggregateExpr(bt.Operand)
+                || ContainsAggregateExpr(bt.Low) || ContainsAggregateExpr(bt.High),
+            InExpr inExpr => ContainsAggregateExpr(inExpr.Operand)
+                || (inExpr.Target is InExprList inList && inList.Expressions.Any(ContainsAggregateExpr)),
+            IsExpr i => ContainsAggregateExpr(i.Left) || ContainsAggregateExpr(i.Right),
+            NullTestExpr n => ContainsAggregateExpr(n.Operand),
             _ => false,
         };
     }
@@ -1721,6 +1744,35 @@ public sealed class QueryPlanner
             }
         }
 
+        // IN-list candidate: col IN (lit1, ..., litN) with a single-column secondary
+        // index on col. Each element becomes a separate leaf — treated as syntactic
+        // sugar for col=lit1 OR col=lit2 OR ... NOT IN can never narrow the result set
+        // and is left as a residual filter.
+        if (TryExtractSecondaryIndexInList(expr, table, projection, out int inColIdx, out var inValues))
+        {
+            for (int ii = 0; ii < indexes.Count; ii++)
+            {
+                indexes[ii].EnsureEncodingMetadata(table);
+                var idxCols = indexes[ii].ResolvedColumnIndices!;
+                if (idxCols.Length == 1 && idxCols[0] == inColIdx)
+                {
+                    bool dateAffinity = TypeAffinity.IsDateAffinity(table.Columns[inColIdx].TypeName);
+                    for (int v = 0; v < inValues.Length; v++)
+                    {
+                        var iv = inValues[v];
+                        if (dateAffinity && iv.Type == DbType.Text &&
+                            DateTimeHelper.TryParseToTicks(iv.AsText().Span, out long ticks))
+                        {
+                            iv = DbValue.Integer(ticks);
+                            inValues[v] = iv;
+                        }
+                        leaves.Add(new MultiIndexLeaf(inColIdx, indexes[ii], iv));
+                    }
+                    return true;
+                }
+            }
+        }
+
         return false;
     }
 
@@ -1752,6 +1804,43 @@ public sealed class QueryPlanner
             for (int i = 0; i < children.Count; i++)
                 built[i] = BuildPkStream(children[i], table, projection, indexes, tx)!;
             return new IndexUnionPkStream(built);
+        }
+
+        // IN-list leaf — N-way union over the same single-column index.
+        if (TryExtractSecondaryIndexInList(expr, table, projection, out int inColIdx, out var inValues))
+        {
+            IndexSchema? inMatch = null;
+            for (int ii = 0; ii < indexes.Count; ii++)
+            {
+                indexes[ii].EnsureEncodingMetadata(table);
+                var idxCols = indexes[ii].ResolvedColumnIndices!;
+                if (idxCols.Length == 1 && idxCols[0] == inColIdx)
+                {
+                    inMatch = indexes[ii];
+                    break;
+                }
+            }
+            if (inMatch is null) return null;
+
+            bool inDateAffinity = TypeAffinity.IsDateAffinity(table.Columns[inColIdx].TypeName);
+            var leafStreams = new IPkStream[inValues.Length];
+            for (int v = 0; v < inValues.Length; v++)
+            {
+                var iv = inValues[v];
+                if (inDateAffinity && iv.Type == DbType.Text &&
+                    DateTimeHelper.TryParseToTicks(iv.AsText().Span, out long inTicks))
+                {
+                    iv = DbValue.Integer(inTicks);
+                }
+                var prefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
+                    inMatch.Oid,
+                    new[] { iv },
+                    new[] { inMatch.ResolvedColumnTypes![0] });
+                leafStreams[v] = new IndexLeafPkStream(tx.CreateCursor(), inMatch, prefix, expr);
+            }
+            return leafStreams.Length == 1
+                ? leafStreams[0]
+                : new IndexUnionPkStream(leafStreams);
         }
 
         // Leaf — must succeed because the dry-run already validated.
@@ -1909,6 +1998,78 @@ public sealed class QueryPlanner
     /// by at least one secondary index on <paramref name="table"/>. Returns the column's
     /// index in the table's column array plus the literal value.
     /// </summary>
+    /// <summary>
+    /// Recognizes <c>col IN (lit1, lit2, ..., litN)</c> over a non-PK column with at
+    /// least one secondary index whose leading column is <c>col</c>. Mirrors
+    /// <see cref="TryExtractSecondaryIndexEquality"/>: rejects PK columns, requires all
+    /// list elements to be literals (so we can encode seek prefixes at plan time), and
+    /// rejects NOT IN (which can never narrow the search). Returns the column index and
+    /// the values; the caller turns each value into a leaf stream wrapped in
+    /// <see cref="IndexUnionPkStream"/>.
+    /// </summary>
+    private bool TryExtractSecondaryIndexInList(
+        SqlExpr expr, TableSchema table, Projection projection,
+        out int columnIdx, out DbValue[] values)
+    {
+        columnIdx = -1;
+        values = Array.Empty<DbValue>();
+
+        if (expr is not InExpr { Negated: false } inExpr) return false;
+        if (inExpr.Operand is not ColumnRefExpr colRef) return false;
+        if (inExpr.Target is not InExprList list) return false;
+        if (list.Expressions.Length == 0) return false;
+
+        // All elements must be literal-resolvable; otherwise we can't encode seek
+        // prefixes at plan time.
+        var extracted = new DbValue[list.Expressions.Length];
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            var e = list.Expressions[i];
+            if (e is ResolvedLiteralExpr rl) extracted[i] = rl.Value;
+            else if (e is LiteralExpr lit) extracted[i] = ExprEvaluator.EvaluateLiteral(lit);
+            else return false;
+
+            // NULL elements never participate in equality — drop the entire candidate
+            // because (a) NULL would produce a malformed seek prefix, and (b) IN with
+            // any NULL element flips the SQL semantics; safer to leave it as a residual
+            // filter for the evaluator's three-valued logic.
+            if (extracted[i].IsNull) return false;
+        }
+
+        // Resolve column to index. Reject PK columns (handled by TryBuildPrimaryKeyScan
+        // or as filter-only PK bounds in this method's caller).
+        for (int i = 0; i < table.Columns.Length; i++)
+        {
+            if (string.Equals(table.Columns[i].Name, colRef.Column, StringComparison.OrdinalIgnoreCase))
+            {
+                if (table.Columns[i].IsPrimaryKey) return false;
+                columnIdx = i;
+                break;
+            }
+        }
+        if (columnIdx < 0) return false;
+
+        // Must be covered by at least one secondary index whose leading column is
+        // this column.
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        bool covered = false;
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length > 0 && idxCols[0] == columnIdx)
+            {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) return false;
+
+        values = extracted;
+        return true;
+    }
+
     private bool TryExtractSecondaryIndexEquality(
         SqlExpr expr, TableSchema table, Projection projection, out int columnIdx, out DbValue value)
     {
@@ -2371,6 +2532,22 @@ public sealed class QueryPlanner
                 return CollectColumnNames(b.Left, names) && CollectColumnNames(b.Right, names);
             case UnaryExpr u:
                 return CollectColumnNames(u.Operand, names);
+            case BetweenExpr bt:
+                return CollectColumnNames(bt.Operand, names)
+                    && CollectColumnNames(bt.Low, names)
+                    && CollectColumnNames(bt.High, names);
+            case InExpr inExpr:
+                if (!CollectColumnNames(inExpr.Operand, names)) return false;
+                if (inExpr.Target is not InExprList inList) return false;
+                for (int i = 0; i < inList.Expressions.Length; i++)
+                    if (!CollectColumnNames(inList.Expressions[i], names)) return false;
+                return true;
+            case IsExpr isExpr:
+                return CollectColumnNames(isExpr.Left, names) && CollectColumnNames(isExpr.Right, names);
+            case NullTestExpr nullTest:
+                return CollectColumnNames(nullTest.Operand, names);
+            case CastExpr cast:
+                return CollectColumnNames(cast.Operand, names);
             case LiteralExpr or ResolvedLiteralExpr:
                 return true;
             default:
@@ -2745,10 +2922,27 @@ public sealed class QueryPlanner
                 Low = ResolveColumns(between.Low, projection),
                 High = ResolveColumns(between.High, projection),
             },
+            InExpr inExpr => ResolveInColumns(inExpr, projection),
             CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
             FunctionCallExpr func => ResolveFunctionColumns(func, projection),
             _ => expr,
         };
+    }
+
+    private InExpr ResolveInColumns(InExpr inExpr, Projection projection)
+    {
+        var operand = ResolveColumns(inExpr.Operand, projection);
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = ResolveColumns(list.Expressions[i], projection);
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     /// <summary>
@@ -2824,6 +3018,8 @@ public sealed class QueryPlanner
                     return new ValueTask<SqlExpr>(between with { Operand = vTask.Result, Low = loTask.Result, High = hiTask.Result });
                 return ResolveBetweenAsync(between, vTask, loTask, hiTask);
             }
+            case InExpr inExpr:
+                return ResolveInAsync(inExpr, projection, tx);
             case CastExpr cast:
             {
                 var opTask = ResolveColumnsAsync(cast.Operand, projection, tx);
@@ -2867,6 +3063,22 @@ public sealed class QueryPlanner
         var lo = loTask.IsCompletedSuccessfully ? loTask.Result : await loTask.ConfigureAwait(false);
         var hi = hiTask.IsCompletedSuccessfully ? hiTask.Result : await hiTask.ConfigureAwait(false);
         return between with { Operand = val, Low = lo, High = hi };
+    }
+
+    private async ValueTask<SqlExpr> ResolveInAsync(InExpr inExpr, Projection projection, ReadOnlyTransaction tx)
+    {
+        var operand = await ResolveColumnsAsync(inExpr.Operand, projection, tx).ConfigureAwait(false);
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = await ResolveColumnsAsync(list.Expressions[i], projection, tx).ConfigureAwait(false);
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     private async ValueTask<SqlExpr> ResolveFunctionColumnsAsync(

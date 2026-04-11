@@ -1234,4 +1234,170 @@ public class OrderByEliminationTests : TempDirTest
         Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_b"));
         Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_c"));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // IN-list integration with the recursive multi-index scan
+    // ─────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task InList_OnIndexedColumn_UsesMultiIndexUnion()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 0, 0, 0),  -- a=1 → matches
+            (2, 2, 0, 0, 0),  -- a=2 → does NOT match
+            (3, 3, 0, 0, 0),  -- a=3 → matches
+            (4, 5, 0, 0, 0),  -- a=5 → matches
+            (5, 9, 0, 0, 0)   -- a=9 → does NOT match");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a IN (1, 3, 5) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L, 4L }, ids);
+    }
+
+    [Fact]
+    public async Task InList_NotIn_FiltersOutMatchingValues()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 0, 0, 0),
+            (2, 2, 0, 0, 0),
+            (3, 3, 0, 0, 0),
+            (4, 5, 0, 0, 0),
+            (5, 9, 0, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a NOT IN (1, 3, 5) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 2L, 5L }, ids);
+    }
+
+    [Fact]
+    public async Task InList_CombinedWithEquality_BuildsIntersectionOverUnion()
+    {
+        // (a IN (1, 3)) AND (b = 2) — equivalent to (a=1 OR a=3) AND b=2.
+        // The recursive plan should produce Intersect(Union(a=1, a=3), b=2).
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 2, 0, 0),  -- a=1, b=2 → matches
+            (2, 1, 9, 0, 0),  -- a=1 but b=9 → does NOT match
+            (3, 3, 2, 0, 0),  -- a=3, b=2 → matches
+            (4, 5, 2, 0, 0),  -- a=5, b=2 → does NOT match (a not in list)
+            (5, 3, 9, 0, 0)   -- a=3 but b=9 → does NOT match");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a IN (1, 3) AND b = 2 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task InList_NullOperand_ReturnsNoRows()
+    {
+        // SQL three-valued logic: NULL IN (...) is NULL, which filters out the row.
+        // Use an unindexed column so NULLs are storable.
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)");
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, NULL),
+            (2, 1),
+            (3, NULL)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE x IN (1, 2)";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 2L }, ids);
+    }
+
+    [Fact]
+    public async Task InList_NullElement_ReturnsNullForUnmatchedRows()
+    {
+        // x IN (1, NULL) → 1 if x=1, NULL otherwise. NULL filters out, so only x=1 rows survive.
+        // x NOT IN (1, NULL) → 0 if x=1, NULL otherwise (no rows survive).
+        // Use an unindexed column so the IN-list takes the residual-filter path
+        // (the multi-index leaf path rejects NULL elements as a safety guard).
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)");
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1),
+            (2, 2),
+            (3, 3)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE x IN (1, NULL) ORDER BY id";
+        var inIds = await ReadIds(cmd);
+        Assert.Equal(new[] { 1L }, inIds);
+
+        cmd.CommandText = "SELECT id FROM t WHERE x NOT IN (1, NULL)";
+        var notInIds = await ReadIds(cmd);
+        Assert.Empty(notInIds);
+    }
+
+    [Fact]
+    public async Task InList_EmptyList_AlwaysFalse()
+    {
+        // SQLite/PostgreSQL: x IN () is always 0; x NOT IN () is always 1.
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES (1, 1, 0, 0, 0), (2, 2, 0, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a IN ()";
+        var inIds = await ReadIds(cmd);
+        Assert.Empty(inIds);
+
+        cmd.CommandText = "SELECT id FROM t WHERE a NOT IN () ORDER BY id";
+        var notInIds = await ReadIds(cmd);
+        Assert.Equal(new[] { 1L, 2L }, notInIds);
+    }
+
+    [Fact]
+    public async Task InList_OnIndexedColumn_ExplainShowsUnionOfLeaves()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a IN (1, 3) AND b = 2";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+
+        // Expected plan:
+        //   MULTI-INDEX SCAN ON t (...)
+        //     └ INDEX INTERSECTION
+        //         ├ INDEX UNION                 ← from a IN (1, 3)
+        //         │   ├ INDEX SEEK idx_a ("a" IN (1, 3))
+        //         │   └ INDEX SEEK idx_a ("a" IN (1, 3))
+        //         └ INDEX SEEK idx_b ("b" = 2)
+        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r == "INDEX INTERSECTION");
+        Assert.Contains(rows, r => r == "INDEX UNION");
+        Assert.Equal(2, rows.Count(r => r.StartsWith("INDEX SEEK idx_a")));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_b"));
+    }
+
+    [Fact]
+    public async Task InList_OnUnindexedColumn_FallsBackToFullScanFilter()
+    {
+        // When the column has no secondary index, IN-list participates as a residual filter.
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)");
+        await Exec(conn, @"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE x IN (10, 30) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L }, ids);
+    }
 }
