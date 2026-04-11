@@ -850,17 +850,17 @@ public class OrderByEliminationTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE a = 1 AND b = 1";
         await using var reader = await cmd.ExecuteReaderAsync();
         bool foundCompositeIndex = false;
-        bool foundIntersection = false;
+        bool foundMultiIndex = false;
         while (await reader.ReadAsync())
         {
             var detail = reader.GetString(2);
             if (detail.Contains("idx_ab") &&
                 (detail.StartsWith("INDEX SCAN") || detail.StartsWith("INDEX ONLY SCAN")))
                 foundCompositeIndex = true;
-            if (detail.StartsWith("INDEX INTERSECTION")) foundIntersection = true;
+            if (detail.StartsWith("MULTI-INDEX SCAN")) foundMultiIndex = true;
         }
         Assert.True(foundCompositeIndex, "Expected composite index path on idx_ab");
-        Assert.False(foundIntersection, "Should NOT have chosen intersection when composite covers both conjuncts");
+        Assert.False(foundMultiIndex, "Should NOT have chosen multi-index when composite covers both conjuncts");
     }
 
     // ----- IndexUnionScan correctness -----
@@ -927,11 +927,17 @@ public class OrderByEliminationTests : TempDirTest
     }
 
     [Fact]
-    public async Task IndexUnion_SameColumnOr_FallsBackToFullScan()
+    public async Task IndexUnion_SameColumnOr_UsesUnionOfTwoLeavesOnSameIndex()
     {
-        // MVP limitation guard: a = 1 OR a = 2 should fall back to a single-index scan +
-        // filter (or full scan), NOT fire the union. Tests that the planner bails out of
-        // the union path for same-column disjuncts.
+        // After the recursive refactor, `a = 1 OR a = 2` is handled as a union of two
+        // IndexLeafPkStreams that happen to share the same underlying index. Each leaf
+        // opens its own cursor on idx_a with a different seek prefix; the union dedups
+        // any PK that matches both predicates.
+        //
+        // TODO: this is correct but suboptimal vs a future IN-list optimization, which
+        // would do a single cursor walk over idx_a with multiple seek values instead of
+        // two separate cursors. Until IN-list lands, the recursive multi-index path is
+        // the cheapest plan we can produce for same-column OR.
         await using var conn = await OpenConnectionAsync();
         await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)");
         await Exec(conn, "CREATE INDEX idx_a ON t(a)");
@@ -941,14 +947,18 @@ public class OrderByEliminationTests : TempDirTest
         cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id";
         var ids = await ReadIds(cmd);
 
-        // Correctness: we still get the right rows even though union doesn't fire.
         Assert.Equal(new[] { 1L, 2L }, ids);
 
-        // Explain should NOT show INDEX UNION.
+        // EXPLAIN: must show MULTI-INDEX SCAN with INDEX UNION over two idx_a leaves.
         cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE a = 1 OR a = 2";
+        var rows = new List<string>();
         await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
-            Assert.DoesNotContain("INDEX UNION", reader.GetString(2));
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r == "INDEX UNION");
+        // Both leaves use idx_a — we don't bail just because the column is the same.
+        int idxALeafCount = rows.Count(r => r.StartsWith("INDEX SEEK idx_a"));
+        Assert.Equal(2, idxALeafCount);
     }
 
     [Fact]
@@ -988,18 +998,240 @@ public class OrderByEliminationTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE id = 2 AND a = 1 AND b = 1";
         await using var reader = await cmd.ExecuteReaderAsync();
         bool foundSearch = false;
-        bool foundIntersection = false;
+        bool foundMultiIndex = false;
         while (await reader.ReadAsync())
         {
             var detail = reader.GetString(2);
             if (detail.StartsWith("SEARCH t USING PRIMARY KEY")) foundSearch = true;
-            if (detail.StartsWith("INDEX INTERSECTION")) foundIntersection = true;
+            if (detail.StartsWith("MULTI-INDEX SCAN")) foundMultiIndex = true;
         }
         Assert.True(foundSearch, "Expected SEARCH t USING PRIMARY KEY for full PK equality");
-        Assert.False(foundIntersection, "Should NOT have chosen intersection when PK is fully pinned");
+        Assert.False(foundMultiIndex, "Should NOT have chosen multi-index scan when PK is fully pinned");
 
         cmd.CommandText = "SELECT id FROM t WHERE id = 2 AND a = 1 AND b = 1";
         var ids = await ReadIds(cmd);
         Assert.Equal(new[] { 2L }, ids);
+    }
+
+    // ----- Recursive AND/OR shapes -----
+
+    /// <summary>
+    /// Sets up a 4-column test table with three single-column secondary indexes
+    /// (idx_a, idx_b, idx_c) and a few rows that exercise the various nested shapes.
+    /// Used by every test in this section.
+    /// </summary>
+    private static async Task SetupNestedTable(SequelLightConnection conn)
+    {
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "CREATE INDEX idx_c ON t(c)");
+        await Exec(conn, "CREATE INDEX idx_d ON t(d)");
+    }
+
+    [Fact]
+    public async Task Recursive_AndInsideOr_ProducesCorrectUnion()
+    {
+        // (a=1 AND b=2) OR (a=3 AND c=4):
+        //   - First disjunct: rows where a=1 AND b=2
+        //   - Second disjunct: rows where a=3 AND c=4
+        //   - Union: rows matching either intersection
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 2, 0, 0),  -- matches (a=1 AND b=2)
+            (2, 1, 9, 0, 0),  -- matches a=1 only — NOT in result
+            (3, 3, 9, 4, 0),  -- matches (a=3 AND c=4)
+            (4, 3, 9, 9, 0),  -- matches a=3 only — NOT in result
+            (5, 1, 2, 0, 0)   -- matches (a=1 AND b=2)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE (a = 1 AND b = 2) OR (a = 3 AND c = 4) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L, 5L }, ids);
+    }
+
+    [Fact]
+    public async Task Recursive_OrInsideAnd_ProducesCorrectIntersection()
+    {
+        // (a=1 OR b=2) AND c=3:
+        //   - rows where (a=1 OR b=2) intersected with rows where c=3
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 0, 3, 0),  -- a=1 AND c=3 → matches
+            (2, 0, 2, 3, 0),  -- b=2 AND c=3 → matches
+            (3, 1, 2, 3, 0),  -- a=1 AND b=2 AND c=3 → matches (only once)
+            (4, 1, 0, 9, 0),  -- a=1 but c=9 → does NOT match
+            (5, 0, 0, 3, 0)   -- c=3 but neither a=1 nor b=2 → does NOT match");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE (a = 1 OR b = 2) AND c = 3 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task Recursive_BothBranchesNested_AndInsideOrAtBothLevels()
+    {
+        // (a=1 AND b=2) OR (c=3 AND d=4):
+        //   - Disjunct 1: rows with a=1 AND b=2
+        //   - Disjunct 2: rows with c=3 AND d=4
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 2, 0, 0),  -- (a=1 AND b=2) → matches
+            (2, 0, 0, 3, 4),  -- (c=3 AND d=4) → matches
+            (3, 1, 2, 3, 4),  -- both → matches (once)
+            (4, 1, 9, 0, 0),  -- a=1 only → no
+            (5, 0, 0, 3, 9)   -- c=3 only → no");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT id FROM t WHERE (a = 1 AND b = 2) OR (c = 3 AND d = 4) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task Recursive_BothBranchesNested_OrInsideAndAtBothLevels()
+    {
+        // (a=1 OR b=2) AND (c=3 OR d=4):
+        //   - rows where (a=1 OR b=2) AND (c=3 OR d=4)
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 0, 3, 0),  -- a=1 AND c=3 → matches
+            (2, 0, 2, 0, 4),  -- b=2 AND d=4 → matches
+            (3, 1, 0, 0, 4),  -- a=1 AND d=4 → matches
+            (4, 0, 2, 3, 0),  -- b=2 AND c=3 → matches
+            (5, 1, 2, 3, 4),  -- all → matches (once)
+            (6, 1, 0, 0, 0),  -- a=1 only — no c/d match
+            (7, 0, 0, 3, 0),  -- c=3 only — no a/b match
+            (8, 0, 0, 0, 0)   -- nothing → no");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT id FROM t WHERE (a = 1 OR b = 2) AND (c = 3 OR d = 4) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L, 4L, 5L }, ids);
+    }
+
+    [Fact]
+    public async Task Recursive_PkRangeWithNestedSecondary_AppliesPkBoundFilter()
+    {
+        // id < 4 AND ((a=1 AND b=2) OR c=3):
+        //   - PK bound `id < 4` is filter-only at the top level
+        //   - The OR conjunct becomes a Union of (Intersect a,b) and a leaf c
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 2, 0, 0),  -- (a=1 AND b=2), id<4 → matches
+            (2, 0, 0, 3, 0),  -- c=3, id<4 → matches
+            (3, 1, 2, 3, 0),  -- both, id<4 → matches (once)
+            (4, 1, 2, 0, 0),  -- (a=1 AND b=2) but id=4 → filtered out by PK bound
+            (5, 0, 0, 3, 0)   -- c=3 but id=5 → filtered out");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT id FROM t WHERE id < 4 AND ((a = 1 AND b = 2) OR c = 3) ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task Recursive_PkPredicateInsideNestedOr_FallsBackToFullScan()
+    {
+        // (id < 100 AND a=1) OR b=2 — PK predicate inside a nested operator.
+        // Per the recursive MVP scope rule, this BAILS out of the multi-index path
+        // because PK predicates are only supported at the top level. Falls back to
+        // full scan + filter, but the result is still correct.
+        //
+        // TODO: lifting this restriction would need a "PkSeekPkStream" leaf so PK
+        // predicates can become first-class participants in the recursive tree.
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, @"INSERT INTO t VALUES
+            (1, 1, 0, 0, 0),  -- a=1 AND id<100 → matches
+            (2, 0, 2, 0, 0),  -- b=2 → matches
+            (3, 1, 2, 0, 0),  -- both → matches (once)
+            (200, 1, 0, 0, 0),-- a=1 but id>=100 → does NOT match (id<100 fails)
+            (201, 0, 2, 0, 0) -- b=2 → matches");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE (id < 100 AND a = 1) OR b = 2 ORDER BY id";
+        var ids = await ReadIds(cmd);
+        Assert.Equal(new[] { 1L, 2L, 3L, 201L }, ids);
+
+        // EXPLAIN: must NOT show MULTI-INDEX SCAN — fell back to a different path.
+        cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE (id < 100 AND a = 1) OR b = 2";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+        Assert.DoesNotContain(rows, r => r.StartsWith("MULTI-INDEX SCAN"));
+    }
+
+    [Fact]
+    public async Task Recursive_NestedAndInsideOr_ExplainShowsTreeShape()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE (a = 1 AND b = 2) OR (c = 3 AND d = 4)";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+
+        // Expected plan:
+        //   MULTI-INDEX SCAN ON t (...)
+        //     └ INDEX UNION
+        //         ├ INDEX INTERSECTION
+        //         │   ├ INDEX SEEK idx_a ("a" = 1)
+        //         │   └ INDEX SEEK idx_b ("b" = 2)
+        //         └ INDEX INTERSECTION
+        //             ├ INDEX SEEK idx_c ("c" = 3)
+        //             └ INDEX SEEK idx_d ("d" = 4)
+        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r == "INDEX UNION");
+        Assert.Equal(2, rows.Count(r => r == "INDEX INTERSECTION"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_a"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_b"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_c"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_d"));
+    }
+
+    [Fact]
+    public async Task Recursive_NestedOrInsideAnd_ExplainShowsTreeShape()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 0, 3, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE (a = 1 OR b = 2) AND c = 3";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+
+        // Expected plan:
+        //   MULTI-INDEX SCAN ON t (...)
+        //     └ INDEX INTERSECTION
+        //         ├ INDEX UNION
+        //         │   ├ INDEX SEEK idx_a ("a" = 1)
+        //         │   └ INDEX SEEK idx_b ("b" = 2)
+        //         └ INDEX SEEK idx_c ("c" = 3)
+        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r == "INDEX INTERSECTION");
+        Assert.Contains(rows, r => r == "INDEX UNION");
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_a"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_b"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_c"));
     }
 }

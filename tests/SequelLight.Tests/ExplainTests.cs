@@ -311,10 +311,15 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2";
         var rows = await ReadExplain(cmd);
 
-        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)"));
-        // Rendered predicate should include both equalities (order follows the planner's
-        // matched-conjunct list).
-        Assert.Contains(rows, r => r.Detail.Contains("\"a\" = 1") && r.Detail.Contains("\"b\" = 2"));
+        // New tree-shaped EXPLAIN format:
+        //   MULTI-INDEX SCAN ON t (...)
+        //     └ INDEX INTERSECTION
+        //         ├ INDEX SEEK idx_a ("a" = 1)
+        //         └ INDEX SEEK idx_b ("b" = 2)
+        Assert.Contains(rows, r => r.Detail.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r.Detail == "INDEX INTERSECTION");
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_a") && r.Detail.Contains("\"a\" = 1"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_b") && r.Detail.Contains("\"b\" = 2"));
         // Intersection covers both conjuncts — no residual FILTER.
         Assert.DoesNotContain(rows, r => r.Detail.StartsWith("FILTER"));
     }
@@ -336,11 +341,11 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3";
         var rows = await ReadExplain(cmd);
 
-        Assert.Contains(rows, r =>
-            r.Detail.StartsWith("INDEX INTERSECTION ON t USING (") &&
-            r.Detail.Contains("idx_a") &&
-            r.Detail.Contains("idx_b") &&
-            r.Detail.Contains("idx_c"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r.Detail == "INDEX INTERSECTION");
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_a"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_b"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_c"));
     }
 
     [Fact]
@@ -354,8 +359,9 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 10";
         var rows = await ReadExplain(cmd);
 
-        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)"));
         Assert.Contains(rows, r => r.Detail.StartsWith("FILTER") && r.Detail.Contains("\"c\" > 10"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r.Detail == "INDEX INTERSECTION");
     }
 
     [Fact]
@@ -365,13 +371,13 @@ public class ExplainTests : TempDirTest
         var cmd = conn.CreateCommand();
         await SetupMultiIndexTable(cmd);
 
-        // `id < 100` folds into the intersection operator as a pre-lookup PK bound —
-        // it should appear in the rendered predicate alongside a=1 AND b=2.
+        // `id < 100` folds into the operator as a pre-lookup PK bound — it should
+        // appear in the MULTI-INDEX SCAN row's matched-predicate alongside a=1 AND b=2.
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND id < 100";
         var rows = await ReadExplain(cmd);
 
         Assert.Contains(rows, r =>
-            r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)") &&
+            r.Detail.StartsWith("MULTI-INDEX SCAN ON t") &&
             r.Detail.Contains("\"a\" = 1") &&
             r.Detail.Contains("\"b\" = 2") &&
             r.Detail.Contains("\"id\" < 100"));
@@ -388,8 +394,10 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 OR b = 2";
         var rows = await ReadExplain(cmd);
 
-        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX UNION ON t USING (idx_a, idx_b)"));
-        Assert.Contains(rows, r => r.Detail.Contains("\"a\" = 1") && r.Detail.Contains("\"b\" = 2"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r.Detail == "INDEX UNION");
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_a") && r.Detail.Contains("\"a\" = 1"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_b") && r.Detail.Contains("\"b\" = 2"));
         // Union covers the entire disjunction — no FILTER wrapper.
         Assert.DoesNotContain(rows, r => r.Detail.StartsWith("FILTER"));
     }
@@ -411,10 +419,10 @@ public class ExplainTests : TempDirTest
         cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 OR b = 2 OR c = 3";
         var rows = await ReadExplain(cmd);
 
-        Assert.Contains(rows, r =>
-            r.Detail.StartsWith("INDEX UNION ON t USING (") &&
-            r.Detail.Contains("idx_a") &&
-            r.Detail.Contains("idx_b") &&
-            r.Detail.Contains("idx_c"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r.Detail == "INDEX UNION");
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_a"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_b"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX SEEK idx_c"));
     }
 }

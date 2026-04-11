@@ -252,6 +252,52 @@ public class WhereBenchmarks
         return count;
     }
 
+    // ---- Nested AND/OR shapes (recursive multi-index path) ----
+    // Both queries use only the existing idx_category and idx_score.
+    //
+    // Query 1: (category=3 AND score=21) OR (category=5 AND score=35)
+    //   - Disjunct 1: category=3 AND score=21 → 10 rows (i ∈ {3, 1003, ..., 9003}).
+    //     For these rows i*7 % 1000 = 21 because (3 + 1000k) * 7 = 21 + 7000k ≡ 21 (mod 1000).
+    //   - Disjunct 2: category=5 AND score=35 → 10 rows (i ∈ {5, 1005, ..., 9005}).
+    //   - Union: 20 distinct rows (the two disjuncts don't overlap because the categories differ).
+    //   - Before recursive: top-level OR with nested ANDs → multi-index planner bails →
+    //     full scan + residual filter → ~4 ms / ~400 KB at 10k rows.
+    //   - After recursive: Union(Intersect(idx_cat=3, idx_score=21), Intersect(idx_cat=5, idx_score=35)).
+    //
+    // Query 2: (category=3 OR category=5) AND score=21
+    //   - Same-column OR — currently bails for two reasons (same-column AND nested
+    //     under an AND). Equivalent to `category IN (3,5) AND score=21`.
+    //   - score=21 → 10 rows (i ∈ {3, 1003, ..., 9003}, all with category=3).
+    //   - Intersection of (category=3 OR category=5) with score=21 → 10 rows (only the
+    //     category=3 ones, none of category=5 happen to have score=21).
+    //   - Before recursive: bails → full scan + filter → ~4 ms / ~400 KB.
+    //   - After recursive: Intersect(Union(idx_cat=3, idx_cat=5), idx_score=21).
+    //     Two cursors on idx_category, one on idx_score, sorted-merge intersection.
+
+    [Benchmark(Description = "WHERE nested AND-inside-OR")]
+    public async Task<int> Where_NestedAndInsideOr()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE (category = 3 AND score = 21) OR (category = 5 AND score = 35)",
+            null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE nested OR-inside-AND (same-column OR)")]
+    public async Task<int> Where_NestedOrInsideAnd()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE (category = 3 OR category = 5) AND score = 21",
+            null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
     // ---- SQLite baseline benchmarks ----
 
     [Benchmark(Baseline = true, Description = "SQLite: Full scan (no WHERE)")]
@@ -361,6 +407,28 @@ public class WhereBenchmarks
     {
         using var cmd = _sqlite.CreateCommand();
         cmd.CommandText = "SELECT * FROM t WHERE category = 3 OR score = 7";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE nested AND-inside-OR")]
+    public int Sqlite_Where_NestedAndInsideOr()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE (category = 3 AND score = 21) OR (category = 5 AND score = 35)";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE nested OR-inside-AND (same-column OR)")]
+    public int Sqlite_Where_NestedOrInsideAnd()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE (category = 3 OR category = 5) AND score = 21";
         using var reader = cmd.ExecuteReader();
         int count = 0;
         while (reader.Read()) count++;

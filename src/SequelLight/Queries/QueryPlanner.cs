@@ -661,8 +661,12 @@ public sealed class QueryPlanner
                             return pkResult;
                     }
 
-                    // 2. Multi-index intersection / union.
-                    if (scanForPk.Table.IndexCount >= 2)
+                    // 2. Multi-index intersection / union (recursive). The recursive
+                    //    plan can fire even with a single secondary index when the WHERE
+                    //    has multiple equality predicates on the same indexed column
+                    //    (e.g., `a = 1 OR a = 2` becomes a Union over two leaves on the
+                    //    same index — correct, though suboptimal vs an IN-list seek).
+                    if (scanForPk.Table.IndexCount >= 1)
                     {
                         var multi = TryBuildMultiIndexScan(scanForPk, filter, tx);
                         if (multi is not null)
@@ -1501,30 +1505,28 @@ public sealed class QueryPlanner
     }
 
     /// <summary>
-    /// Tries to build a multi-index scan (intersection for AND, union for OR) from a
-    /// <see cref="FilterPlan"/> over a <see cref="ScanPlan"/>. Returns null if the shape
-    /// doesn't fit or a single index would cover the predicate better.
+    /// Tries to build a multi-index scan from a <see cref="FilterPlan"/> over a
+    /// <see cref="ScanPlan"/>. Returns null if the shape doesn't fit or a single index
+    /// would cover the predicate better.
     /// <para>
-    /// AND path (<see cref="IndexIntersectionScan"/>): collects equality conjuncts on
-    /// columns covered by single-column secondary indexes. Requires ≥2 distinct
-    /// conjuncts on distinct columns. If any single index covers ≥2 of the matched
-    /// conjuncts as a leading prefix, the composite wins and this method bails (deferring
-    /// to <see cref="TryBuildIndexScan"/>). PK range conjuncts become pre-lookup byte
-    /// bounds on the intersection output — the InnoDB rule that PK predicates are
-    /// filter-only in a multi-index scan. Any leftover non-equality conjuncts become a
-    /// residual <see cref="Filter"/> wrapper.
+    /// Recursive: AND/OR can nest arbitrarily over <c>col = literal</c> leaves on
+    /// secondary indexes. The result is a tree of <see cref="IPkStream"/> nodes
+    /// (<see cref="IndexLeafPkStream"/>, <see cref="IndexIntersectionPkStream"/>,
+    /// <see cref="IndexUnionPkStream"/>) wrapped by a single
+    /// <see cref="MultiIndexScan"/> operator that does one bookmark lookup per yielded PK.
     /// </para>
     /// <para>
-    /// OR path (<see cref="IndexUnionScan"/>): requires a top-level OR whose every
-    /// disjunct is a plain <c>col = literal</c> on a distinct single-column secondary
-    /// index. Bails on same-column disjuncts (no IN-list support yet), nested AND-inside-
-    /// OR disjuncts, or any disjunct that lacks a matching index.
+    /// PK conjuncts on the primary key are extracted at the TOP level only (the InnoDB
+    /// rule: never intersection inputs, only filter-only bounds). Anything not consumed
+    /// by the IPkStream tree or the PK bounds becomes a residual <see cref="Filter"/>
+    /// wrapper.
     /// </para>
     /// <para>
-    /// TODO: make disjunct matching recursive so shapes like
-    /// <c>(a = 1 AND b = 2) OR c = 3</c> can use a three-way union between an
-    /// IndexIntersectionScan and an IndexScan. Also add IN-list support so same-column
-    /// disjuncts collapse into a single scan with multiple seek keys.
+    /// TODO: PK predicates that appear inside nested OR/AND structures (rather than at
+    /// the top level of the WHERE) are not currently consumed. The recursive descent
+    /// bails as soon as it sees a PK column reference. Lifting this would need a
+    /// "PkSeekPkStream" leaf so PK conditions can become first-class participants in
+    /// the recursive tree alongside secondary-index leaves.
     /// </para>
     /// </summary>
     private IDbEnumerator? TryBuildMultiIndexScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
@@ -1538,225 +1540,282 @@ public sealed class QueryPlanner
 
         var indexes = new List<IndexSchema>();
         _schema.GetIndexesForTable(table.Oid, indexes);
-        if (indexes.Count < 2)
-            return null; // Need at least two distinct secondary indexes.
+        if (indexes.Count == 0)
+            return null;
 
         var names = new QualifiedName[table.Columns.Length];
         for (int i = 0; i < table.Columns.Length; i++)
             names[i] = new QualifiedName(null, table.Columns[i].Name);
         var scanProjection = new Projection(names);
 
-        // Dispatch on top-level predicate shape.
-        if (filter.Predicate is BinaryExpr { Op: BinaryOp.Or })
-            return TryBuildIndexUnion(table, filter, tx, indexes, scanProjection);
-
-        return TryBuildIndexIntersection(table, filter, tx, indexes, scanProjection);
-    }
-
-    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildIndexIntersection(
-        TableSchema table,
-        FilterPlan filter,
-        ReadOnlyTransaction tx,
-        List<IndexSchema> indexes,
-        Projection scanProjection)
-    {
-        var pkIndices = table.PkColumnIndices;
-        var pkTypes = table.PkColumnTypes;
-
+        // Phase 1: split top-level AND, separate PK-bound conjuncts (filter-only) from
+        // the rest. PK bounds are computed once here and passed to the operator wrapper —
+        // they never participate in the recursive tree.
         var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
-
-        // Phase 1: classify conjuncts.
-        //   - pkBoundUsed[ci] = true when the conjunct is a PK range/equality that we
-        //     fold into pkLower/pkUpper bounds (it becomes a pre-lookup filter).
-        //   - eqCandidates: (conjunctIdx, columnIdx, literalValue) for each conjunct
-        //     that is a col=literal on a non-PK indexed column.
         var pkBoundUsed = new bool[conjuncts.Count];
-        var eqCandidates = new List<(int ConjunctIdx, int ColumnIdx, DbValue Value)>();
         var pkRangeBounds = ExtractPkRangeBounds(table, conjuncts, scanProjection, pkBoundUsed);
 
+        // Phase 2: classify each non-PK conjunct as either consumable (we can build a
+        // PkStream from it) or residual (post-bookmark filter). The dry-run accumulates
+        // a flat list of leaves so we can apply the leaf-count and composite-preference
+        // guards before allocating any cursors.
+        var consumableConjuncts = new List<int>();
+        var residualConjunctIdxs = new List<int>();
+        var allLeaves = new List<MultiIndexLeaf>();
+
         for (int ci = 0; ci < conjuncts.Count; ci++)
         {
             if (pkBoundUsed[ci]) continue;
-            if (TryExtractSecondaryIndexEquality(conjuncts[ci], table, scanProjection, out int colIdx, out var value))
-                eqCandidates.Add((ci, colIdx, value));
-        }
 
-        if (eqCandidates.Count < 2)
-            return null;
-
-        // Phase 2: composite-preference guard. If any single index has ≥2 of the matched
-        // equality columns as a contiguous leading prefix, that composite will beat the
-        // intersection — defer to TryBuildIndexScan.
-        if (CompositeCoversTwoOrMore(indexes, eqCandidates, table))
-            return null;
-
-        // Phase 3: pick distinct single-column indexes for distinct equality conjuncts.
-        var pickedConjuncts = new HashSet<int>();
-        var pickedColumns = new HashSet<int>();
-        var pickedIndexes = new List<IndexSchema>();
-        var pickedPrefixes = new List<byte[]>();
-
-        for (int k = 0; k < eqCandidates.Count; k++)
-        {
-            var (ci, colIdx, value) = eqCandidates[k];
-            if (pickedColumns.Contains(colIdx)) continue;
-
-            IndexSchema? match = null;
-            for (int ii = 0; ii < indexes.Count; ii++)
+            int leavesBefore = allLeaves.Count;
+            if (DryRunPkStream(conjuncts[ci], table, scanProjection, indexes, allLeaves))
             {
-                indexes[ii].EnsureEncodingMetadata(table);
-                var idxCols = indexes[ii].ResolvedColumnIndices!;
-                if (idxCols.Length == 1 && idxCols[0] == colIdx)
-                {
-                    match = indexes[ii];
-                    break;
-                }
+                consumableConjuncts.Add(ci);
             }
-            if (match is null) continue;
-
-            // Date-affinity coercion: mirrors TryBuildIndexScan.
-            if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
-                value.Type == DbType.Text &&
-                DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+            else
             {
-                value = DbValue.Integer(ticks);
+                // Roll back any leaves added during the failed dry-run.
+                if (allLeaves.Count > leavesBefore)
+                    allLeaves.RemoveRange(leavesBefore, allLeaves.Count - leavesBefore);
+                residualConjunctIdxs.Add(ci);
             }
-
-            var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
-                match.Oid,
-                new[] { value },
-                new[] { match.ResolvedColumnTypes![0] });
-
-            pickedIndexes.Add(match);
-            pickedPrefixes.Add(seekPrefix);
-            pickedColumns.Add(colIdx);
-            pickedConjuncts.Add(ci);
         }
 
-        if (pickedIndexes.Count < 2)
+        if (consumableConjuncts.Count == 0)
             return null;
 
-        // Phase 4: build residual filter from conjuncts we didn't fold into either the
-        // PK bound or an intersection input.
-        var residualConjuncts = new List<SqlExpr>();
-        for (int ci = 0; ci < conjuncts.Count; ci++)
+        // Phase 3: defer to single-index scan when the multi-index plan would be a single
+        // bare leaf (TryBuildIndexScan handles that case better — no IPkStream indirection,
+        // no MultiIndexScan wrapper overhead).
+        if (allLeaves.Count < 2)
+            return null;
+
+        // Phase 4: composite-preference guard. If any single index covers ≥2 of the
+        // collected leaf columns as a contiguous leading prefix, the composite single-
+        // index path beats the recursive plan. Defer to TryBuildIndexScan.
+        if (CompositeCoversTwoOrMoreLeaves(indexes, allLeaves, table))
+            return null;
+
+        // Phase 5: build the IPkStream tree for real. Cursors get created here. We're
+        // committed at this point — guards have already passed.
+        var consumableStreams = new IPkStream[consumableConjuncts.Count];
+        for (int k = 0; k < consumableConjuncts.Count; k++)
         {
-            if (pkBoundUsed[ci]) continue;
-            if (pickedConjuncts.Contains(ci)) continue;
-            residualConjuncts.Add(conjuncts[ci]);
+            consumableStreams[k] = BuildPkStream(
+                conjuncts[consumableConjuncts[k]], table, scanProjection, indexes, tx)!;
         }
 
-        // Phase 5: build EXPLAIN-only matched-predicate tree (PK bounds + picked eqs).
+        IPkStream rootStream = consumableStreams.Length == 1
+            ? consumableStreams[0]
+            : new IndexIntersectionPkStream(consumableStreams);
+
+        // Phase 6: matched-predicate tree for EXPLAIN — top-level conjuncts that the
+        // operator consumed (PK bounds + everything that became a leaf).
         var matched = new List<SqlExpr>();
         for (int ci = 0; ci < conjuncts.Count; ci++)
-            if (pkBoundUsed[ci] || pickedConjuncts.Contains(ci))
+            if (pkBoundUsed[ci] || consumableConjuncts.Contains(ci))
                 matched.Add(conjuncts[ci]);
         var boundPredicate = matched.Count > 0 ? HeuristicOptimizer.CombineAnd(matched) : null;
 
-        // Phase 6: construct the operator.
-        var cursors = new Storage.Cursor[pickedIndexes.Count];
-        for (int i = 0; i < pickedIndexes.Count; i++)
-            cursors[i] = tx.CreateCursor();
-
-        var operatorBuilder = new Indexes.IndexIntersectionScan(
-            cursors,
-            pickedIndexes.ToArray(),
-            pickedPrefixes.ToArray(),
+        // Phase 7: wrap the root stream in MultiIndexScan and a residual Filter (if any).
+        var op = new Indexes.MultiIndexScan(
+            rootStream,
             table,
             tx,
             pkLowerBoundInclusive: pkRangeBounds.Lower,
             pkUpperBoundExclusive: pkRangeBounds.Upper,
             boundPredicate: boundPredicate);
 
-        IDbEnumerator result = operatorBuilder;
-        if (residualConjuncts.Count > 0)
+        IDbEnumerator result = op;
+        if (residualConjunctIdxs.Count > 0)
         {
-            var residual = HeuristicOptimizer.CombineAnd(residualConjuncts);
-            var resolved = ResolveColumns(residual, operatorBuilder.Projection);
-            result = new Filter(operatorBuilder, resolved);
+            var residuals = new List<SqlExpr>(residualConjunctIdxs.Count);
+            foreach (var ci in residualConjunctIdxs)
+                residuals.Add(conjuncts[ci]);
+            var residual = HeuristicOptimizer.CombineAnd(residuals);
+            var resolved = ResolveColumns(residual, op.Projection);
+            result = new Filter(op, resolved);
         }
 
-        // Provided order: PK ascending (the operator emits rows in PK order).
+        // Provided order: PK ascending (the IPkStream tree emits PKs in order, and
+        // MultiIndexScan does one bookmark lookup per PK in that order).
         var sortKeys = BuildPkSortKeys(table);
         return (result, sortKeys);
     }
 
-    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildIndexUnion(
+    /// <summary>
+    /// Compact representation of a single leaf in a hypothetical IPkStream tree —
+    /// used by the dry-run / guard phase before any cursors are created.
+    /// </summary>
+    private readonly record struct MultiIndexLeaf(int ColumnIdx, IndexSchema Index, DbValue Value);
+
+    /// <summary>
+    /// Dry-run pass that walks <paramref name="expr"/> as if building an IPkStream tree.
+    /// Returns true if the entire subtree is consumable (every leaf is a
+    /// <c>col = literal</c> on a single-column secondary index, every internal node is an
+    /// AND or OR). Appends the discovered leaves to <paramref name="leaves"/> for use by
+    /// the composite-preference guard. PK column references inside the subtree cause it
+    /// to bail (TODO: lift this restriction by introducing a PkSeekPkStream leaf).
+    /// </summary>
+    private bool DryRunPkStream(
+        SqlExpr expr,
         TableSchema table,
-        FilterPlan filter,
-        ReadOnlyTransaction tx,
+        Projection projection,
         List<IndexSchema> indexes,
-        Projection scanProjection)
+        List<MultiIndexLeaf> leaves)
     {
-        var disjuncts = HeuristicOptimizer.SplitOr(filter.Predicate);
-        if (disjuncts.Count < 2)
-            return null;
-
-        var pickedIndexes = new List<IndexSchema>();
-        var pickedPrefixes = new List<byte[]>();
-        var pickedColumns = new HashSet<int>();
-
-        // Each disjunct must be a plain col=literal on a single-column secondary index
-        // whose column hasn't been picked by another disjunct. Any failure → bail.
-        for (int di = 0; di < disjuncts.Count; di++)
+        if (expr is BinaryExpr { Op: BinaryOp.And } binAnd)
         {
-            if (!TryExtractSecondaryIndexEquality(disjuncts[di], table, scanProjection, out int colIdx, out var value))
-                return null;
+            var children = HeuristicOptimizer.SplitAnd(binAnd);
+            if (children.Count < 2) return false;
+            int before = leaves.Count;
+            foreach (var child in children)
+            {
+                if (!DryRunPkStream(child, table, projection, indexes, leaves))
+                {
+                    if (leaves.Count > before)
+                        leaves.RemoveRange(before, leaves.Count - before);
+                    return false;
+                }
+            }
+            return true;
+        }
 
-            // Same-column disjunct → MVP limitation, bail (IN-list handling is a TODO).
-            if (!pickedColumns.Add(colIdx))
-                return null;
+        if (expr is BinaryExpr { Op: BinaryOp.Or } binOr)
+        {
+            var children = HeuristicOptimizer.SplitOr(binOr);
+            if (children.Count < 2) return false;
+            int before = leaves.Count;
+            foreach (var child in children)
+            {
+                if (!DryRunPkStream(child, table, projection, indexes, leaves))
+                {
+                    if (leaves.Count > before)
+                        leaves.RemoveRange(before, leaves.Count - before);
+                    return false;
+                }
+            }
+            return true;
+        }
 
-            IndexSchema? match = null;
+        // Leaf candidate: col = literal on a non-PK column with a single-column secondary index.
+        if (TryExtractSecondaryIndexEquality(expr, table, projection, out int colIdx, out var value))
+        {
+            // Find a single-column index covering this column.
             for (int ii = 0; ii < indexes.Count; ii++)
             {
                 indexes[ii].EnsureEncodingMetadata(table);
                 var idxCols = indexes[ii].ResolvedColumnIndices!;
                 if (idxCols.Length == 1 && idxCols[0] == colIdx)
                 {
-                    match = indexes[ii];
-                    break;
+                    // Date-affinity coercion mirrors TryBuildIndexScan / the original method.
+                    if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
+                        value.Type == DbType.Text &&
+                        DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                    {
+                        value = DbValue.Integer(ticks);
+                    }
+                    leaves.Add(new MultiIndexLeaf(colIdx, indexes[ii], value));
+                    return true;
                 }
             }
-            if (match is null)
-                return null;
-
-            if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
-                value.Type == DbType.Text &&
-                DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
-            {
-                value = DbValue.Integer(ticks);
-            }
-
-            var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
-                match.Oid,
-                new[] { value },
-                new[] { match.ResolvedColumnTypes![0] });
-
-            pickedIndexes.Add(match);
-            pickedPrefixes.Add(seekPrefix);
         }
 
-        // EXPLAIN-only matched predicate = the whole OR.
-        var boundPredicate = filter.Predicate;
+        return false;
+    }
 
-        var cursors = new Storage.Cursor[pickedIndexes.Count];
-        for (int i = 0; i < pickedIndexes.Count; i++)
-            cursors[i] = tx.CreateCursor();
+    /// <summary>
+    /// Materializes the IPkStream subtree corresponding to <paramref name="expr"/>. Must
+    /// only be called after <see cref="DryRunPkStream"/> succeeded — guarantees we don't
+    /// half-build a tree and leak cursors. Mirrors the dry-run shape exactly.
+    /// </summary>
+    private IPkStream? BuildPkStream(
+        SqlExpr expr,
+        TableSchema table,
+        Projection projection,
+        List<IndexSchema> indexes,
+        ReadOnlyTransaction tx)
+    {
+        if (expr is BinaryExpr { Op: BinaryOp.And } binAnd)
+        {
+            var children = HeuristicOptimizer.SplitAnd(binAnd);
+            var built = new IPkStream[children.Count];
+            for (int i = 0; i < children.Count; i++)
+                built[i] = BuildPkStream(children[i], table, projection, indexes, tx)!;
+            return new IndexIntersectionPkStream(built);
+        }
 
-        var op = new Indexes.IndexUnionScan(
-            cursors,
-            pickedIndexes.ToArray(),
-            pickedPrefixes.ToArray(),
-            table,
-            tx,
-            pkLowerBoundInclusive: null,
-            pkUpperBoundExclusive: null,
-            boundPredicate: boundPredicate);
+        if (expr is BinaryExpr { Op: BinaryOp.Or } binOr)
+        {
+            var children = HeuristicOptimizer.SplitOr(binOr);
+            var built = new IPkStream[children.Count];
+            for (int i = 0; i < children.Count; i++)
+                built[i] = BuildPkStream(children[i], table, projection, indexes, tx)!;
+            return new IndexUnionPkStream(built);
+        }
 
-        // Union covers the entire predicate by construction → no residual filter.
-        var sortKeys = BuildPkSortKeys(table);
-        return (op, sortKeys);
+        // Leaf — must succeed because the dry-run already validated.
+        if (!TryExtractSecondaryIndexEquality(expr, table, projection, out int colIdx, out var value))
+            return null;
+
+        IndexSchema? match = null;
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length == 1 && idxCols[0] == colIdx)
+            {
+                match = indexes[ii];
+                break;
+            }
+        }
+        if (match is null) return null;
+
+        if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
+            value.Type == DbType.Text &&
+            DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+        {
+            value = DbValue.Integer(ticks);
+        }
+
+        var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
+            match.Oid,
+            new[] { value },
+            new[] { match.ResolvedColumnTypes![0] });
+
+        return new IndexLeafPkStream(tx.CreateCursor(), match, seekPrefix, expr);
+    }
+
+    /// <summary>
+    /// Composite-preference guard for the recursive multi-index path. If any single index
+    /// covers ≥2 of the collected leaves as a contiguous leading prefix, the composite
+    /// single-index path beats the recursive plan — defer to <see cref="TryBuildIndexScan"/>.
+    /// </summary>
+    private static bool CompositeCoversTwoOrMoreLeaves(
+        List<IndexSchema> indexes,
+        List<MultiIndexLeaf> leaves,
+        TableSchema table)
+    {
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length < 2) continue;
+
+            int matched = 0;
+            for (int pos = 0; pos < idxCols.Length; pos++)
+            {
+                bool hit = false;
+                for (int k = 0; k < leaves.Count; k++)
+                {
+                    if (leaves[k].ColumnIdx == idxCols[pos]) { hit = true; break; }
+                }
+                if (!hit) break; // contiguous leading prefix only
+                matched++;
+            }
+            if (matched >= 2) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -1904,38 +1963,6 @@ public sealed class QueryPlanner
         return true;
     }
 
-    /// <summary>
-    /// Returns true if any index in <paramref name="indexes"/> covers ≥2 of the candidate
-    /// equality conjuncts as a contiguous leading prefix. Such an index beats the
-    /// intersection path (single cursor walk + no bookmark-per-match overhead), so the
-    /// planner should defer to <see cref="TryBuildIndexScan"/>.
-    /// </summary>
-    private static bool CompositeCoversTwoOrMore(
-        List<IndexSchema> indexes,
-        List<(int ConjunctIdx, int ColumnIdx, DbValue Value)> eqCandidates,
-        TableSchema table)
-    {
-        for (int ii = 0; ii < indexes.Count; ii++)
-        {
-            indexes[ii].EnsureEncodingMetadata(table);
-            var idxCols = indexes[ii].ResolvedColumnIndices!;
-            if (idxCols.Length < 2) continue;
-
-            int matched = 0;
-            for (int pos = 0; pos < idxCols.Length; pos++)
-            {
-                bool hit = false;
-                for (int k = 0; k < eqCandidates.Count; k++)
-                {
-                    if (eqCandidates[k].ColumnIdx == idxCols[pos]) { hit = true; break; }
-                }
-                if (!hit) break; // prefix must be contiguous
-                matched++;
-            }
-            if (matched >= 2) return true;
-        }
-        return false;
-    }
 
     /// <summary>
     /// Builds the PK-ASC sort keys for a table — used by multi-index scans to expose

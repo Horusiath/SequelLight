@@ -37,12 +37,9 @@ internal static class PlanFormatter
                 rows.Add((id, parentId, $"INDEX SCAN {idxScan.Index.Name} ON {idxScan.Table.Name}"));
                 break;
 
-            case Indexes.IndexIntersectionScan idxIntersect:
-                rows.Add((id, parentId, FormatMultiIndex("INDEX INTERSECTION", idxIntersect.Table, idxIntersect.Indexes, idxIntersect.BoundPredicate, idxIntersect.Projection)));
-                break;
-
-            case Indexes.IndexUnionScan idxUnion:
-                rows.Add((id, parentId, FormatMultiIndex("INDEX UNION", idxUnion.Table, idxUnion.Indexes, idxUnion.BoundPredicate, idxUnion.Projection)));
+            case Indexes.MultiIndexScan multi:
+                rows.Add((id, parentId, FormatMultiIndexRoot(multi)));
+                VisitPkStream(multi.RootStream, id, rows, multi.Projection);
                 break;
 
             case Filter filter:
@@ -171,30 +168,73 @@ internal static class PlanFormatter
     }
 
     /// <summary>
-    /// Renders a multi-index scan as <c>INDEX INTERSECTION ON t USING (idx_a, idx_b)</c>
-    /// or <c>INDEX UNION ON t USING (...)</c>, appending the matched predicate if the
-    /// operator supplied one.
+    /// Top-level row for the recursive multi-index scan: <c>MULTI-INDEX SCAN ON t (...)</c>
+    /// where the parenthesized portion is the matched-conjunct predicate (PK bounds plus
+    /// the conjuncts the IPkStream tree consumed). The IPkStream tree itself is rendered
+    /// as child rows by <see cref="VisitPkStream"/>.
     /// </summary>
-    private static string FormatMultiIndex(
-        string kind,
-        SequelLight.Schema.TableSchema table,
-        SequelLight.Schema.IndexSchema[] indexes,
-        Parsing.Ast.SqlExpr? boundPredicate,
-        Projection projection)
+    private static string FormatMultiIndexRoot(Indexes.MultiIndexScan multi)
     {
-        var sb = new StringBuilder(kind);
-        sb.Append(" ON ").Append(table.Name);
-        sb.Append(" USING (");
-        for (int i = 0; i < indexes.Length; i++)
-        {
-            if (i > 0) sb.Append(", ");
-            sb.Append(indexes[i].Name);
-        }
-        sb.Append(')');
-        if (boundPredicate is not null)
+        var sb = new StringBuilder("MULTI-INDEX SCAN ON ");
+        sb.Append(multi.Table.Name);
+        if (multi.BoundPredicate is not null)
         {
             sb.Append(" (");
-            SqlWriter.AppendExpr(sb, UnresolveExpr(boundPredicate, projection));
+            SqlWriter.AppendExpr(sb, UnresolveExpr(multi.BoundPredicate, multi.Projection));
+            sb.Append(')');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Recursively walks the IPkStream tree and emits one EXPLAIN row per node.
+    /// Internal nodes (intersection, union) become <c>INDEX INTERSECTION</c> /
+    /// <c>INDEX UNION</c> rows; leaves become <c>INDEX SEEK idx_x ("col" = value)</c>.
+    /// Each child gets <paramref name="parentId"/> as its parent so the tree shape is
+    /// visible in the parent/child relationship column.
+    /// </summary>
+    private static void VisitPkStream(
+        Indexes.IPkStream node,
+        int parentId,
+        List<(int, int, string)> rows,
+        Projection projection)
+    {
+        int id = rows.Count + 1;
+        switch (node)
+        {
+            case Indexes.IndexIntersectionPkStream intersect:
+                rows.Add((id, parentId, "INDEX INTERSECTION"));
+                foreach (var child in intersect.Children)
+                    VisitPkStream(child, id, rows, projection);
+                break;
+
+            case Indexes.IndexUnionPkStream union:
+                rows.Add((id, parentId, "INDEX UNION"));
+                foreach (var child in union.Children)
+                    VisitPkStream(child, id, rows, projection);
+                break;
+
+            case Indexes.IndexLeafPkStream leaf:
+                rows.Add((id, parentId, FormatLeafPkStream(leaf, projection)));
+                break;
+
+            default:
+                rows.Add((id, parentId, node.GetType().Name));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Renders a leaf as <c>INDEX SEEK idx_a ("a" = 1)</c>.
+    /// </summary>
+    private static string FormatLeafPkStream(Indexes.IndexLeafPkStream leaf, Projection projection)
+    {
+        var sb = new StringBuilder("INDEX SEEK ");
+        sb.Append(leaf.Index.Name);
+        if (leaf.BoundPredicate is not null)
+        {
+            sb.Append(" (");
+            SqlWriter.AppendExpr(sb, UnresolveExpr(leaf.BoundPredicate, projection));
             sb.Append(')');
         }
         return sb.ToString();
