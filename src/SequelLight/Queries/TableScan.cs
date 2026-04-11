@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using SequelLight.Data;
+using SequelLight.Indexes;
 using SequelLight.Parsing.Ast;
 using SequelLight.Schema;
 using SequelLight.Storage;
@@ -38,21 +39,12 @@ public sealed class TableScan : IDbEnumerator
     /// <summary>True iff this scan was constructed with a non-default lower or upper bound.</summary>
     internal bool IsBounded => _upperBoundExclusive is not null || !ReferenceEquals(_seekStart, _prefix);
 
-    // Precomputed encoding metadata
-    private readonly int _columnCount;
-    private readonly int[] _pkColumnIndices;
-    private readonly ColumnSchema[] _pkColumns;
-    private readonly ColumnSchema[] _valueColumns;
-    private readonly int[] _valueColumnOutputIndices;
-
-    // Reusable decode buffers
-    private readonly DbValue[] _pkBuf;
-    private readonly DbValue[] _valueBuf;
+    private readonly IndexRowDecoder _decoder;
 
     internal TableSchema Table => _table;
 
-    public Projection Projection { get; }
-    public DbValue[] Current { get; }
+    public Projection Projection => _decoder.Projection;
+    public DbValue[] Current => _decoder.Current;
 
     public TableScan(
         Cursor cursor,
@@ -67,50 +59,10 @@ public sealed class TableScan : IDbEnumerator
         _seekStart = lowerBoundInclusive ?? _prefix;
         _upperBoundExclusive = upperBoundExclusive;
         BoundPredicate = boundPredicate;
-        _columnCount = table.Columns.Length;
 
-        // Build projection from column names. Per-value type information (including the
-        // DateTime affinity bit) is carried by the values themselves — the row decoder
-        // produces DbValue.DateTime for date columns inline, so no projection-level type
-        // metadata is needed.
-        var names = new QualifiedName[_columnCount];
-        for (int i = 0; i < _columnCount; i++)
-            names[i] = new QualifiedName(null, table.Columns[i].Name);
-        Projection = new Projection(names);
-
-        // Precompute PK and value column metadata
-        int pkCount = 0, valCount = 0;
-        for (int i = 0; i < _columnCount; i++)
-        {
-            if (table.Columns[i].IsPrimaryKey) pkCount++;
-            else valCount++;
-        }
-
-        _pkColumnIndices = new int[pkCount];
-        _pkColumns = new ColumnSchema[pkCount];
-        _valueColumns = new ColumnSchema[valCount];
-        _valueColumnOutputIndices = new int[valCount];
-
-        int pk = 0, val = 0;
-        for (int i = 0; i < _columnCount; i++)
-        {
-            if (table.Columns[i].IsPrimaryKey)
-            {
-                _pkColumnIndices[pk] = i;
-                _pkColumns[pk] = table.Columns[i];
-                pk++;
-            }
-            else
-            {
-                _valueColumns[val] = table.Columns[i];
-                _valueColumnOutputIndices[val] = i;
-                val++;
-            }
-        }
-
-        _pkBuf = new DbValue[pkCount];
-        _valueBuf = new DbValue[valCount];
-        Current = new DbValue[_columnCount];
+        // All per-row decode state (buffers, column metadata, Current output, Projection)
+        // lives in the shared decoder helper — keeps TableScan focused on the cursor walk.
+        _decoder = new IndexRowDecoder(table);
     }
 
     public ValueTask<bool> NextAsync(CancellationToken ct = default)
@@ -229,30 +181,7 @@ public sealed class TableScan : IDbEnumerator
     }
 
     private void DecodeRow(ReadOnlySpan<byte> key)
-    {
-        // Decode PK columns from key (schema-aware: tags date PKs as DbValue.DateTime)
-        RowKeyEncoder.Decode(key, out _, _pkBuf, _pkColumns);
-
-        // Decode value columns
-        var valueSpan = _cursor.CurrentValue.Span;
-        ushort storedSlotCount = RowValueEncoder.ReadSlotCount(valueSpan);
-        RowValueEncoder.Decode(valueSpan, _valueBuf, _valueColumns);
-
-        // Fill defaults for columns absent from the stored row (added after the row was written).
-        // A column is absent when its SeqNo >= storedSlotCount — distinct from an explicit NULL
-        // where the slot exists but offset == 0.
-        for (int i = 0; i < _valueColumns.Length; i++)
-        {
-            if (_valueBuf[i].IsNull && _valueColumns[i].SeqNo >= storedSlotCount && _valueColumns[i].DefaultValue is { } def)
-                _valueBuf[i] = Database.EvaluateDefault(def, _valueColumns[i]);
-        }
-
-        // Assemble full row in column order — reuse Current buffer
-        for (int i = 0; i < _pkColumnIndices.Length; i++)
-            Current[_pkColumnIndices[i]] = _pkBuf[i];
-        for (int i = 0; i < _valueColumnOutputIndices.Length; i++)
-            Current[_valueColumnOutputIndices[i]] = _valueBuf[i];
-    }
+        => _decoder.Decode(key, _cursor.CurrentValue.Span);
 
     public ValueTask DisposeAsync() => _cursor.DisposeAsync();
 }

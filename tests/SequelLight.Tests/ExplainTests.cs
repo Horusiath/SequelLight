@@ -288,4 +288,133 @@ public class ExplainTests : TempDirTest
         Assert.Contains(rows, r => r.Detail.StartsWith("FILTER"));
         Assert.Contains(rows, r => r.Detail.StartsWith("SCAN t"));
     }
+
+    // ----- Multi-index scan EXPLAIN coverage -----
+
+    private static async Task SetupMultiIndexTable(SequelLightCommand cmd)
+    {
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_a ON t(a)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_b ON t(b)";
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task Explain_Intersection_ShowsBothIndexes()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        await SetupMultiIndexTable(cmd);
+
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)"));
+        // Rendered predicate should include both equalities (order follows the planner's
+        // matched-conjunct list).
+        Assert.Contains(rows, r => r.Detail.Contains("\"a\" = 1") && r.Detail.Contains("\"b\" = 2"));
+        // Intersection covers both conjuncts — no residual FILTER.
+        Assert.DoesNotContain(rows, r => r.Detail.StartsWith("FILTER"));
+    }
+
+    [Fact]
+    public async Task Explain_Intersection_NWay_ShowsAllIndexes()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_a ON t(a)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_b ON t(b)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_c ON t(c)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r =>
+            r.Detail.StartsWith("INDEX INTERSECTION ON t USING (") &&
+            r.Detail.Contains("idx_a") &&
+            r.Detail.Contains("idx_b") &&
+            r.Detail.Contains("idx_c"));
+    }
+
+    [Fact]
+    public async Task Explain_Intersection_WithResidualFilter_ShowsFilterNodeAboveIntersection()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        await SetupMultiIndexTable(cmd);
+
+        // `a = 1 AND b = 2` are intersected; `c > 10` is a residual.
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 10";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)"));
+        Assert.Contains(rows, r => r.Detail.StartsWith("FILTER") && r.Detail.Contains("\"c\" > 10"));
+    }
+
+    [Fact]
+    public async Task Explain_Intersection_WithPkRangeFilter_IncludesPkBoundInPredicate()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        await SetupMultiIndexTable(cmd);
+
+        // `id < 100` folds into the intersection operator as a pre-lookup PK bound —
+        // it should appear in the rendered predicate alongside a=1 AND b=2.
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2 AND id < 100";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r =>
+            r.Detail.StartsWith("INDEX INTERSECTION ON t USING (idx_a, idx_b)") &&
+            r.Detail.Contains("\"a\" = 1") &&
+            r.Detail.Contains("\"b\" = 2") &&
+            r.Detail.Contains("\"id\" < 100"));
+        Assert.DoesNotContain(rows, r => r.Detail.StartsWith("FILTER"));
+    }
+
+    [Fact]
+    public async Task Explain_Union_ShowsBothIndexes()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        await SetupMultiIndexTable(cmd);
+
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 OR b = 2";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r => r.Detail.StartsWith("INDEX UNION ON t USING (idx_a, idx_b)"));
+        Assert.Contains(rows, r => r.Detail.Contains("\"a\" = 1") && r.Detail.Contains("\"b\" = 2"));
+        // Union covers the entire disjunction — no FILTER wrapper.
+        Assert.DoesNotContain(rows, r => r.Detail.StartsWith("FILTER"));
+    }
+
+    [Fact]
+    public async Task Explain_Union_NWay_ShowsAllIndexes()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_a ON t(a)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_b ON t(b)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_c ON t(c)";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a = 1 OR b = 2 OR c = 3";
+        var rows = await ReadExplain(cmd);
+
+        Assert.Contains(rows, r =>
+            r.Detail.StartsWith("INDEX UNION ON t USING (") &&
+            r.Detail.Contains("idx_a") &&
+            r.Detail.Contains("idx_b") &&
+            r.Detail.Contains("idx_c"));
+    }
 }

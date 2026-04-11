@@ -37,6 +37,14 @@ internal static class PlanFormatter
                 rows.Add((id, parentId, $"INDEX SCAN {idxScan.Index.Name} ON {idxScan.Table.Name}"));
                 break;
 
+            case Indexes.IndexIntersectionScan idxIntersect:
+                rows.Add((id, parentId, FormatMultiIndex("INDEX INTERSECTION", idxIntersect.Table, idxIntersect.Indexes, idxIntersect.BoundPredicate, idxIntersect.Projection)));
+                break;
+
+            case Indexes.IndexUnionScan idxUnion:
+                rows.Add((id, parentId, FormatMultiIndex("INDEX UNION", idxUnion.Table, idxUnion.Indexes, idxUnion.BoundPredicate, idxUnion.Projection)));
+                break;
+
             case Filter filter:
                 rows.Add((id, parentId, FormatFilter(filter)));
                 Visit(filter.Source, id, rows);
@@ -159,6 +167,36 @@ internal static class PlanFormatter
     {
         var sb = new StringBuilder("FILTER ");
         SqlWriter.AppendExpr(sb, UnresolveExpr(filter.Predicate, filter.Projection));
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Renders a multi-index scan as <c>INDEX INTERSECTION ON t USING (idx_a, idx_b)</c>
+    /// or <c>INDEX UNION ON t USING (...)</c>, appending the matched predicate if the
+    /// operator supplied one.
+    /// </summary>
+    private static string FormatMultiIndex(
+        string kind,
+        SequelLight.Schema.TableSchema table,
+        SequelLight.Schema.IndexSchema[] indexes,
+        Parsing.Ast.SqlExpr? boundPredicate,
+        Projection projection)
+    {
+        var sb = new StringBuilder(kind);
+        sb.Append(" ON ").Append(table.Name);
+        sb.Append(" USING (");
+        for (int i = 0; i < indexes.Length; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(indexes[i].Name);
+        }
+        sb.Append(')');
+        if (boundPredicate is not null)
+        {
+            sb.Append(" (");
+            SqlWriter.AppendExpr(sb, UnresolveExpr(boundPredicate, projection));
+            sb.Append(')');
+        }
         return sb.ToString();
     }
 

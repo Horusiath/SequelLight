@@ -461,6 +461,31 @@ public static class HeuristicOptimizer
         return result;
     }
 
+    /// <summary>
+    /// Flattens a left-leaning OR tree into its top-level disjuncts. For example, the
+    /// parsed form of <c>a OR b OR c</c> — which is <c>((a OR b) OR c)</c> — splits into
+    /// <c>[a, b, c]</c>. A non-OR expression at the root returns a single-element list.
+    /// </summary>
+    internal static List<SqlExpr> SplitOr(SqlExpr expr)
+    {
+        var result = new List<SqlExpr>();
+        SplitOrRecursive(expr, result);
+        return result;
+    }
+
+    private static void SplitOrRecursive(SqlExpr expr, List<SqlExpr> result)
+    {
+        if (expr is BinaryExpr { Op: BinaryOp.Or } binary)
+        {
+            SplitOrRecursive(binary.Left, result);
+            SplitOrRecursive(binary.Right, result);
+        }
+        else
+        {
+            result.Add(expr);
+        }
+    }
+
     private static HashSet<string> CollectTableAliases(LogicalPlan plan)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

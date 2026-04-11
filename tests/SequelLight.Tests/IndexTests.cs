@@ -694,4 +694,312 @@ public class OrderByEliminationTests : TempDirTest
 
         Assert.Equal(new[] { 10L, 20L, 30L }, values);
     }
+
+    // ----- IndexIntersectionScan correctness -----
+
+    private static async Task<List<long>> ReadIds(SequelLightCommand cmd)
+    {
+        var ids = new List<long>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            ids.Add(reader.GetInt64(0));
+        return ids;
+    }
+
+    [Fact]
+    public async Task IndexIntersection_TwoIndexes_ReturnsIntersectedRows()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        // Layout:
+        //   id  a  b
+        //    1  1  1   ← matches a=1 AND b=1
+        //    2  1  2
+        //    3  2  1
+        //    4  2  2
+        //    5  1  1   ← matches a=1 AND b=1
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1,0), (2,1,2,0), (3,2,1,0), (4,2,2,0), (5,1,1,0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 5L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_ThreeIndexes_NWayMergeProducesOnlyAllMatching()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "CREATE INDEX idx_c ON t(c)");
+        // Rows designed so only id=3 and id=9 match all three equalities.
+        await Exec(conn,
+            @"INSERT INTO t VALUES
+              (1, 1, 0, 0),
+              (2, 1, 1, 0),
+              (3, 1, 1, 1),
+              (4, 1, 1, 0),
+              (5, 0, 1, 1),
+              (6, 1, 0, 1),
+              (7, 1, 1, 0),
+              (8, 0, 0, 0),
+              (9, 1, 1, 1),
+              (10, 0, 1, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1 AND c = 1 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 3L, 9L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_EmptyIntersection_ReturnsNothing()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,2), (2,1,2), (3,2,3)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 3";
+        var ids = await ReadIds(cmd);
+
+        Assert.Empty(ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_HandlesDeletedRow_SkipsStaleIndexEntries()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1), (2,1,1), (3,1,1)");
+        await Exec(conn, "DELETE FROM t WHERE id = 2");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_WithPkRangeFilter_AppliesFilterBeforeBookmark()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        // 1, 3, 5 all match (a=1 AND b=1); pk filter id < 4 keeps 1 and 3.
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1), (2,1,2), (3,1,1), (4,2,1), (5,1,1)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1 AND id < 4 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 3L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_WithResidualFilter_FiltersAfterIntersection()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        // Intersection of a=1 AND b=1 is {1, 3, 4}; residual filter c > 10 keeps {3}.
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1,5), (2,1,2,15), (3,1,1,20), (4,1,1,8)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1 AND c > 10";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 3L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexIntersection_CompositeIndex_PrefersCompositeOverIntersection()
+    {
+        // Regression guard: when idx_ab(a, b) covers both equality conjuncts, the planner
+        // must NOT use intersection even though idx_a(a) and idx_b(b) also exist.
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_ab ON t(a, b)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1), (2,1,2), (3,2,1)");
+
+        // Results should still be correct regardless of which path fires.
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 AND b = 1";
+        var ids = await ReadIds(cmd);
+        Assert.Equal(new[] { 1L }, ids);
+
+        // Assert on the plan shape: the composite idx_ab must be picked. An
+        // INDEX ONLY SCAN is acceptable (even better — the PK comes from the index value,
+        // no bookmark lookup) and IndexOnlyScan is what the planner picks for `SELECT id`
+        // when the composite index covers every projected column.
+        cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE a = 1 AND b = 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        bool foundCompositeIndex = false;
+        bool foundIntersection = false;
+        while (await reader.ReadAsync())
+        {
+            var detail = reader.GetString(2);
+            if (detail.Contains("idx_ab") &&
+                (detail.StartsWith("INDEX SCAN") || detail.StartsWith("INDEX ONLY SCAN")))
+                foundCompositeIndex = true;
+            if (detail.StartsWith("INDEX INTERSECTION")) foundIntersection = true;
+        }
+        Assert.True(foundCompositeIndex, "Expected composite index path on idx_ab");
+        Assert.False(foundIntersection, "Should NOT have chosen intersection when composite covers both conjuncts");
+    }
+
+    // ----- IndexUnionScan correctness -----
+
+    [Fact]
+    public async Task IndexUnion_TwoIndexes_ReturnsDeduplicatedUnion()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        // a=1: {1, 3, 5}.  b=2: {2, 3}. Union: {1, 2, 3, 5}.
+        // id=3 matches both — must appear exactly once.
+        await Exec(conn, "INSERT INTO t VALUES (1,1,0), (2,0,2), (3,1,2), (4,0,0), (5,1,0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR b = 2 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L, 5L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexUnion_ThreeIndexes_NWayUnionDedups()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "CREATE INDEX idx_c ON t(c)");
+        // Designed so id=5 is the only row in all three selections;
+        // Union should emit it exactly once.
+        await Exec(conn,
+            @"INSERT INTO t VALUES
+              (1, 1, 0, 0),
+              (2, 0, 2, 0),
+              (3, 0, 0, 3),
+              (4, 0, 0, 0),
+              (5, 1, 2, 3),
+              (6, 1, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 3 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L, 5L, 6L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexUnion_HandlesDeletedRow_SkipsStaleIndexEntries()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,0), (2,0,2), (3,1,2)");
+        await Exec(conn, "DELETE FROM t WHERE id = 3");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR b = 2 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L }, ids);
+    }
+
+    [Fact]
+    public async Task IndexUnion_SameColumnOr_FallsBackToFullScan()
+    {
+        // MVP limitation guard: a = 1 OR a = 2 should fall back to a single-index scan +
+        // filter (or full scan), NOT fire the union. Tests that the planner bails out of
+        // the union path for same-column disjuncts.
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1), (2,2), (3,3)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR a = 2 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        // Correctness: we still get the right rows even though union doesn't fire.
+        Assert.Equal(new[] { 1L, 2L }, ids);
+
+        // Explain should NOT show INDEX UNION.
+        cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE a = 1 OR a = 2";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            Assert.DoesNotContain("INDEX UNION", reader.GetString(2));
+    }
+
+    [Fact]
+    public async Task IndexUnion_NonIndexableDisjunct_FallsBackToFullScan()
+    {
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,0,0), (2,0,2,0), (3,0,0,5)");
+
+        var cmd = conn.CreateCommand();
+        // `c = 5` has no index — the whole OR must fall back.
+        cmd.CommandText = "SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 5 ORDER BY id";
+        var ids = await ReadIds(cmd);
+
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+
+        cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE a = 1 OR b = 2 OR c = 5";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            Assert.DoesNotContain("INDEX UNION", reader.GetString(2));
+    }
+
+    [Fact]
+    public async Task IndexIntersection_FullPkEquality_PrefersPointSeek()
+    {
+        // Regression guard: even when idx_a, idx_b could satisfy the non-PK parts, a full
+        // PK equality (id = N) must win because PK seek is a single-row lookup.
+        await using var conn = await OpenConnectionAsync();
+        await Exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)");
+        await Exec(conn, "CREATE INDEX idx_a ON t(a)");
+        await Exec(conn, "CREATE INDEX idx_b ON t(b)");
+        await Exec(conn, "INSERT INTO t VALUES (1,1,1), (2,1,1), (3,1,1)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT id FROM t WHERE id = 2 AND a = 1 AND b = 1";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        bool foundSearch = false;
+        bool foundIntersection = false;
+        while (await reader.ReadAsync())
+        {
+            var detail = reader.GetString(2);
+            if (detail.StartsWith("SEARCH t USING PRIMARY KEY")) foundSearch = true;
+            if (detail.StartsWith("INDEX INTERSECTION")) foundIntersection = true;
+        }
+        Assert.True(foundSearch, "Expected SEARCH t USING PRIMARY KEY for full PK equality");
+        Assert.False(foundIntersection, "Should NOT have chosen intersection when PK is fully pinned");
+
+        cmd.CommandText = "SELECT id FROM t WHERE id = 2 AND a = 1 AND b = 1";
+        var ids = await ReadIds(cmd);
+        Assert.Equal(new[] { 2L }, ids);
+    }
 }
