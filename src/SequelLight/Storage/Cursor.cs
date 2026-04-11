@@ -106,6 +106,7 @@ internal sealed class SkipListCursor : Cursor
 /// </summary>
 internal sealed class SSTableCursor : Cursor
 {
+    private readonly SSTableReader _reader;
     private readonly SafeFileHandle _handle;
     private readonly SSTableReader.IndexEntry[] _index;
     private readonly BlockCache? _blockCache;
@@ -114,7 +115,10 @@ internal sealed class SSTableCursor : Cursor
     private int _blockIdx = -1;
     private int _entryIdx = -1;
 
-    // Raw block data — kept alive until next block load or dispose
+    // Decoded block bytes — kept alive until next block load or dispose. For
+    // compressed tables this holds the LZ4-decoded payload; for uncompressed tables
+    // it holds the on-disk bytes verbatim. CurrentValue references slices of this
+    // buffer so it must stay stable between MoveNext calls.
     private byte[]? _rawBuf;
     private int _rawLen;
 
@@ -134,9 +138,10 @@ internal sealed class SSTableCursor : Cursor
         public int ValueLength; // -1 for tombstone
     }
 
-    internal SSTableCursor(SafeFileHandle handle, SSTableReader.IndexEntry[] index,
+    internal SSTableCursor(SSTableReader reader, SafeFileHandle handle, SSTableReader.IndexEntry[] index,
         BlockCache? blockCache, string filePath)
     {
+        _reader = reader;
         _handle = handle;
         _index = index;
         _blockCache = blockCache;
@@ -254,10 +259,18 @@ internal sealed class SSTableCursor : Cursor
         _blockIdx = blockIdx;
 
         var idx = _index[blockIdx];
-        EnsureRawBuf(idx.Length);
+
+        // The in-memory block buffer must hold the DECODED block bytes. For compressed
+        // tables that's capped by the reader's max_uncompressed_block_size; for
+        // uncompressed tables it's the on-disk length.
+        int requiredCapacity = _reader.CompressionCodec == CompressionCodec.Lz4
+            ? _reader.MaxUncompressedBlockSize
+            : idx.Length;
+        EnsureRawBuf(requiredCapacity);
 
         if (_blockCache is not null && _blockCache.TryGet(_filePath, idx.Offset, out var lease))
         {
+            // Cache always stores decoded bytes — ready to walk entries.
             using (lease)
             {
                 lease.Span.CopyTo(_rawBuf);
@@ -266,9 +279,8 @@ internal sealed class SSTableCursor : Cursor
         }
         else
         {
-            await RandomAccess.ReadAsync(_handle, _rawBuf.AsMemory(0, idx.Length), idx.Offset)
-                .ConfigureAwait(false);
-            _rawLen = idx.Length;
+            // Reader's ReadBlockAsync centralizes "read from disk + maybe LZ4 decode".
+            _rawLen = await _reader.ReadBlockAsync(idx.Offset, idx.Length, _rawBuf!).ConfigureAwait(false);
             _blockCache?.Insert(_filePath, idx.Offset, _rawBuf.AsSpan(0, _rawLen));
         }
 

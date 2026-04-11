@@ -453,8 +453,12 @@ public sealed class SpillBuffer : IAsyncDisposable
         EnsureSorted();
 
         var path = _allocateSpillPath();
+        // Spill SSTables are always uncompressed — they're short-lived scan-only runs
+        // where per-block LZ4 decode overhead isn't worth the space savings. This is
+        // deliberately independent of the LsmStore's BlockCompression setting.
         await using (var writer = SSTableWriter.Create(path, _blockSize,
-            buildBloomFilter: !_sequentialSpillsOnly))
+            buildBloomFilter: !_sequentialSpillsOnly,
+            compressionCodec: CompressionCodec.None))
         {
             for (int i = 0; i < _entryCount; i++)
             {

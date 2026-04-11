@@ -797,6 +797,255 @@ public class SSTableTests : TempDirTest
         Assert.Equal("apple", Str(reader.MinKey));
         Assert.Equal("cherry", Str(reader.MaxKey));
     }
+
+    // ----- LZ4 compression coverage -----
+
+    [Fact]
+    public async Task Lz4_Roundtrip_ManyEntries_PointLookupAndScan()
+    {
+        var path = Path.Combine(TempDir, "lz4.sst");
+        var expected = new SortedDictionary<string, string>();
+
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            // Use enough entries to force multiple blocks, with repetition-friendly
+            // key prefixes so LZ4 actually compresses meaningfully.
+            for (int i = 0; i < 500; i++)
+            {
+                var key = $"user:row:{i:D6}";
+                var val = $"the quick brown fox value {i}";
+                expected[key] = val;
+                await writer.WriteEntryAsync(Key(key), Val(val));
+            }
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        Assert.Equal(CompressionCodec.Lz4, reader.GetType()
+            .GetProperty("CompressionCodec",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(reader));
+
+        // Point lookups must return every inserted row.
+        foreach (var (k, v) in expected)
+        {
+            var (value, found) = await reader.GetAsync(Key(k));
+            Assert.True(found, $"Key {k} not found");
+            Assert.Equal(v, Str(value));
+        }
+
+        var (_, notFound) = await reader.GetAsync(Key("missing-key"));
+        Assert.False(notFound);
+
+        // Sequential scan via ScanAsync must yield all entries in order.
+        var scanned = new List<(string Key, string Value)>();
+        await foreach (var (k, v) in reader.ScanAsync())
+            scanned.Add((Str(k), Str(v)));
+        Assert.Equal(expected.Count, scanned.Count);
+        int idx = 0;
+        foreach (var (k, v) in expected)
+        {
+            Assert.Equal(k, scanned[idx].Key);
+            Assert.Equal(v, scanned[idx].Value);
+            idx++;
+        }
+    }
+
+    [Fact]
+    public async Task Lz4_Roundtrip_Scanner_MatchesUncompressed()
+    {
+        // Write the same entries once with LZ4 and once without, then walk both via
+        // SSTableScanner.MoveNextAsync — the iteration must be byte-identical.
+        var plainPath = Path.Combine(TempDir, "plain.sst");
+        var lz4Path = Path.Combine(TempDir, "lz4.sst");
+
+        async Task WriteAllAsync(string path, CompressionCodec codec)
+        {
+            await using var writer = SSTableWriter.Create(path, compressionCodec: codec);
+            for (int i = 0; i < 300; i++)
+                await writer.WriteEntryAsync(Key($"row:{i:D5}"), Val($"payload_{i}"));
+            // Include a tombstone to make sure it survives compression.
+            await writer.WriteEntryAsync(Key("tombstoned-key"), null);
+            await writer.FinishAsync();
+        }
+
+        await WriteAllAsync(plainPath, CompressionCodec.None);
+        await WriteAllAsync(lz4Path, CompressionCodec.Lz4);
+
+        async Task<List<(string Key, string? Value)>> DrainAsync(string path)
+        {
+            await using var reader = await SSTableReader.OpenAsync(path);
+            await using var scanner = reader.CreateScanner();
+            var entries = new List<(string, string?)>();
+            while (await scanner.MoveNextAsync())
+            {
+                var key = Encoding.UTF8.GetString(scanner.CurrentKey);
+                string? value = scanner.IsTombstone
+                    ? null
+                    : Encoding.UTF8.GetString(scanner.CurrentValueMemory.Span);
+                entries.Add((key, value));
+            }
+            return entries;
+        }
+
+        var plainEntries = await DrainAsync(plainPath);
+        var lz4Entries = await DrainAsync(lz4Path);
+
+        Assert.Equal(plainEntries.Count, lz4Entries.Count);
+        for (int i = 0; i < plainEntries.Count; i++)
+            Assert.Equal(plainEntries[i], lz4Entries[i]);
+    }
+
+    [Fact]
+    public async Task Lz4_Roundtrip_Cursor_SeekAndIterate()
+    {
+        var path = Path.Combine(TempDir, "cursor.sst");
+
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            for (int i = 0; i < 200; i++)
+                await writer.WriteEntryAsync(Key($"k{i:D4}"), Val($"v{i}"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        await using var cursor = reader.CreateScanner();
+
+        // Walk forward via the scanner (cursor API is internal; scanner exercises the
+        // same read path including block load + decompression).
+        int count = 0;
+        while (await cursor.MoveNextAsync())
+        {
+            var key = Encoding.UTF8.GetString(cursor.CurrentKey);
+            Assert.Equal($"k{count:D4}", key);
+            count++;
+        }
+        Assert.Equal(200, count);
+    }
+
+    [Fact]
+    public async Task Lz4_Produces_Smaller_File_Than_Uncompressed()
+    {
+        // Use repetitive data so LZ4 has something to compress.
+        var plainPath = Path.Combine(TempDir, "plain.sst");
+        var lz4Path = Path.Combine(TempDir, "lz4.sst");
+
+        async Task WriteAllAsync(string path, CompressionCodec codec)
+        {
+            await using var writer = SSTableWriter.Create(path, compressionCodec: codec);
+            for (int i = 0; i < 1000; i++)
+                await writer.WriteEntryAsync(
+                    Key($"repeated-key-prefix-{i:D6}"),
+                    Val("repeated-value-payload-that-compresses-well-abcdefghijklmnop"));
+            await writer.FinishAsync();
+        }
+
+        await WriteAllAsync(plainPath, CompressionCodec.None);
+        await WriteAllAsync(lz4Path, CompressionCodec.Lz4);
+
+        long plainSize = new FileInfo(plainPath).Length;
+        long lz4Size = new FileInfo(lz4Path).Length;
+
+        // Both files should be non-trivial, and LZ4 should be meaningfully smaller —
+        // at least 30% smaller for this highly-compressible pattern.
+        Assert.True(plainSize > 10_000);
+        Assert.True(lz4Size < plainSize * 0.7,
+            $"Expected LZ4 output to be <70% of plain; got {lz4Size} vs {plainSize}");
+    }
+
+    [Fact]
+    public async Task Lz4_EmptySSTable_Roundtrips()
+    {
+        var path = Path.Combine(TempDir, "empty.sst");
+
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        Assert.Equal(0, reader.EntryCount);
+
+        // Scan yields nothing.
+        int count = 0;
+        await foreach (var _ in reader.ScanAsync()) count++;
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public async Task Lz4_SingleEntry_Roundtrips()
+    {
+        var path = Path.Combine(TempDir, "single.sst");
+
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            await writer.WriteEntryAsync(Key("only"), Val("one"));
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+        Assert.Equal(1, reader.EntryCount);
+        Assert.Equal("only", Str(reader.MinKey));
+        Assert.Equal("only", Str(reader.MaxKey));
+
+        var (value, found) = await reader.GetAsync(Key("only"));
+        Assert.True(found);
+        Assert.Equal("one", Str(value));
+    }
+
+    [Fact]
+    public async Task Lz4_TombstonesSurvive_Compression()
+    {
+        var path = Path.Combine(TempDir, "tombstones.sst");
+
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            await writer.WriteEntryAsync(Key("alive"), Val("value"));
+            await writer.WriteEntryAsync(Key("dead"), null);
+            await writer.WriteEntryAsync(Key("zombie"), null);
+            await writer.FinishAsync();
+        }
+
+        await using var reader = await SSTableReader.OpenAsync(path);
+
+        var (aliveVal, aliveFound) = await reader.GetAsync(Key("alive"));
+        Assert.True(aliveFound);
+        Assert.Equal("value", Str(aliveVal));
+
+        var (deadVal, deadFound) = await reader.GetAsync(Key("dead"));
+        Assert.True(deadFound);
+        Assert.Null(deadVal); // tombstone is Found=true with null value
+    }
+
+    [Fact]
+    public async Task Lz4_InvalidMagic_ThrowsOnOpen()
+    {
+        var path = Path.Combine(TempDir, "corrupt.sst");
+
+        // Write a valid LZ4 SSTable then corrupt the magic number in the footer.
+        await using (var writer = SSTableWriter.Create(path,
+            compressionCodec: CompressionCodec.Lz4))
+        {
+            await writer.WriteEntryAsync(Key("k"), Val("v"));
+            await writer.FinishAsync();
+        }
+
+        var bytes = File.ReadAllBytes(path);
+        // Magic is the last 4 bytes of the footer — corrupt them.
+        bytes[^1] = 0xFF;
+        bytes[^2] = 0xFF;
+        bytes[^3] = 0xFF;
+        bytes[^4] = 0xFF;
+        File.WriteAllBytes(path, bytes);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            SSTableReader.OpenAsync(path).AsTask());
+    }
 }
 
 public class BloomFilterTests
