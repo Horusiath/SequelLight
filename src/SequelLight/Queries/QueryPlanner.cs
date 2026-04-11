@@ -1591,7 +1591,7 @@ public sealed class QueryPlanner
             if (pkBoundUsed[ci]) continue;
 
             int leavesBefore = allLeaves.Count;
-            if (DryRunPkStream(conjuncts[ci], table, scanProjection, indexes, allLeaves))
+            if (DryRunPkStream(conjuncts[ci], table, scanProjection, indexes, allLeaves, ci))
             {
                 consumableConjuncts.Add(ci);
             }
@@ -1611,6 +1611,17 @@ public sealed class QueryPlanner
         // bare leaf (TryBuildIndexScan handles that case better — no IPkStream indirection,
         // no MultiIndexScan wrapper overhead).
         if (allLeaves.Count < 2)
+            return null;
+
+        // Phase 3.5: same-column-OR-vs-selective-conjunct deferral (Option C).
+        // Detect the regression shape: exactly two consumable conjuncts, one being a
+        // same-column OR / IN-list (≥2 leaves all on the same column), the other a
+        // single-leaf equality on a different column. In that case the single-leaf
+        // conjunct is a strictly better driver — defer to TryBuildIndexScan, which
+        // will use it as the seek and apply the same-col OR/IN as a residual filter.
+        // This is the documented 12× regression (see
+        // benchmark_recursive_multi_index_2026_04_11.md).
+        if (ShouldDeferToSelectiveSingleIndex(consumableConjuncts, allLeaves))
             return null;
 
         // Phase 4: composite-preference guard. If any single index covers ≥2 of the
@@ -1669,15 +1680,20 @@ public sealed class QueryPlanner
     /// <summary>
     /// Compact representation of a single leaf in a hypothetical IPkStream tree —
     /// used by the dry-run / guard phase before any cursors are created.
+    /// <see cref="ConjunctIdx"/> tracks which top-level WHERE conjunct produced this
+    /// leaf, so the structural deferral guards (Phase 2.5) can group leaves by their
+    /// originating conjunct without re-parsing the AST.
     /// </summary>
-    private readonly record struct MultiIndexLeaf(int ColumnIdx, IndexSchema Index, DbValue Value);
+    private readonly record struct MultiIndexLeaf(
+        int ConjunctIdx, int ColumnIdx, IndexSchema Index, DbValue Value);
 
     /// <summary>
     /// Dry-run pass that walks <paramref name="expr"/> as if building an IPkStream tree.
     /// Returns true if the entire subtree is consumable (every leaf is a
     /// <c>col = literal</c> on a single-column secondary index, every internal node is an
-    /// AND or OR). Appends the discovered leaves to <paramref name="leaves"/> for use by
-    /// the composite-preference guard. PK column references inside the subtree cause it
+    /// AND or OR). Appends the discovered leaves to <paramref name="leaves"/> tagged with
+    /// <paramref name="conjunctIdx"/> so the structural guards can group them by
+    /// originating top-level conjunct. PK column references inside the subtree cause it
     /// to bail (TODO: lift this restriction by introducing a PkSeekPkStream leaf).
     /// </summary>
     private bool DryRunPkStream(
@@ -1685,7 +1701,8 @@ public sealed class QueryPlanner
         TableSchema table,
         Projection projection,
         List<IndexSchema> indexes,
-        List<MultiIndexLeaf> leaves)
+        List<MultiIndexLeaf> leaves,
+        int conjunctIdx)
     {
         if (expr is BinaryExpr { Op: BinaryOp.And } binAnd)
         {
@@ -1694,7 +1711,7 @@ public sealed class QueryPlanner
             int before = leaves.Count;
             foreach (var child in children)
             {
-                if (!DryRunPkStream(child, table, projection, indexes, leaves))
+                if (!DryRunPkStream(child, table, projection, indexes, leaves, conjunctIdx))
                 {
                     if (leaves.Count > before)
                         leaves.RemoveRange(before, leaves.Count - before);
@@ -1711,7 +1728,7 @@ public sealed class QueryPlanner
             int before = leaves.Count;
             foreach (var child in children)
             {
-                if (!DryRunPkStream(child, table, projection, indexes, leaves))
+                if (!DryRunPkStream(child, table, projection, indexes, leaves, conjunctIdx))
                 {
                     if (leaves.Count > before)
                         leaves.RemoveRange(before, leaves.Count - before);
@@ -1738,7 +1755,7 @@ public sealed class QueryPlanner
                     {
                         value = DbValue.Integer(ticks);
                     }
-                    leaves.Add(new MultiIndexLeaf(colIdx, indexes[ii], value));
+                    leaves.Add(new MultiIndexLeaf(conjunctIdx, colIdx, indexes[ii], value));
                     return true;
                 }
             }
@@ -1766,7 +1783,7 @@ public sealed class QueryPlanner
                             iv = DbValue.Integer(ticks);
                             inValues[v] = iv;
                         }
-                        leaves.Add(new MultiIndexLeaf(inColIdx, indexes[ii], iv));
+                        leaves.Add(new MultiIndexLeaf(conjunctIdx, inColIdx, indexes[ii], iv));
                     }
                     return true;
                 }
@@ -1873,6 +1890,67 @@ public sealed class QueryPlanner
             new[] { match.ResolvedColumnTypes![0] });
 
         return new IndexLeafPkStream(tx.CreateCursor(), match, seekPrefix, expr);
+    }
+
+    /// <summary>
+    /// Same-column-OR-vs-selective-conjunct guard (Option C). Returns true when we
+    /// should defer to <see cref="TryBuildIndexScan"/> instead of building the recursive
+    /// multi-index plan, because the single-leaf side is a strictly better driver and
+    /// the recursive plan would walk far more index entries than necessary.
+    /// <para>
+    /// Fires only on this exact structural shape: exactly two consumable conjuncts,
+    /// one producing N≥2 leaves all on the same column (a same-column OR or an
+    /// IN-list), the other producing exactly one leaf on a different column. The fix
+    /// is provably safe because the deferral target — single-index seek on the
+    /// selective conjunct + residual filter on the same-column-OR conjunct — is the
+    /// plan the pre-recursive code already picked when it bailed out.
+    /// </para>
+    /// <para>
+    /// Does NOT fire when both sides are single equalities (the recursive intersection
+    /// is correct), when both sides are same-column ORs (no obviously better driver),
+    /// or when there are 3+ consumable conjuncts (deferral target unclear).
+    /// </para>
+    /// </summary>
+    private static bool ShouldDeferToSelectiveSingleIndex(
+        List<int> consumableConjuncts, List<MultiIndexLeaf> leaves)
+    {
+        if (consumableConjuncts.Count != 2) return false;
+
+        int firstCi = consumableConjuncts[0];
+        int secondCi = consumableConjuncts[1];
+
+        // Group leaves by their originating top-level conjunct. Track per-conjunct
+        // count, the column of the first leaf, and whether all leaves share that column.
+        int firstCount = 0, secondCount = 0;
+        int firstColumn = -1, secondColumn = -1;
+        bool firstAllSameColumn = true, secondAllSameColumn = true;
+
+        for (int li = 0; li < leaves.Count; li++)
+        {
+            var leaf = leaves[li];
+            if (leaf.ConjunctIdx == firstCi)
+            {
+                if (firstCount == 0) firstColumn = leaf.ColumnIdx;
+                else if (leaf.ColumnIdx != firstColumn) firstAllSameColumn = false;
+                firstCount++;
+            }
+            else if (leaf.ConjunctIdx == secondCi)
+            {
+                if (secondCount == 0) secondColumn = leaf.ColumnIdx;
+                else if (leaf.ColumnIdx != secondColumn) secondAllSameColumn = false;
+                secondCount++;
+            }
+        }
+
+        if (firstColumn == secondColumn) return false;
+
+        bool firstIsSameColOr = firstCount >= 2 && firstAllSameColumn;
+        bool secondIsSingleLeaf = secondCount == 1;
+        bool secondIsSameColOr = secondCount >= 2 && secondAllSameColumn;
+        bool firstIsSingleLeaf = firstCount == 1;
+
+        return (firstIsSameColOr && secondIsSingleLeaf)
+            || (secondIsSameColOr && firstIsSingleLeaf);
     }
 
     /// <summary>

@@ -1360,8 +1360,39 @@ public class OrderByEliminationTests : TempDirTest
     }
 
     [Fact]
-    public async Task InList_OnIndexedColumn_ExplainShowsUnionOfLeaves()
+    public async Task InList_AloneOnIndexedColumn_ExplainShowsMultiIndexUnion()
     {
+        // Bare same-column IN-list (no companion conjunct) — the deferral guard
+        // does NOT fire (it requires exactly one selective single-leaf companion),
+        // so we get the recursive Union-of-leaves plan.
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE a IN (1, 3)";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+
+        // Expected plan:
+        //   MULTI-INDEX SCAN ON t (...)
+        //     └ INDEX UNION
+        //         ├ INDEX SEEK idx_a ("a" IN (1, 3))
+        //         └ INDEX SEEK idx_a ("a" IN (1, 3))
+        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
+        Assert.Contains(rows, r => r == "INDEX UNION");
+        Assert.Equal(2, rows.Count(r => r.StartsWith("INDEX SEEK idx_a")));
+    }
+
+    [Fact]
+    public async Task InList_WithSelectiveCompanion_DefersToSingleIndexScan()
+    {
+        // Regression-fix shape (Option C deferral guard): same-column IN-list AND
+        // a single-leaf equality on a different column. The single-leaf side is
+        // the better driver — TryBuildMultiIndexScan must defer to TryBuildIndexScan,
+        // which uses idx_b for the seek and applies `a IN (1, 3)` as a residual filter.
+        // This is provably the plan the pre-recursive code already picked.
         await using var conn = await OpenConnectionAsync();
         await SetupNestedTable(conn);
         await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 0, 0)");
@@ -1373,17 +1404,31 @@ public class OrderByEliminationTests : TempDirTest
         while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
 
         // Expected plan:
-        //   MULTI-INDEX SCAN ON t (...)
-        //     └ INDEX INTERSECTION
-        //         ├ INDEX UNION                 ← from a IN (1, 3)
-        //         │   ├ INDEX SEEK idx_a ("a" IN (1, 3))
-        //         │   └ INDEX SEEK idx_a ("a" IN (1, 3))
-        //         └ INDEX SEEK idx_b ("b" = 2)
-        Assert.Contains(rows, r => r.StartsWith("MULTI-INDEX SCAN ON t"));
-        Assert.Contains(rows, r => r == "INDEX INTERSECTION");
-        Assert.Contains(rows, r => r == "INDEX UNION");
-        Assert.Equal(2, rows.Count(r => r.StartsWith("INDEX SEEK idx_a")));
-        Assert.Contains(rows, r => r.StartsWith("INDEX SEEK idx_b"));
+        //   FILTER "a" IN (1, 3)
+        //     └ INDEX SCAN idx_b ON t
+        Assert.DoesNotContain(rows, r => r.StartsWith("MULTI-INDEX SCAN"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SCAN idx_b"));
+        Assert.Contains(rows, r => r.StartsWith("FILTER") && r.Contains("IN"));
+    }
+
+    [Fact]
+    public async Task SameColOr_WithSelectiveCompanion_DefersToSingleIndexScan()
+    {
+        // Same shape as above but written as a hand-written same-column OR.
+        // Should produce the same plan: idx_b seek + residual `a=1 OR a=3` filter.
+        await using var conn = await OpenConnectionAsync();
+        await SetupNestedTable(conn);
+        await Exec(conn, "INSERT INTO t VALUES (1, 1, 2, 0, 0)");
+
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN SELECT * FROM t WHERE (a = 1 OR a = 3) AND b = 2";
+        var rows = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(2));
+
+        Assert.DoesNotContain(rows, r => r.StartsWith("MULTI-INDEX SCAN"));
+        Assert.Contains(rows, r => r.StartsWith("INDEX SCAN idx_b"));
+        Assert.Contains(rows, r => r.StartsWith("FILTER"));
     }
 
     [Fact]
