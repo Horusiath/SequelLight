@@ -39,6 +39,9 @@ public sealed class QueryPlanner
     private readonly DatabaseSchema _schema;
     private readonly IReadOnlyDictionary<string, DbValue>? _parameters;
     private DbValue[]? _parameterValues;
+    private readonly Stack<Dictionary<string, CteBinding>> _cteScopes = new();
+
+    private readonly record struct CteBinding(LogicalPlan Inner, OrderingTerm[]? OrderBy, string[]? ColumnNames);
 
     public QueryPlanner(DatabaseSchema schema, IReadOnlyDictionary<string, DbValue>? parameters = null)
     {
@@ -86,35 +89,17 @@ public sealed class QueryPlanner
     /// </summary>
     internal CompiledQuery? Compile(SelectStmt stmt)
     {
-        LogicalPlan logical;
+        // Top-level VALUES is not compilable — caller handles it directly.
+        if (stmt.Compounds.Length == 0 && stmt.First is not SelectCore)
+            return null;
 
-        if (stmt.Compounds.Length > 0)
-        {
-            logical = BuildCompoundPlan(stmt);
-        }
-        else
-        {
-            if (stmt.First is not SelectCore core)
-                return null;
-            logical = BuildLogicalPlan(core);
-        }
-
-        // Wrap with LimitPlan if LIMIT/OFFSET are present
-        if (stmt.Limit is not null || stmt.Offset is not null)
-        {
-            var limitExpr = stmt.Limit ?? new ResolvedLiteralExpr(DbValue.Integer(long.MaxValue));
-            var offsetExpr = stmt.Offset ?? new ResolvedLiteralExpr(DbValue.Integer(0));
-            logical = new LimitPlan(limitExpr, offsetExpr, logical);
-        }
-
-        logical = HeuristicOptimizer.Optimize(logical);
+        var (logical, orderBy) = BuildSelectStmtPlan(stmt);
 
         // Resolve BindParameterExpr → ResolvedParameterExpr, collecting the name→ordinal mapping
         var paramMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         logical = ResolveParameterOrdinals(logical, paramMap);
 
         // Also resolve parameters in ORDER BY expressions
-        var orderBy = stmt.OrderBy;
         if (orderBy is { Length: > 0 })
         {
             var resolved = new OrderingTerm[orderBy.Length];
@@ -129,6 +114,86 @@ public sealed class QueryPlanner
             names[kvp.Value] = kvp.Key;
 
         return new CompiledQuery(logical, orderBy, names);
+    }
+
+    /// <summary>
+    /// Builds an optimized logical plan for a <see cref="SelectStmt"/>, honoring its WITH clause
+    /// by pushing CTE bindings onto <see cref="_cteScopes"/> for the duration of the body build.
+    /// Returns the plan and the (un-resolved) ORDER BY terms; parameter resolution is the caller's job.
+    /// </summary>
+    private (LogicalPlan plan, OrderingTerm[]? orderBy) BuildSelectStmtPlan(SelectStmt stmt)
+    {
+        LogicalPlan body;
+        if (stmt.With is not null)
+        {
+            PushCteScope(stmt.With);
+            try { body = BuildBodyWithLimit(stmt); }
+            finally { _cteScopes.Pop(); }
+        }
+        else
+        {
+            body = BuildBodyWithLimit(stmt);
+        }
+
+        body = HeuristicOptimizer.Optimize(body);
+        return (body, stmt.OrderBy);
+    }
+
+    private LogicalPlan BuildBodyWithLimit(SelectStmt stmt)
+    {
+        LogicalPlan logical;
+        if (stmt.Compounds.Length > 0)
+        {
+            logical = BuildCompoundPlan(stmt);
+        }
+        else
+        {
+            if (stmt.First is not SelectCore core)
+                throw new NotSupportedException("VALUES is not supported in this context.");
+            logical = BuildLogicalPlan(core);
+        }
+
+        if (stmt.Limit is not null || stmt.Offset is not null)
+        {
+            var limitExpr = stmt.Limit ?? new ResolvedLiteralExpr(DbValue.Integer(long.MaxValue));
+            var offsetExpr = stmt.Offset ?? new ResolvedLiteralExpr(DbValue.Integer(0));
+            logical = new LimitPlan(limitExpr, offsetExpr, logical);
+        }
+        return logical;
+    }
+
+    /// <summary>
+    /// Pushes a CTE scope on entry to a SELECT with a WITH clause. Each CTE's body is built
+    /// in declaration order so later siblings can reference earlier ones; a CTE is not visible
+    /// inside its own body (non-recursive CTE — RECURSIVE is rejected).
+    /// </summary>
+    private void PushCteScope(WithClause with)
+    {
+        if (with.Recursive)
+            throw new NotSupportedException("Recursive CTEs are not supported.");
+
+        var scope = new Dictionary<string, CteBinding>(StringComparer.OrdinalIgnoreCase);
+        _cteScopes.Push(scope);
+
+        foreach (var cte in with.Tables)
+        {
+            // The MATERIALIZED hint is parsed but ignored — we always inline.
+            var (inner, orderBy) = BuildSelectStmtPlan(cte.Query);
+            if (!scope.TryAdd(cte.Name, new CteBinding(inner, orderBy, cte.ColumnNames)))
+                throw new InvalidOperationException($"Duplicate CTE name '{cte.Name}'.");
+        }
+    }
+
+    private bool TryGetCte(string name, out CteBinding binding)
+    {
+        // Stack<T> iterates from top to bottom — innermost scope wins.
+        foreach (var scope in _cteScopes)
+        {
+            if (scope.TryGetValue(name, out binding))
+                return true;
+        }
+        binding = default;
+        return false;
     }
 
     /// <summary>
@@ -327,7 +392,7 @@ public sealed class QueryPlanner
                     if (resolved is not null) orderBy = resolved;
                 }
                 return ReferenceEquals(inner, sub.Inner) && ReferenceEquals(orderBy, sub.OrderBy)
-                    ? plan : new SubqueryPlan(inner, orderBy, sub.Alias);
+                    ? plan : new SubqueryPlan(inner, orderBy, sub.Alias, sub.ColumnNames);
             }
             default:
                 return plan; // ScanPlan, DualPlan — no expressions
@@ -640,8 +705,16 @@ public sealed class QueryPlanner
         };
     }
 
-    private ScanPlan BuildTableRefPlan(TableRef tableRef)
+    private LogicalPlan BuildTableRefPlan(TableRef tableRef)
     {
+        // CTE references take precedence over the catalog (lexical scope), but only for
+        // unqualified names — `schema.name` skips the CTE lookup entirely.
+        if (tableRef.Schema is null && TryGetCte(tableRef.Table, out var cte))
+        {
+            var cteAlias = tableRef.Alias ?? tableRef.Table;
+            return new SubqueryPlan(cte.Inner, cte.OrderBy, cteAlias, cte.ColumnNames);
+        }
+
         var table = _schema.GetTable(tableRef.Table)
             ?? throw new InvalidOperationException($"Table '{tableRef.Table}' does not exist.");
         var alias = tableRef.Alias ?? tableRef.Table;
@@ -653,29 +726,8 @@ public sealed class QueryPlanner
         if (string.IsNullOrEmpty(sub.Alias))
             throw new InvalidOperationException("Every subquery in FROM must have an alias.");
 
-        var stmt = sub.Query;
-        LogicalPlan inner;
-
-        if (stmt.Compounds.Length > 0)
-        {
-            inner = BuildCompoundPlan(stmt);
-        }
-        else
-        {
-            if (stmt.First is not SelectCore core)
-                throw new NotSupportedException("VALUES is not supported as a subquery in FROM.");
-            inner = BuildLogicalPlan(core);
-        }
-
-        if (stmt.Limit is not null || stmt.Offset is not null)
-        {
-            var limitExpr = stmt.Limit ?? new ResolvedLiteralExpr(DbValue.Integer(long.MaxValue));
-            var offsetExpr = stmt.Offset ?? new ResolvedLiteralExpr(DbValue.Integer(0));
-            inner = new LimitPlan(limitExpr, offsetExpr, inner);
-        }
-
-        inner = HeuristicOptimizer.Optimize(inner);
-        return new SubqueryPlan(inner, stmt.OrderBy, sub.Alias);
+        var (inner, orderBy) = BuildSelectStmtPlan(sub.Query);
+        return new SubqueryPlan(inner, orderBy, sub.Alias);
     }
 
     private IDbEnumerator BuildPhysical(LogicalPlan plan, ReadOnlyTransaction tx)
@@ -750,8 +802,25 @@ public sealed class QueryPlanner
     private IDbEnumerator BuildSubqueryPhysical(SubqueryPlan plan, ReadOnlyTransaction tx)
     {
         var inner = BuildFromCompiled(plan.Inner, plan.OrderBy, tx);
-        var selectors = QualifyProjection(inner.Projection, plan.Alias);
+        var selectors = QualifyAndRenameProjection(inner.Projection, plan.Alias, plan.ColumnNames);
         return WrapWithQualifiedProjection(inner, selectors);
+    }
+
+    private static Selector[] QualifyAndRenameProjection(Projection source, string alias, string[]? columnNames)
+    {
+        if (columnNames is { Length: > 0 } && columnNames.Length != source.ColumnCount)
+            throw new InvalidOperationException(
+                $"Column list has {columnNames.Length} entries but the underlying SELECT produces {source.ColumnCount} columns.");
+
+        var selectors = new Selector[source.ColumnCount];
+        for (int i = 0; i < source.ColumnCount; i++)
+        {
+            var colName = columnNames is { Length: > 0 }
+                ? columnNames[i]
+                : source.GetQualifiedName(i).Column;
+            selectors[i] = Selector.ColumnIdentifier(new QualifiedName(alias, colName), i);
+        }
+        return selectors;
     }
 
     private IDbEnumerator BuildGroupBy(GroupByPlan plan, ReadOnlyTransaction tx)

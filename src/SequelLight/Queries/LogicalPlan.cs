@@ -121,17 +121,21 @@ public sealed class LimitPlan : LogicalPlan
 /// At physical build the inner plan executes through the same pipeline used for top-level
 /// queries (so ORDER BY/LIMIT honored), then its output projection is qualified with
 /// <see cref="Alias"/> to make <c>alias.col</c> references resolvable in the parent.
+/// When <see cref="ColumnNames"/> is non-null, output columns are renamed in declaration
+/// order — used by CTEs declared as <c>WITH cte(c1, c2) AS (...)</c>.
 /// </summary>
 public sealed class SubqueryPlan : LogicalPlan
 {
     public LogicalPlan Inner { get; }
     public OrderingTerm[]? OrderBy { get; }
     public string Alias { get; }
+    public string[]? ColumnNames { get; }
 
-    public SubqueryPlan(LogicalPlan inner, OrderingTerm[]? orderBy, string alias)
+    public SubqueryPlan(LogicalPlan inner, OrderingTerm[]? orderBy, string alias, string[]? columnNames = null)
     {
         Inner = inner;
         OrderBy = orderBy;
         Alias = alias;
+        ColumnNames = columnNames;
     }
 }
