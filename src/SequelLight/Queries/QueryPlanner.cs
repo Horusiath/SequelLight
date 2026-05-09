@@ -384,6 +384,12 @@ public sealed class QueryPlanner
             BinaryExpr b => b with { Left = ResolveBindParametersFromDict(b.Left), Right = ResolveBindParametersFromDict(b.Right) },
             UnaryExpr u => u with { Operand = ResolveBindParametersFromDict(u.Operand) },
             CastExpr c => c with { Operand = ResolveBindParametersFromDict(c.Operand) },
+            LikeExpr l => l with
+            {
+                Operand = ResolveBindParametersFromDict(l.Operand),
+                Pattern = ResolveBindParametersFromDict(l.Pattern),
+                Escape = l.Escape is not null ? ResolveBindParametersFromDict(l.Escape) : null,
+            },
             FunctionCallExpr func => ResolveBindParamsInFunction(func),
             _ => expr,
         };
@@ -564,6 +570,12 @@ public sealed class QueryPlanner
                 High = ResolveParamExpr(bt.High, paramMap)!,
             },
             InExpr inExpr => ResolveParamExprInIn(inExpr, paramMap),
+            LikeExpr l => l with
+            {
+                Operand = ResolveParamExpr(l.Operand, paramMap)!,
+                Pattern = ResolveParamExpr(l.Pattern, paramMap)!,
+                Escape = ResolveParamExpr(l.Escape, paramMap),
+            },
             CastExpr c => c with { Operand = ResolveParamExpr(c.Operand, paramMap)! },
             FunctionCallExpr func => ResolveParamExprInFunction(func, paramMap),
             _ => expr,
@@ -824,6 +836,8 @@ public sealed class QueryPlanner
                 || (inExpr.Target is InExprList inList && inList.Expressions.Any(ContainsAggregateExpr)),
             IsExpr i => ContainsAggregateExpr(i.Left) || ContainsAggregateExpr(i.Right),
             NullTestExpr n => ContainsAggregateExpr(n.Operand),
+            LikeExpr l => ContainsAggregateExpr(l.Operand) || ContainsAggregateExpr(l.Pattern)
+                || (l.Escape is not null && ContainsAggregateExpr(l.Escape)),
             _ => false,
         };
     }
@@ -2947,6 +2961,11 @@ public sealed class QueryPlanner
                 return CollectColumnNames(nullTest.Operand, names);
             case CastExpr cast:
                 return CollectColumnNames(cast.Operand, names);
+            case LikeExpr likeExpr:
+                if (!CollectColumnNames(likeExpr.Operand, names)) return false;
+                if (!CollectColumnNames(likeExpr.Pattern, names)) return false;
+                if (likeExpr.Escape is not null && !CollectColumnNames(likeExpr.Escape, names)) return false;
+                return true;
             case LiteralExpr or ResolvedLiteralExpr:
                 return true;
             default:
@@ -3323,6 +3342,12 @@ public sealed class QueryPlanner
                 High = ResolveColumns(between.High, projection),
             },
             InExpr inExpr => ResolveInColumns(inExpr, projection),
+            LikeExpr likeExpr => likeExpr with
+            {
+                Operand = ResolveColumns(likeExpr.Operand, projection),
+                Pattern = ResolveColumns(likeExpr.Pattern, projection),
+                Escape = likeExpr.Escape is not null ? ResolveColumns(likeExpr.Escape, projection) : null,
+            },
             CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
             FunctionCallExpr func => ResolveFunctionColumns(func, projection),
             _ => expr,
@@ -3420,6 +3445,25 @@ public sealed class QueryPlanner
             }
             case InExpr inExpr:
                 return ResolveInAsync(inExpr, projection, tx);
+            case LikeExpr likeExpr:
+            {
+                var opTask = ResolveColumnsAsync(likeExpr.Operand, projection, tx);
+                var patTask = ResolveColumnsAsync(likeExpr.Pattern, projection, tx);
+                var escTask = likeExpr.Escape is not null
+                    ? ResolveColumnsAsync(likeExpr.Escape, projection, tx)
+                    : new ValueTask<SqlExpr>((SqlExpr?)null!);
+                if (opTask.IsCompletedSuccessfully && patTask.IsCompletedSuccessfully
+                    && (likeExpr.Escape is null || escTask.IsCompletedSuccessfully))
+                {
+                    return new ValueTask<SqlExpr>(likeExpr with
+                    {
+                        Operand = opTask.Result,
+                        Pattern = patTask.Result,
+                        Escape = likeExpr.Escape is not null ? escTask.Result : null,
+                    });
+                }
+                return ResolveLikeAsync(likeExpr, opTask, patTask, escTask);
+            }
             case CastExpr cast:
             {
                 var opTask = ResolveColumnsAsync(cast.Operand, projection, tx);
@@ -3463,6 +3507,17 @@ public sealed class QueryPlanner
         var lo = loTask.IsCompletedSuccessfully ? loTask.Result : await loTask.ConfigureAwait(false);
         var hi = hiTask.IsCompletedSuccessfully ? hiTask.Result : await hiTask.ConfigureAwait(false);
         return between with { Operand = val, Low = lo, High = hi };
+    }
+
+    private static async ValueTask<SqlExpr> ResolveLikeAsync(
+        LikeExpr likeExpr, ValueTask<SqlExpr> opTask, ValueTask<SqlExpr> patTask, ValueTask<SqlExpr> escTask)
+    {
+        var operand = opTask.IsCompletedSuccessfully ? opTask.Result : await opTask.ConfigureAwait(false);
+        var pattern = patTask.IsCompletedSuccessfully ? patTask.Result : await patTask.ConfigureAwait(false);
+        SqlExpr? escape = null;
+        if (likeExpr.Escape is not null)
+            escape = escTask.IsCompletedSuccessfully ? escTask.Result : await escTask.ConfigureAwait(false);
+        return likeExpr with { Operand = operand, Pattern = pattern, Escape = escape };
     }
 
     private async ValueTask<SqlExpr> ResolveInAsync(InExpr inExpr, Projection projection, ReadOnlyTransaction tx)

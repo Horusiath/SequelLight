@@ -50,6 +50,7 @@ public static class FunctionRegistry
             ["format"] = new(ScalarFunctions.Printf, 1, int.MaxValue, true),
             ["like"] = new(ScalarFunctions.Like, 2, 2, true),
             ["glob"] = new(ScalarFunctions.Glob, 2, 2, true),
+            ["regexp"] = new(ScalarFunctions.Regexp, 2, 2, true),
             // Date/time functions
             ["date"] = new(DateFunctions.Date, 1, 1, true),
             ["time"] = new(DateFunctions.Time, 1, 1, true),

@@ -264,6 +264,26 @@ public static class HeuristicOptimizer
                 return ReferenceEquals(operand, cast.Operand) ? expr : new CastExpr(operand, cast.Type);
             }
 
+            case LikeExpr likeExpr:
+            {
+                var operand = FoldConstants(likeExpr.Operand);
+                var pattern = FoldConstants(likeExpr.Pattern);
+                var escape = likeExpr.Escape is not null ? FoldConstants(likeExpr.Escape) : null;
+
+                if (operand is ResolvedLiteralExpr && pattern is ResolvedLiteralExpr
+                    && (escape is null || escape is ResolvedLiteralExpr))
+                {
+                    var folded = TryEvaluate(new LikeExpr(operand, likeExpr.Op, likeExpr.Negated, pattern, escape));
+                    if (folded is not null) return folded;
+                }
+
+                return ReferenceEquals(operand, likeExpr.Operand)
+                       && ReferenceEquals(pattern, likeExpr.Pattern)
+                       && ReferenceEquals(escape, likeExpr.Escape)
+                    ? expr
+                    : likeExpr with { Operand = operand, Pattern = pattern, Escape = escape };
+            }
+
             case FunctionCallExpr func:
             {
                 var args = new SqlExpr[func.Arguments.Length];
@@ -598,6 +618,12 @@ public static class HeuristicOptimizer
                 if (func.FilterWhere is not null)
                     CollectColumnRefsRecursive(func.FilterWhere, result);
                 break;
+            case LikeExpr likeExpr:
+                CollectColumnRefsRecursive(likeExpr.Operand, result);
+                CollectColumnRefsRecursive(likeExpr.Pattern, result);
+                if (likeExpr.Escape is not null)
+                    CollectColumnRefsRecursive(likeExpr.Escape, result);
+                break;
         }
     }
 
@@ -792,6 +818,12 @@ public static class HeuristicOptimizer
                 break;
             case CastExpr cast:
                 CollectExprColumnNames(cast.Operand, result);
+                break;
+            case LikeExpr likeExpr:
+                CollectExprColumnNames(likeExpr.Operand, result);
+                CollectExprColumnNames(likeExpr.Pattern, result);
+                if (likeExpr.Escape is not null)
+                    CollectExprColumnNames(likeExpr.Escape, result);
                 break;
         }
     }

@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using SequelLight.Data;
 using SequelLight.Queries;
 
@@ -277,23 +279,40 @@ internal static class ScalarFunctions
 
     // ---- Pattern matching helpers ----
 
-    internal static bool LikeMatch(string pattern, string str)
+    internal static bool LikeMatch(string pattern, string str, char? escape = null)
     {
-        // Case-insensitive, % = any sequence, _ = any single char
-        return LikeMatchRecursive(pattern, 0, str.ToUpperInvariant(), 0, pattern.ToUpperInvariant());
+        // Case-insensitive (ASCII), % = any sequence, _ = any single char.
+        // ESCAPE: when escape char is followed by %, _, or itself, the next char matches literally.
+        var foldedPattern = pattern.ToUpperInvariant();
+        var foldedStr = str.ToUpperInvariant();
+        char? foldedEscape = escape.HasValue ? char.ToUpperInvariant(escape.Value) : null;
+        return LikeMatchRecursive(foldedPattern, 0, foldedStr, 0, foldedEscape);
     }
 
-    private static bool LikeMatchRecursive(string origPattern, int pi, string str, int si, string pattern)
+    private static bool LikeMatchRecursive(string pattern, int pi, string str, int si, char? escape)
     {
         while (pi < pattern.Length)
         {
             char pc = pattern[pi];
+
+            // ESCAPE: next char is taken literally
+            if (escape.HasValue && pc == escape.Value)
+            {
+                pi++;
+                if (pi >= pattern.Length)
+                    throw new InvalidOperationException("LIKE pattern: ESCAPE character at end of pattern.");
+                if (si >= str.Length) return false;
+                if (pattern[pi] != str[si]) return false;
+                pi++; si++;
+                continue;
+            }
+
             if (pc == '%')
             {
                 pi++;
                 if (pi >= pattern.Length) return true;
                 for (int k = si; k <= str.Length; k++)
-                    if (LikeMatchRecursive(origPattern, pi, str, k, pattern)) return true;
+                    if (LikeMatchRecursive(pattern, pi, str, k, escape)) return true;
                 return false;
             }
             if (si >= str.Length) return false;
@@ -302,6 +321,40 @@ internal static class ScalarFunctions
             pi++; si++;
         }
         return si >= str.Length;
+    }
+
+    // ---- REGEXP ----
+
+    // Compiled patterns are cached per-process. Bounded by RegexCacheCap; exceeding the cap
+    // clears the dictionary (simple eviction — pattern variety in queries is typically tiny).
+    private const int RegexCacheCap = 256;
+    private static readonly ConcurrentDictionary<string, Regex> RegexCache = new();
+
+    internal static bool RegexMatch(string pattern, string str)
+    {
+        if (!RegexCache.TryGetValue(pattern, out var regex))
+        {
+            if (RegexCache.Count >= RegexCacheCap)
+                RegexCache.Clear();
+            try
+            {
+                regex = new Regex(pattern, RegexOptions.Compiled);
+            }
+            catch (ArgumentException ex)
+            {
+                throw new InvalidOperationException($"Invalid REGEXP pattern '{pattern}': {ex.Message}", ex);
+            }
+            RegexCache.TryAdd(pattern, regex);
+        }
+        return regex.IsMatch(str);
+    }
+
+    public static DbValue Regexp(ReadOnlySpan<DbValue> args)
+    {
+        if (args[0].IsNull || args[1].IsNull) return DbValue.Null;
+        var pattern = Encoding.UTF8.GetString(args[0].AsText().Span);
+        var str = Encoding.UTF8.GetString(args[1].AsText().Span);
+        return DbValue.Integer(RegexMatch(pattern, str) ? 1 : 0);
     }
 
     internal static bool GlobMatch(string pattern, string str)

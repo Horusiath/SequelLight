@@ -47,6 +47,9 @@ public static class ExprEvaluator
             case InExpr inExpr:
                 return EvaluateIn(inExpr, row, projection);
 
+            case LikeExpr likeExpr:
+                return EvaluateLike(likeExpr, row, projection);
+
             case CastExpr cast:
                 return EvaluateCast(cast, row, projection);
 
@@ -481,6 +484,90 @@ public static class ExprEvaluator
 
         if (sawNull) return DbValue.Null;
         return DbValue.Integer(negated ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Evaluates <c>operand [NOT] LIKE/GLOB/REGEXP pattern [ESCAPE esc]</c>.
+    /// NULL propagation: any NULL among operand, pattern, or escape → NULL (regardless of NOT).
+    /// LIKE is ASCII-case-insensitive; GLOB and REGEXP are case-sensitive. REGEXP uses .NET's
+    /// <see cref="System.Text.RegularExpressions.Regex"/> dialect. MATCH is reserved for
+    /// virtual-table modules and throws.
+    /// </summary>
+    private static ValueTask<DbValue> EvaluateLike(LikeExpr likeExpr, DbValue[] row, Projection projection)
+    {
+        var operandTask = Evaluate(likeExpr.Operand, row, projection);
+        var patternTask = Evaluate(likeExpr.Pattern, row, projection);
+        var escapeTask = likeExpr.Escape is not null
+            ? Evaluate(likeExpr.Escape, row, projection)
+            : new ValueTask<DbValue>(DbValue.Null);
+
+        if (operandTask.IsCompletedSuccessfully && patternTask.IsCompletedSuccessfully && escapeTask.IsCompletedSuccessfully)
+            return new ValueTask<DbValue>(ApplyLike(
+                operandTask.Result, patternTask.Result, escapeTask.Result,
+                likeExpr.Op, likeExpr.Negated, likeExpr.Escape is not null));
+        return EvaluateLikeSlow(likeExpr, operandTask, patternTask, escapeTask);
+    }
+
+    private static async ValueTask<DbValue> EvaluateLikeSlow(
+        LikeExpr likeExpr, ValueTask<DbValue> operandTask, ValueTask<DbValue> patternTask, ValueTask<DbValue> escapeTask)
+    {
+        var operand = operandTask.IsCompletedSuccessfully ? operandTask.Result : await operandTask.ConfigureAwait(false);
+        var pattern = patternTask.IsCompletedSuccessfully ? patternTask.Result : await patternTask.ConfigureAwait(false);
+        var escape = escapeTask.IsCompletedSuccessfully ? escapeTask.Result : await escapeTask.ConfigureAwait(false);
+        return ApplyLike(operand, pattern, escape, likeExpr.Op, likeExpr.Negated, likeExpr.Escape is not null);
+    }
+
+    private static DbValue ApplyLike(DbValue operand, DbValue pattern, DbValue escape,
+        LikeOp op, bool negated, bool hasEscape)
+    {
+        if (operand.IsNull || pattern.IsNull) return DbValue.Null;
+        if (hasEscape && escape.IsNull) return DbValue.Null;
+
+        if (op == LikeOp.Match)
+            throw new NotSupportedException("MATCH requires a virtual-table module — not supported.");
+
+        var operandStr = ToText(operand);
+        var patternStr = ToText(pattern);
+
+        bool matched;
+        switch (op)
+        {
+            case LikeOp.Like:
+                char? escChar = null;
+                if (hasEscape)
+                {
+                    var escStr = ToText(escape);
+                    if (escStr.Length != 1)
+                        throw new InvalidOperationException(
+                            $"LIKE ESCAPE must be a single character, got {escStr.Length}.");
+                    escChar = escStr[0];
+                }
+                matched = ScalarFunctions.LikeMatch(patternStr, operandStr, escChar);
+                break;
+
+            case LikeOp.Glob:
+                matched = ScalarFunctions.GlobMatch(patternStr, operandStr);
+                break;
+
+            case LikeOp.Regexp:
+                matched = ScalarFunctions.RegexMatch(patternStr, operandStr);
+                break;
+
+            default:
+                throw new NotSupportedException($"LIKE operator '{op}' is not supported.");
+        }
+
+        if (negated) matched = !matched;
+        return DbValue.Integer(matched ? 1 : 0);
+    }
+
+    private static string ToText(DbValue v)
+    {
+        if (v.Type == DbType.Text) return Encoding.UTF8.GetString(v.AsText().Span);
+        if (v.Type.IsInteger()) return v.AsInteger().ToString(CultureInfo.InvariantCulture);
+        if (v.Type == DbType.Float64) return v.AsReal().ToString(CultureInfo.InvariantCulture);
+        if (v.Type == DbType.Bytes) return Encoding.UTF8.GetString(v.AsBlob().Span);
+        return string.Empty;
     }
 
     private static ValueTask<DbValue> EvaluateCast(CastExpr cast, DbValue[] row, Projection projection)
