@@ -41,6 +41,7 @@ public sealed class QueryPlanner
     private readonly int _recursiveCteMaxDepth;
     private DbValue[]? _parameterValues;
     private readonly Stack<Dictionary<string, CteBinding>> _cteScopes = new();
+    private readonly Stack<string> _viewExpansionStack = new();
 
     private abstract record CteBinding;
     private sealed record InlineCteBinding(LogicalPlan Inner, OrderingTerm[]? OrderBy, string[]? ColumnNames) : CteBinding;
@@ -848,10 +849,55 @@ public sealed class QueryPlanner
             };
         }
 
-        var table = _schema.GetTable(tableRef.Table)
-            ?? throw new InvalidOperationException($"Table '{tableRef.Table}' does not exist.");
-        var alias = tableRef.Alias ?? tableRef.Table;
-        return new ScanPlan(table, alias);
+        var table = _schema.GetTable(tableRef.Table);
+        if (table is not null)
+        {
+            var alias = tableRef.Alias ?? tableRef.Table;
+            return new ScanPlan(table, alias);
+        }
+
+        // Fall through to the view catalog.
+        var view = _schema.GetView(tableRef.Table);
+        if (view is not null)
+            return BuildViewExpansionPlan(view, tableRef.Alias);
+
+        throw new InvalidOperationException($"Table '{tableRef.Table}' does not exist.");
+    }
+
+    /// <summary>
+    /// Inlines a virtual view as an aliased subquery. Views may reference other views; the
+    /// expansion stack is used for cycle detection — if the same view name is already in
+    /// flight (directly or transitively), we throw rather than infinite-loop.
+    /// </summary>
+    private SubqueryPlan BuildViewExpansionPlan(ViewSchema view, string? referenceAlias)
+    {
+        foreach (var inFlight in _viewExpansionStack)
+        {
+            if (string.Equals(inFlight, view.Name, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"Cyclic view definition: '{view.Name}' is referenced (directly or transitively) inside its own expansion.");
+        }
+
+        // Views are lexically isolated from the caller's WITH clauses per SQL semantics —
+        // a view body must not resolve names against outer-query CTEs. Save the current CTE
+        // scope stack, clear it for the body build, then restore.
+        var savedScopes = _cteScopes.ToArray(); // top-to-bottom
+        _cteScopes.Clear();
+
+        _viewExpansionStack.Push(view.Name);
+        try
+        {
+            var (inner, orderBy) = BuildSelectStmtPlan(view.Query);
+            var alias = referenceAlias ?? view.Name;
+            return new SubqueryPlan(inner, orderBy, alias, view.Columns);
+        }
+        finally
+        {
+            _viewExpansionStack.Pop();
+            // Restore the original stack — push in reverse so the original top ends up on top.
+            for (int i = savedScopes.Length - 1; i >= 0; i--)
+                _cteScopes.Push(savedScopes[i]);
+        }
     }
 
     private SubqueryPlan BuildSubqueryRefPlan(SubqueryRef sub)

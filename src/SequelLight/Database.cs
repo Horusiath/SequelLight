@@ -276,8 +276,13 @@ public sealed class Database : IAsyncDisposable
 
     private async ValueTask<int> ExecuteInsertAsync(InsertStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
-        var table = Schema.GetTable(stmt.Table)
-            ?? throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
+        var table = Schema.GetTable(stmt.Table);
+        if (table is null)
+        {
+            if (Schema.GetView(stmt.Table) is not null)
+                throw new InvalidOperationException($"'{stmt.Table}' is a view; views cannot be the target of INSERT.");
+            throw new InvalidOperationException($"Table '{stmt.Table}' does not exist.");
+        }
 
         if (stmt.Source is not SelectInsertSource selectSource)
             throw new NotSupportedException("Only INSERT ... VALUES / INSERT ... SELECT is supported.");
@@ -566,8 +571,13 @@ public sealed class Database : IAsyncDisposable
 
     private async ValueTask<int> ExecuteUpdateAsync(UpdateStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
-        var table = Schema.GetTable(stmt.Table.Table)
-            ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+        var table = Schema.GetTable(stmt.Table.Table);
+        if (table is null)
+        {
+            if (Schema.GetView(stmt.Table.Table) is not null)
+                throw new InvalidOperationException($"'{stmt.Table.Table}' is a view; views cannot be the target of UPDATE.");
+            throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+        }
 
         // Map each setter's column name to its index in the table
         var setColumnIndices = new int[stmt.Setters.Length];
@@ -703,8 +713,13 @@ public sealed class Database : IAsyncDisposable
 
     private async ValueTask<int> ExecuteDeleteAsync(DeleteStmt stmt, IReadOnlyDictionary<string, DbValue>? parameters, ReadOnlyTransaction? transaction, int triggerDepth = 0)
     {
-        var table = Schema.GetTable(stmt.Table.Table)
-            ?? throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+        var table = Schema.GetTable(stmt.Table.Table);
+        if (table is null)
+        {
+            if (Schema.GetView(stmt.Table.Table) is not null)
+                throw new InvalidOperationException($"'{stmt.Table.Table}' is a view; views cannot be the target of DELETE.");
+            throw new InvalidOperationException($"Table '{stmt.Table.Table}' does not exist.");
+        }
 
         var columnNames = new QualifiedName[table.Columns.Length];
         for (int i = 0; i < table.Columns.Length; i++)

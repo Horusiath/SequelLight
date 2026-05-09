@@ -699,9 +699,10 @@ public sealed class IndexSchema : IEquatable<IndexSchema>
 /// </summary>
 public sealed class ViewSchema : IEquatable<ViewSchema>
 {
-    public ViewSchema(Oid oid, string name, bool isTemporary, string[]? columns, SelectStmt query)
+    public ViewSchema(Oid oid, string? schema, string name, bool isTemporary, string[]? columns, SelectStmt query)
     {
         Oid = oid;
+        Schema = schema;
         Name = name;
         IsTemporary = isTemporary;
         Columns = columns;
@@ -709,6 +710,7 @@ public sealed class ViewSchema : IEquatable<ViewSchema>
     }
 
     public Oid Oid { get; }
+    public string? Schema { get; }
     public string Name { get; }
     public bool IsTemporary { get; }
     public string[]? Columns { get; }
@@ -724,6 +726,11 @@ public sealed class ViewSchema : IEquatable<ViewSchema>
         sb.Append("CREATE ");
         if (IsTemporary) sb.Append("TEMP ");
         sb.Append("VIEW ");
+        if (Schema is not null)
+        {
+            SqlWriter.AppendQuotedName(sb, Schema);
+            sb.Append('.');
+        }
         SqlWriter.AppendQuotedName(sb, Name);
         if (Columns is { Length: > 0 })
         {

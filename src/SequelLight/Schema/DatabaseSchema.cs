@@ -299,7 +299,7 @@ public sealed class DatabaseSchema
         }
 
         var oid = AllocateOid();
-        var view = new ViewSchema(oid, stmt.View, stmt.Temporary, stmt.Columns, stmt.Query);
+        var view = new ViewSchema(oid, stmt.Schema, stmt.View, stmt.Temporary, stmt.Columns, stmt.Query);
         _views[oid] = view;
         _viewNames[stmt.View] = oid;
 
