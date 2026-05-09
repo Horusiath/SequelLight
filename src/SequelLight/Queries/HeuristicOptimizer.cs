@@ -475,6 +475,11 @@ public static class HeuristicOptimizer
             case ScanPlan scan:
                 result.Add(scan.Alias);
                 break;
+            case SubqueryPlan sub:
+                // Treat as opaque: register the alias but don't recurse into Inner —
+                // inner aliases aren't visible to outer predicate classification.
+                result.Add(sub.Alias);
+                break;
             case JoinPlan join:
                 CollectTableAliasesRecursive(join.Left, result);
                 CollectTableAliasesRecursive(join.Right, result);

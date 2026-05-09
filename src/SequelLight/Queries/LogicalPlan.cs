@@ -115,3 +115,23 @@ public sealed class LimitPlan : LogicalPlan
         Source = source;
     }
 }
+
+/// <summary>
+/// Wraps an inner SELECT plan so it appears as an aliased relation to the outer query.
+/// At physical build the inner plan executes through the same pipeline used for top-level
+/// queries (so ORDER BY/LIMIT honored), then its output projection is qualified with
+/// <see cref="Alias"/> to make <c>alias.col</c> references resolvable in the parent.
+/// </summary>
+public sealed class SubqueryPlan : LogicalPlan
+{
+    public LogicalPlan Inner { get; }
+    public OrderingTerm[]? OrderBy { get; }
+    public string Alias { get; }
+
+    public SubqueryPlan(LogicalPlan inner, OrderingTerm[]? orderBy, string alias)
+    {
+        Inner = inner;
+        OrderBy = orderBy;
+        Alias = alias;
+    }
+}

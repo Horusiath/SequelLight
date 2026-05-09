@@ -308,6 +308,27 @@ public sealed class QueryPlanner
                 return ReferenceEquals(source, limit.Source) && ReferenceEquals(limitExpr, limit.Limit) && ReferenceEquals(offsetExpr, limit.Offset)
                     ? plan : new LimitPlan(limitExpr, offsetExpr, source);
             }
+            case SubqueryPlan sub:
+            {
+                var inner = ResolveParameterOrdinals(sub.Inner, paramMap);
+                var orderBy = sub.OrderBy;
+                if (orderBy is { Length: > 0 })
+                {
+                    OrderingTerm[]? resolved = null;
+                    for (int i = 0; i < orderBy.Length; i++)
+                    {
+                        var newExpr = ResolveParamExpr(orderBy[i].Expression, paramMap)!;
+                        if (!ReferenceEquals(newExpr, orderBy[i].Expression))
+                        {
+                            resolved ??= (OrderingTerm[])orderBy.Clone();
+                            resolved[i] = orderBy[i] with { Expression = newExpr };
+                        }
+                    }
+                    if (resolved is not null) orderBy = resolved;
+                }
+                return ReferenceEquals(inner, sub.Inner) && ReferenceEquals(orderBy, sub.OrderBy)
+                    ? plan : new SubqueryPlan(inner, orderBy, sub.Alias);
+            }
             default:
                 return plan; // ScanPlan, DualPlan — no expressions
         }
@@ -613,6 +634,7 @@ public sealed class QueryPlanner
         return tos switch
         {
             TableRef tableRef => BuildTableRefPlan(tableRef),
+            SubqueryRef sub => BuildSubqueryRefPlan(sub),
             ParenJoinRef paren => BuildFromPlan(paren.Join),
             _ => throw new NotSupportedException($"Table source '{tos.GetType().Name}' is not supported.")
         };
@@ -624,6 +646,36 @@ public sealed class QueryPlanner
             ?? throw new InvalidOperationException($"Table '{tableRef.Table}' does not exist.");
         var alias = tableRef.Alias ?? tableRef.Table;
         return new ScanPlan(table, alias);
+    }
+
+    private SubqueryPlan BuildSubqueryRefPlan(SubqueryRef sub)
+    {
+        if (string.IsNullOrEmpty(sub.Alias))
+            throw new InvalidOperationException("Every subquery in FROM must have an alias.");
+
+        var stmt = sub.Query;
+        LogicalPlan inner;
+
+        if (stmt.Compounds.Length > 0)
+        {
+            inner = BuildCompoundPlan(stmt);
+        }
+        else
+        {
+            if (stmt.First is not SelectCore core)
+                throw new NotSupportedException("VALUES is not supported as a subquery in FROM.");
+            inner = BuildLogicalPlan(core);
+        }
+
+        if (stmt.Limit is not null || stmt.Offset is not null)
+        {
+            var limitExpr = stmt.Limit ?? new ResolvedLiteralExpr(DbValue.Integer(long.MaxValue));
+            var offsetExpr = stmt.Offset ?? new ResolvedLiteralExpr(DbValue.Integer(0));
+            inner = new LimitPlan(limitExpr, offsetExpr, inner);
+        }
+
+        inner = HeuristicOptimizer.Optimize(inner);
+        return new SubqueryPlan(inner, stmt.OrderBy, sub.Alias);
     }
 
     private IDbEnumerator BuildPhysical(LogicalPlan plan, ReadOnlyTransaction tx)
@@ -687,9 +739,19 @@ public sealed class QueryPlanner
                 return BuildLimitEnumerator(limit, child);
             }
 
+            case SubqueryPlan sub:
+                return BuildSubqueryPhysical(sub, tx);
+
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
         }
+    }
+
+    private IDbEnumerator BuildSubqueryPhysical(SubqueryPlan plan, ReadOnlyTransaction tx)
+    {
+        var inner = BuildFromCompiled(plan.Inner, plan.OrderBy, tx);
+        var selectors = QualifyProjection(inner.Projection, plan.Alias);
+        return WrapWithQualifiedProjection(inner, selectors);
     }
 
     private IDbEnumerator BuildGroupBy(GroupByPlan plan, ReadOnlyTransaction tx)
@@ -1802,6 +1864,7 @@ public sealed class QueryPlanner
         return plan switch
         {
             ScanPlan scan => scan.Alias,
+            SubqueryPlan sub => sub.Alias,
             FilterPlan filter => GetPlanAlias(filter.Source),
             ProjectPlan project => GetPlanAlias(project.Source),
             DistinctPlan distinct => GetPlanAlias(distinct.Source),
@@ -2278,6 +2341,9 @@ public sealed class QueryPlanner
                 var (child, childOrder) = BuildPhysicalWithOrder(limit.Source, tx);
                 return (BuildLimitEnumerator(limit, child), childOrder);
             }
+
+            case SubqueryPlan sub:
+                return (BuildSubqueryPhysical(sub, tx), Array.Empty<SortKey>());
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
