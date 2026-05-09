@@ -120,41 +120,41 @@ AMD Ryzen 9 3950X 3.49GHz, 1 CPU, 32 logical and 16 physical cores
 
 ### WHERE benchmarks
 
-| Method                                    | RowCount | Mean      | Error     | StdDev    | Median     | Min       | Max        | Ratio | RatioSD | Allocated | Alloc Ratio |
-|------------------------------------------ |--------- |----------:|----------:|----------:|-----------:|----------:|-----------:|------:|--------:|----------:|------------:|
-| 'WHERE pk = constant (point)'             | 1000     | 0.8288 ms | 0.0614 ms | 0.0406 ms |  0.8377 ms | 0.7665 ms |  0.8745 ms |  3.26 |    0.23 |   43656 B |       59.97 |
-| 'WHERE pk BETWEEN (range, ~10%)'          | 1000     | 1.0373 ms | 0.1165 ms | 0.0771 ms |  1.0385 ms | 0.9484 ms |  1.1442 ms |  4.08 |    0.36 |   44368 B |       60.95 |
-| 'WHERE non-pk = constant (~10%)'          | 1000     | 0.9121 ms | 0.2309 ms | 0.1527 ms |  0.8520 ms | 0.7830 ms |  1.1462 ms |  3.59 |    0.60 |   43728 B |       60.07 |
-| 'WHERE non-pk range (~50%)'               | 1000     | 0.9284 ms | 0.2428 ms | 0.1445 ms |  0.8612 ms | 0.8035 ms |  1.2474 ms |  3.65 |    0.57 |   43728 B |       60.07 |
-| 'WHERE compound (pk AND non-pk)'          | 1000     | 1.0545 ms | 0.2964 ms | 0.1961 ms |  0.9615 ms | 0.8884 ms |  1.3643 ms |  4.15 |    0.77 |   44376 B |       60.96 |
-| 'WHERE no match (0 rows)'                 | 1000     | 0.9288 ms | 0.3156 ms | 0.1878 ms |  0.8290 ms | 0.7571 ms |  1.2134 ms |  3.65 |    0.73 |   43744 B |       60.09 |
-| 'WHERE IS NULL (on non-null col)'         | 1000     | 0.8700 ms | 0.3226 ms | 0.1920 ms |  0.7836 ms | 0.7089 ms |  1.1395 ms |  3.42 |    0.74 |   43592 B |       59.88 |
-| 'Full scan (no WHERE)'                    | 1000     | 0.7739 ms | 0.2549 ms | 0.1517 ms |  0.6996 ms | 0.6371 ms |  1.0172 ms |  3.04 |    0.59 |   43168 B |       59.30 |
-| 'SQLite: Full scan (no WHERE)'            | 1000     | 0.2550 ms | 0.0249 ms | 0.0148 ms |  0.2500 ms | 0.2409 ms |  0.2849 ms |  1.00 |    0.08 |     728 B |        1.00 |
-| 'SQLite: WHERE pk = constant (point)'     | 1000     | 0.0899 ms | 0.0098 ms | 0.0065 ms |  0.0909 ms | 0.0803 ms |  0.1024 ms |  0.35 |    0.03 |     744 B |        1.02 |
-| 'SQLite: WHERE pk BETWEEN (range, ~10%)'  | 1000     | 0.1164 ms | 0.0186 ms | 0.0097 ms |  0.1129 ms | 0.1042 ms |  0.1309 ms |  0.46 |    0.04 |     872 B |        1.20 |
-| 'SQLite: WHERE non-pk = constant (~10%)'  | 1000     | 0.1446 ms | 0.0173 ms | 0.0115 ms |  0.1378 ms | 0.1351 ms |  0.1659 ms |  0.57 |    0.05 |     752 B |        1.03 |
-| 'SQLite: WHERE non-pk range (~50%)'       | 1000     | 0.2172 ms | 0.0440 ms | 0.0262 ms |  0.2085 ms | 0.1860 ms |  0.2611 ms |  0.85 |    0.11 |     752 B |        1.03 |
-| 'SQLite: WHERE compound (pk AND non-pk)'  | 1000     | 0.1225 ms | 0.0041 ms | 0.0024 ms |  0.1222 ms | 0.1195 ms |  0.1276 ms |  0.48 |    0.03 |     880 B |        1.21 |
-| 'SQLite: WHERE no match (0 rows)'         | 1000     | 0.0883 ms | 0.0089 ms | 0.0053 ms |  0.0863 ms | 0.0833 ms |  0.0978 ms |  0.35 |    0.03 |     832 B |        1.14 |
-| 'SQLite: WHERE IS NULL (on non-null col)' | 1000     | 0.1216 ms | 0.0092 ms | 0.0055 ms |  0.1212 ms | 0.1135 ms |  0.1313 ms |  0.48 |    0.03 |     752 B |        1.03 |
-|                                           |          |           |           |           |            |           |            |       |         |           |             |
-| 'WHERE pk = constant (point)'             | 10000    | 8.5409 ms | 1.9900 ms | 1.3162 ms |  8.3486 ms | 6.6221 ms | 10.5842 ms |  5.12 |    0.84 |  403656 B |      554.47 |
-| 'WHERE pk BETWEEN (range, ~10%)'          | 10000    | 8.7813 ms | 8.7042 ms | 5.7573 ms |  8.7597 ms | 2.1307 ms | 16.8183 ms |  5.26 |    3.32 |  404376 B |      555.46 |
-| 'WHERE non-pk = constant (~10%)'          | 10000    | 7.2088 ms | 7.8301 ms | 5.1792 ms |  8.8097 ms | 1.3968 ms | 13.1495 ms |  4.32 |    2.99 |  403728 B |      554.57 |
-| 'WHERE non-pk range (~50%)'               | 10000    | 9.6837 ms | 4.2686 ms | 2.8234 ms | 10.6167 ms | 2.2773 ms | 11.6835 ms |  5.80 |    1.67 |  403728 B |      554.57 |
-| 'WHERE compound (pk AND non-pk)'          | 10000    | 8.9841 ms | 7.9339 ms | 5.2478 ms |  9.5594 ms | 1.8592 ms | 16.1423 ms |  5.38 |    3.03 |  404376 B |      555.46 |
-| 'WHERE no match (0 rows)'                 | 10000    | 7.9262 ms | 3.9646 ms | 2.6224 ms |  8.3673 ms | 1.5450 ms | 10.3969 ms |  4.75 |    1.54 |  403744 B |      554.59 |
-| 'WHERE IS NULL (on non-null col)'         | 10000    | 8.1150 ms | 1.7976 ms | 0.9402 ms |  8.3569 ms | 6.6146 ms |  9.0791 ms |  4.86 |    0.64 |  403592 B |      554.38 |
-| 'Full scan (no WHERE)'                    | 10000    | 6.2637 ms | 2.3339 ms | 1.5437 ms |  5.5393 ms | 4.7970 ms |  8.6794 ms |  3.75 |    0.93 |  403168 B |      553.80 |
-| 'SQLite: Full scan (no WHERE)'            | 10000    | 1.6778 ms | 0.2034 ms | 0.1345 ms |  1.5963 ms | 1.5272 ms |  1.8784 ms |  1.01 |    0.11 |     728 B |        1.00 |
-| 'SQLite: WHERE pk = constant (point)'     | 10000    | 0.1279 ms | 0.0235 ms | 0.0140 ms |  0.1277 ms | 0.1107 ms |  0.1510 ms |  0.08 |    0.01 |     744 B |        1.02 |
-| 'SQLite: WHERE pk BETWEEN (range, ~10%)'  | 10000    | 0.3206 ms | 0.0416 ms | 0.0218 ms |  0.3155 ms | 0.2987 ms |  0.3695 ms |  0.19 |    0.02 |     880 B |        1.21 |
-| 'SQLite: WHERE non-pk = constant (~10%)'  | 10000    | 0.7562 ms | 0.1157 ms | 0.0689 ms |  0.7716 ms | 0.6474 ms |  0.8335 ms |  0.45 |    0.05 |     752 B |        1.03 |
-| 'SQLite: WHERE non-pk range (~50%)'       | 10000    | 1.1969 ms | 0.0831 ms | 0.0550 ms |  1.2103 ms | 1.1120 ms |  1.2658 ms |  0.72 |    0.06 |     752 B |        1.03 |
-| 'SQLite: WHERE compound (pk AND non-pk)'  | 10000    | 0.4641 ms | 0.0208 ms | 0.0137 ms |  0.4596 ms | 0.4404 ms |  0.4837 ms |  0.28 |    0.02 |     888 B |        1.22 |
-| 'SQLite: WHERE no match (0 rows)'         | 10000    | 0.1293 ms | 0.0111 ms | 0.0066 ms |  0.1329 ms | 0.1176 ms |  0.1352 ms |  0.08 |    0.01 |     840 B |        1.15 |
-| 'SQLite: WHERE IS NULL (on non-null col)' | 10000    | 0.4642 ms | 0.0167 ms | 0.0087 ms |  0.4654 ms | 0.4513 ms |  0.4763 ms |  0.28 |    0.02 |     752 B |        1.03 |
+| Method                                    | RowCount | Mean       | Error     | StdDev    | Min        | Max        | Median     | Ratio | RatioSD | Allocated | Alloc Ratio |
+|------------------------------------------ |--------- |-----------:|----------:|----------:|-----------:|-----------:|-----------:|------:|--------:|----------:|------------:|
+| 'WHERE pk = constant (point)'             | 1000     |  0.9339 ms | 0.0569 ms | 0.0377 ms |  0.8724 ms |  0.9733 ms |  0.9512 ms |  3.70 |    0.20 |   43776 B |       60.13 |
+| 'WHERE pk BETWEEN (range, ~10%)'          | 1000     |  1.2492 ms | 0.0763 ms | 0.0454 ms |  1.1962 ms |  1.3195 ms |  1.2486 ms |  4.95 |    0.25 |   44648 B |       61.33 |
+| 'WHERE non-pk = constant (~10%)'          | 1000     |  0.9672 ms | 0.0673 ms | 0.0445 ms |  0.8974 ms |  1.0394 ms |  0.9760 ms |  3.83 |    0.22 |   43848 B |       60.23 |
+| 'WHERE non-pk range (~50%)'               | 1000     |  0.9832 ms | 0.0377 ms | 0.0250 ms |  0.9492 ms |  1.0152 ms |  0.9911 ms |  3.90 |    0.17 |   43848 B |       60.23 |
+| 'WHERE compound (pk AND non-pk)'          | 1000     |  1.2741 ms | 0.2508 ms | 0.1659 ms |  1.0816 ms |  1.5208 ms |  1.2741 ms |  5.05 |    0.65 |   44656 B |       61.34 |
+| 'WHERE no match (0 rows)'                 | 1000     |  1.0270 ms | 0.2382 ms | 0.1418 ms |  0.8872 ms |  1.1886 ms |  0.9360 ms |  4.07 |    0.55 |   43864 B |       60.25 |
+| 'WHERE IS NULL (on non-null col)'         | 1000     |  0.9445 ms | 0.2262 ms | 0.1346 ms |  0.8050 ms |  1.1223 ms |  0.8738 ms |  3.74 |    0.52 |   43712 B |       60.04 |
+| 'Full scan (no WHERE)'                    | 1000     |  0.7480 ms | 0.0691 ms | 0.0411 ms |  0.6804 ms |  0.7975 ms |  0.7602 ms |  2.97 |    0.19 |   43168 B |       59.30 |
+| 'SQLite: Full scan (no WHERE)'            | 1000     |  0.2526 ms | 0.0169 ms | 0.0101 ms |  0.2445 ms |  0.2723 ms |  0.2490 ms |  1.00 |    0.05 |     728 B |        1.00 |
+| 'SQLite: WHERE pk = constant (point)'     | 1000     |  0.0907 ms | 0.0142 ms | 0.0094 ms |  0.0816 ms |  0.1111 ms |  0.0887 ms |  0.36 |    0.04 |     744 B |        1.02 |
+| 'SQLite: WHERE pk BETWEEN (range, ~10%)'  | 1000     |  0.1082 ms | 0.0075 ms | 0.0045 ms |  0.1037 ms |  0.1183 ms |  0.1073 ms |  0.43 |    0.02 |     872 B |        1.20 |
+| 'SQLite: WHERE non-pk = constant (~10%)'  | 1000     |  0.1524 ms | 0.0185 ms | 0.0110 ms |  0.1386 ms |  0.1673 ms |  0.1543 ms |  0.60 |    0.05 |     752 B |        1.03 |
+| 'SQLite: WHERE non-pk range (~50%)'       | 1000     |  0.1890 ms | 0.0038 ms | 0.0020 ms |  0.1852 ms |  0.1910 ms |  0.1895 ms |  0.75 |    0.03 |     752 B |        1.03 |
+| 'SQLite: WHERE compound (pk AND non-pk)'  | 1000     |  0.1368 ms | 0.0215 ms | 0.0142 ms |  0.1216 ms |  0.1634 ms |  0.1319 ms |  0.54 |    0.06 |     880 B |        1.21 |
+| 'SQLite: WHERE no match (0 rows)'         | 1000     |  0.0904 ms | 0.0130 ms | 0.0077 ms |  0.0831 ms |  0.1060 ms |  0.0859 ms |  0.36 |    0.03 |     832 B |        1.14 |
+| 'SQLite: WHERE IS NULL (on non-null col)' | 1000     |  0.1310 ms | 0.0120 ms | 0.0079 ms |  0.1182 ms |  0.1426 ms |  0.1328 ms |  0.52 |    0.04 |     752 B |        1.03 |
+|                                           |          |            |           |           |            |            |            |       |         |           |             |
+| 'WHERE pk = constant (point)'             | 10000    |  8.0586 ms | 6.3126 ms | 4.1754 ms |  2.1384 ms | 12.3655 ms |  9.3813 ms |  4.76 |    2.36 |  403776 B |      554.64 |
+| 'WHERE pk BETWEEN (range, ~10%)'          | 10000    | 13.1353 ms | 1.8408 ms | 1.0954 ms | 11.1059 ms | 14.7682 ms | 12.9170 ms |  7.75 |    0.73 |  404656 B |      555.85 |
+| 'WHERE non-pk = constant (~10%)'          | 10000    | 10.5136 ms | 5.1239 ms | 3.3891 ms |  2.3034 ms | 14.5239 ms | 11.3248 ms |  6.21 |    1.93 |  403848 B |      554.74 |
+| 'WHERE non-pk range (~50%)'               | 10000    |  9.3647 ms | 4.2930 ms | 2.8395 ms |  3.5769 ms | 12.1235 ms | 10.5221 ms |  5.53 |    1.62 |  403848 B |      554.74 |
+| 'WHERE compound (pk AND non-pk)'          | 10000    | 12.6677 ms | 2.1525 ms | 1.4238 ms | 10.2888 ms | 14.5465 ms | 12.8029 ms |  7.48 |    0.88 |  404656 B |      555.85 |
+| 'WHERE no match (0 rows)'                 | 10000    |  9.9676 ms | 2.4861 ms | 1.6444 ms |  7.2860 ms | 11.7950 ms | 10.2819 ms |  5.88 |    0.97 |  403864 B |      554.76 |
+| 'WHERE IS NULL (on non-null col)'         | 10000    |  7.4353 ms | 6.1461 ms | 4.0652 ms |  1.8869 ms | 11.5814 ms |  8.4811 ms |  4.39 |    2.30 |  403712 B |      554.55 |
+| 'Full scan (no WHERE)'                    | 10000    |  7.8436 ms | 1.3919 ms | 0.9207 ms |  6.4508 ms |  9.5390 ms |  7.8380 ms |  4.63 |    0.57 |  403168 B |      553.80 |
+| 'SQLite: Full scan (no WHERE)'            | 10000    |  1.6985 ms | 0.1317 ms | 0.0871 ms |  1.5423 ms |  1.8129 ms |  1.6955 ms |  1.00 |    0.07 |     728 B |        1.00 |
+| 'SQLite: WHERE pk = constant (point)'     | 10000    |  0.1717 ms | 0.0458 ms | 0.0303 ms |  0.1286 ms |  0.2197 ms |  0.1741 ms |  0.10 |    0.02 |     744 B |        1.02 |
+| 'SQLite: WHERE pk BETWEEN (range, ~10%)'  | 10000    |  0.3601 ms | 0.0506 ms | 0.0301 ms |  0.3064 ms |  0.4129 ms |  0.3638 ms |  0.21 |    0.02 |     880 B |        1.21 |
+| 'SQLite: WHERE non-pk = constant (~10%)'  | 10000    |  0.7023 ms | 0.0678 ms | 0.0403 ms |  0.6492 ms |  0.7758 ms |  0.7097 ms |  0.41 |    0.03 |     752 B |        1.03 |
+| 'SQLite: WHERE non-pk range (~50%)'       | 10000    |  1.2553 ms | 0.0913 ms | 0.0604 ms |  1.1215 ms |  1.3457 ms |  1.2696 ms |  0.74 |    0.05 |     752 B |        1.03 |
+| 'SQLite: WHERE compound (pk AND non-pk)'  | 10000    |  0.5110 ms | 0.0601 ms | 0.0398 ms |  0.4583 ms |  0.5679 ms |  0.5198 ms |  0.30 |    0.03 |     888 B |        1.22 |
+| 'SQLite: WHERE no match (0 rows)'         | 10000    |  0.1689 ms | 0.0480 ms | 0.0317 ms |  0.1275 ms |  0.2158 ms |  0.1682 ms |  0.10 |    0.02 |     840 B |        1.15 |
+| 'SQLite: WHERE IS NULL (on non-null col)' | 10000    |  0.5468 ms | 0.0380 ms | 0.0251 ms |  0.5133 ms |  0.5902 ms |  0.5522 ms |  0.32 |    0.02 |     752 B |        1.03 |
 
 ### ORDER BY benchmarks
 
