@@ -1406,18 +1406,115 @@ public sealed class QueryPlanner
                 matched++;
             }
 
-            if (matched == 0) continue; // No prefix match for this index
+            // After leading equalities, try to extend the seek with range bounds on the
+            // next index column (matched < idxCols.Length). All four comparison operators
+            // are supported, plus half-bounded ranges. Index keys carry a PK suffix after
+            // the column-value encoding, so the bound for `>` (exclusive lower) and `<=`
+            // (inclusive upper) needs the per-type "encoded column successor" — the smallest
+            // byte sequence > every key with col=value, regardless of PK suffix.
+            DbValue rangeLowerVal = default, rangeUpperVal = default;
+            bool rangeLowerInclusive = false, rangeUpperInclusive = false;
+            bool hasRangeLower = false, hasRangeUpper = false;
 
-            // Build seek prefix from matched values
+            if (matched < idxCols.Length)
+            {
+                var rangeColIdx = idxCols[matched];
+                var rangeColName = table.Columns[rangeColIdx].Name;
+                var rangeColTypeName = table.Columns[rangeColIdx].TypeName;
+                int rangeLowerCi = -1, rangeUpperCi = -1;
+
+                for (int ci = 0; ci < conjuncts.Count; ci++)
+                {
+                    if (usedConjuncts.Contains(ci)) continue;
+                    if (!TryExtractComparison(conjuncts[ci], rangeColName, scanProjection,
+                            out var op, out var rhs))
+                        continue;
+
+                    if (TypeAffinity.IsDateAffinity(rangeColTypeName) &&
+                        rhs.Type == DbType.Text &&
+                        DateTimeHelper.TryParseToTicks(rhs.AsText().Span, out long rTicks))
+                    {
+                        rhs = DbValue.Integer(rTicks);
+                    }
+
+                    switch (op)
+                    {
+                        case BinaryOp.GreaterEqual:
+                            if (!hasRangeLower) { rangeLowerVal = rhs; rangeLowerInclusive = true; hasRangeLower = true; rangeLowerCi = ci; }
+                            break;
+                        case BinaryOp.GreaterThan:
+                            if (!hasRangeLower) { rangeLowerVal = rhs; rangeLowerInclusive = false; hasRangeLower = true; rangeLowerCi = ci; }
+                            break;
+                        case BinaryOp.LessEqual:
+                            if (!hasRangeUpper) { rangeUpperVal = rhs; rangeUpperInclusive = true; hasRangeUpper = true; rangeUpperCi = ci; }
+                            break;
+                        case BinaryOp.LessThan:
+                            if (!hasRangeUpper) { rangeUpperVal = rhs; rangeUpperInclusive = false; hasRangeUpper = true; rangeUpperCi = ci; }
+                            break;
+                    }
+                }
+
+                if (hasRangeLower) usedConjuncts.Add(rangeLowerCi);
+                if (hasRangeUpper) usedConjuncts.Add(rangeUpperCi);
+            }
+
+            bool hasAnyRange = hasRangeLower || hasRangeUpper;
+            if (matched == 0 && !hasAnyRange) continue; // No leading equality and no range — try next index
+
+            // Build equality prefix (oid + matched equality values).
             var prefixValues = seekValues.AsSpan(0, matched);
             var prefixTypes = new DbType[matched];
             for (int i = 0; i < matched; i++)
                 prefixTypes[i] = idxTypes[i];
-            var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(index.Oid, prefixValues, prefixTypes);
+            var equalityPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(index.Oid, prefixValues, prefixTypes);
+
+            byte[]? seekPrefix;
+            byte[]? upperBound;
+            if (hasAnyRange)
+            {
+                var rangeColType = idxTypes[matched];
+
+                // Lower bound: `>=` uses the encoded value as-is; `>` uses the encoded
+                // column successor (smallest byte sequence > every key with col=value).
+                // Half-bound (no lower): use the equality prefix as the lower — that's
+                // the first key in this index branch.
+                if (hasRangeLower)
+                {
+                    seekPrefix = rangeLowerInclusive
+                        ? EncodeIndexBound(equalityPrefix, rangeLowerVal, rangeColType)
+                        : EncodeIndexColumnSuccessor(equalityPrefix, rangeLowerVal, rangeColType);
+                }
+                else
+                {
+                    seekPrefix = equalityPrefix;
+                }
+
+                // Upper bound (exclusive): `<` uses the encoded value as-is; `<=` uses
+                // the encoded column successor. Half-bound (no upper): use the end-of-
+                // equality-branch sentinel — bumps the equality prefix or the index oid
+                // if matched=0.
+                if (hasRangeUpper)
+                {
+                    upperBound = rangeUpperInclusive
+                        ? EncodeIndexColumnSuccessor(equalityPrefix, rangeUpperVal, rangeColType)
+                        : EncodeIndexBound(equalityPrefix, rangeUpperVal, rangeColType);
+                }
+                else
+                {
+                    upperBound = ComputeIndexBranchEndSentinel(index.Oid, prefixValues, prefixTypes);
+                }
+
+                if (seekPrefix is null || upperBound is null) continue;
+            }
+            else
+            {
+                seekPrefix = equalityPrefix;
+                upperBound = null;
+            }
 
             // Build IndexScan
             var cursor = tx.CreateCursor();
-            var indexScan = new Indexes.IndexScan(cursor, index, table, tx, seekPrefix, null);
+            var indexScan = new Indexes.IndexScan(cursor, index, table, tx, seekPrefix, upperBound);
 
             // Extract sort order: unmatched index suffix + PK columns
             var sortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
@@ -1774,6 +1871,86 @@ public sealed class QueryPlanner
         Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
         RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
         return inclusive ? LexSuccessor(combined) : combined;
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="value"/> as the next column of <paramref name="prefix"/> for
+    /// an index-key bound. Unlike PK keys, index keys have a PK suffix appended after the
+    /// column-value encoding, so callers building <c>&gt;=</c> / <c>&lt;</c> bounds use this
+    /// (the suffix bytes don't matter — bytes-after-prefix carry the inequality).
+    /// </summary>
+    private static byte[] EncodeIndexBound(byte[] prefix, DbValue value, DbType type)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+        return combined;
+    }
+
+    /// <summary>
+    /// Returns the smallest byte sequence strictly greater than every index key with
+    /// <paramref name="prefix"/> + col=value, regardless of PK suffix. Used to encode
+    /// <c>&gt;</c> (exclusive lower) and <c>&lt;=</c> (inclusive upper) bounds on a
+    /// secondary index where the column-value encoding is followed by PK bytes.
+    ///
+    /// Variable-length text/blob: the encoded form ends with the 0x00 0x00 terminator
+    /// (embedded nulls are escaped as 0x00 0x01). Bumping the trailing 0x00 to 0x01
+    /// produces a sequence greater than any continuation that's a valid index key.
+    ///
+    /// Fixed-width numeric: lex-increment the byte sequence with carry. Returns null
+    /// when the value is at its encoded maximum (carry overflows out of the column
+    /// bytes); the caller should fall back to a full scan.
+    /// </summary>
+    private static byte[]? EncodeIndexColumnSuccessor(byte[] prefix, DbValue value, DbType type)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+
+        if (type.IsVariableLength())
+        {
+            // Trailing terminator is 0x00 0x00; flip the last byte to 0x01.
+            combined[^1] = 0x01;
+            return combined;
+        }
+
+        // Fixed-width numeric: increment with carry from the right; overflow → null.
+        for (int i = combined.Length - 1; i >= prefix.Length; i--)
+        {
+            if (combined[i] != 0xFF)
+            {
+                combined[i]++;
+                return combined;
+            }
+            combined[i] = 0x00;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Computes the exclusive upper sentinel for "all keys sharing the equality prefix"
+    /// — used for half-bounded ranges (<c>col &gt;= X</c> with no upper). With <c>matched
+    /// &gt; 0</c> this is the encoded column successor of the last equality value (same
+    /// trick as <see cref="EncodeIndexColumnSuccessor"/>) so the PK suffix bytes don't
+    /// collide with the sentinel. With <c>matched == 0</c> it's the next index's oid
+    /// (<c>oid + 1</c>) as a 4-byte big-endian sentinel. Returns null when the column
+    /// successor overflows or oid is <see cref="uint.MaxValue"/> (rare wraparounds).
+    /// </summary>
+    private static byte[]? ComputeIndexBranchEndSentinel(Schema.Oid indexOid, ReadOnlySpan<DbValue> prefixValues, ReadOnlySpan<DbType> prefixTypes)
+    {
+        if (prefixValues.Length > 0)
+        {
+            var subPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
+                indexOid, prefixValues[..^1], prefixTypes[..^1]);
+            return EncodeIndexColumnSuccessor(subPrefix, prefixValues[^1], prefixTypes[^1]);
+        }
+
+        if (indexOid.Value == uint.MaxValue) return null;
+        var sentinel = new byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(sentinel, indexOid.Value + 1);
+        return sentinel;
     }
 
     /// <summary>
@@ -2695,7 +2872,10 @@ public sealed class QueryPlanner
             var fullSortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
             var remappedKeys = RemapIndexOnlySortKeys(fullSortKeys, idxCols, pkIndices, outputMapArray);
 
-            // Apply residual filter if needed
+            // Apply residual filter if needed. The residual must only reference columns
+            // present in the IndexOnlyScan's output projection — otherwise we can't resolve
+            // the column refs without going back to the table. In that case bail and let a
+            // wider physical plan handle the query.
             if (usedConjuncts.Count < conjuncts.Count)
             {
                 var residuals = new List<SqlExpr>();
@@ -2703,6 +2883,21 @@ public sealed class QueryPlanner
                     if (!usedConjuncts.Contains(i))
                         residuals.Add(conjuncts[i]);
                 var residual = HeuristicOptimizer.CombineAnd(residuals);
+
+                var residualCols = new List<string>();
+                if (!CollectColumnNames(residual, residualCols))
+                    return null;
+                foreach (var c in residualCols)
+                {
+                    bool found = false;
+                    for (int i = 0; i < result.Projection.ColumnCount; i++)
+                    {
+                        if (string.Equals(result.Projection.GetQualifiedName(i).Column, c, StringComparison.OrdinalIgnoreCase))
+                        { found = true; break; }
+                    }
+                    if (!found) return null;
+                }
+
                 var resolved = ResolveColumns(residual, result.Projection);
                 result = new Filter(result, resolved);
             }
@@ -2914,7 +3109,10 @@ public sealed class QueryPlanner
             var fullSortKeys = ExtractIndexSortKeys(index, table, matched, idxCols);
             var remappedKeys = RemapIndexOnlySortKeys(fullSortKeys, idxCols, pkIndices, outputMapArray);
 
-            // Apply residual filter if needed
+            // Apply residual filter if needed. The residual must only reference columns
+            // present in the IndexOnlyScan's output projection — otherwise we can't resolve
+            // the column refs without going back to the table. In that case bail and let a
+            // wider physical plan handle the query.
             if (usedConjuncts.Count < conjuncts.Count)
             {
                 var residuals = new List<SqlExpr>();
@@ -2922,6 +3120,21 @@ public sealed class QueryPlanner
                     if (!usedConjuncts.Contains(i))
                         residuals.Add(conjuncts[i]);
                 var residual = HeuristicOptimizer.CombineAnd(residuals);
+
+                var residualCols = new List<string>();
+                if (!CollectColumnNames(residual, residualCols))
+                    return null;
+                foreach (var c in residualCols)
+                {
+                    bool found = false;
+                    for (int i = 0; i < result.Projection.ColumnCount; i++)
+                    {
+                        if (string.Equals(result.Projection.GetQualifiedName(i).Column, c, StringComparison.OrdinalIgnoreCase))
+                        { found = true; break; }
+                    }
+                    if (!found) return null;
+                }
+
                 var resolved = ResolveColumns(residual, result.Projection);
                 result = new Filter(result, resolved);
             }

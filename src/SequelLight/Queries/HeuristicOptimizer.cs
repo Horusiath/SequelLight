@@ -39,6 +39,7 @@ public static class HeuristicOptimizer
         plan = PushDownPredicates(plan);
         plan = PushDownProjections(plan);
         plan = EliminateRedundantDistinct(plan);
+        plan = RewriteLikePrefixInPlan(plan);
         return plan;
     }
 
@@ -1054,4 +1055,207 @@ public static class HeuristicOptimizer
         FilterPlan filter => FindLeafScan(filter.Source),
         _ => null,
     };
+
+    // ───────────────────────────────────────────────────────────────────
+    // Rule 5: LIKE/GLOB prefix → range
+    //
+    // Rewrites `col LIKE 'prefix%'` (no letters) and `col GLOB 'prefix*'`
+    // to `col >= prefix AND col < successor(prefix)`. The PK / index
+    // pickers downstream then turn that range into a bounded scan.
+    //
+    // LIKE is ASCII-case-insensitive, but byte ranges aren't, so we only
+    // rewrite when the prefix has no ASCII letters (e.g. '/api/%', '20251%').
+    // GLOB is always case-sensitive — rewrite is safe there.
+    // ───────────────────────────────────────────────────────────────────
+
+    private static LogicalPlan RewriteLikePrefixInPlan(LogicalPlan plan)
+    {
+        switch (plan)
+        {
+            case FilterPlan filter:
+            {
+                var source = RewriteLikePrefixInPlan(filter.Source);
+                var newPredicate = RewriteLikePrefixInExpr(filter.Predicate);
+                if (ReferenceEquals(source, filter.Source) && ReferenceEquals(newPredicate, filter.Predicate))
+                    return plan;
+                return new FilterPlan(newPredicate, source);
+            }
+            case JoinPlan join:
+            {
+                var left = RewriteLikePrefixInPlan(join.Left);
+                var right = RewriteLikePrefixInPlan(join.Right);
+                var condition = join.Condition is not null ? RewriteLikePrefixInExpr(join.Condition) : null;
+                if (ReferenceEquals(left, join.Left) && ReferenceEquals(right, join.Right)
+                    && ReferenceEquals(condition, join.Condition))
+                    return plan;
+                return new JoinPlan(left, right, join.Kind, condition);
+            }
+            case ProjectPlan project:
+            {
+                var source = RewriteLikePrefixInPlan(project.Source);
+                return ReferenceEquals(source, project.Source) ? plan : new ProjectPlan(project.Columns, source);
+            }
+            case DistinctPlan distinct:
+            {
+                var source = RewriteLikePrefixInPlan(distinct.Source);
+                return ReferenceEquals(source, distinct.Source) ? plan : new DistinctPlan(source);
+            }
+            case GroupByPlan agg:
+            {
+                var source = RewriteLikePrefixInPlan(agg.Source);
+                var having = agg.Having is not null ? RewriteLikePrefixInExpr(agg.Having) : null;
+                if (ReferenceEquals(source, agg.Source) && ReferenceEquals(having, agg.Having))
+                    return plan;
+                return new GroupByPlan(agg.GroupByExprs, agg.Columns, having, source);
+            }
+            case CompoundPlan compound:
+            {
+                var sources = OptimizeSources(compound.Sources, RewriteLikePrefixInPlan);
+                return sources is not null ? new CompoundPlan(compound.Op, sources) : plan;
+            }
+            case LimitPlan limit:
+            {
+                var source = RewriteLikePrefixInPlan(limit.Source);
+                return ReferenceEquals(source, limit.Source) ? plan : new LimitPlan(limit.Limit, limit.Offset, source);
+            }
+            default:
+                return plan;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites eligible <see cref="LikeExpr"/> nodes inside an expression tree.
+    /// Other operators recurse into children so a LIKE buried inside <c>AND</c> /
+    /// <c>OR</c> still gets transformed.
+    /// </summary>
+    private static SqlExpr RewriteLikePrefixInExpr(SqlExpr expr)
+    {
+        switch (expr)
+        {
+            case LikeExpr like:
+            {
+                if (TryExtractLikePrefix(like, out var prefix))
+                    return BuildPrefixRange(like.Operand, prefix!);
+                return expr;
+            }
+            case BinaryExpr binary:
+            {
+                var left = RewriteLikePrefixInExpr(binary.Left);
+                var right = RewriteLikePrefixInExpr(binary.Right);
+                return ReferenceEquals(left, binary.Left) && ReferenceEquals(right, binary.Right)
+                    ? expr
+                    : binary with { Left = left, Right = right };
+            }
+            case UnaryExpr unary:
+            {
+                var operand = RewriteLikePrefixInExpr(unary.Operand);
+                return ReferenceEquals(operand, unary.Operand) ? expr : unary with { Operand = operand };
+            }
+            default:
+                return expr;
+        }
+    }
+
+    /// <summary>
+    /// Builds <c>col &gt;= prefix AND col &lt; successor(prefix)</c>. When the
+    /// prefix has no successor (all 0xFF bytes), the upper bound is omitted.
+    /// </summary>
+    private static SqlExpr BuildPrefixRange(SqlExpr operand, byte[] prefix)
+    {
+        var lower = new ResolvedLiteralExpr(DbValue.Text(prefix));
+        var lowerCmp = new BinaryExpr(operand, BinaryOp.GreaterEqual, lower);
+        var successor = StringSuccessor(prefix);
+        if (successor is null)
+            return lowerCmp;
+        var upper = new ResolvedLiteralExpr(DbValue.Text(successor));
+        var upperCmp = new BinaryExpr(operand, BinaryOp.LessThan, upper);
+        return new BinaryExpr(lowerCmp, BinaryOp.And, upperCmp);
+    }
+
+    /// <summary>
+    /// Smallest byte string strictly greater than <paramref name="prefix"/>: increment
+    /// the rightmost non-0xFF byte and truncate the rest. Returns null when the prefix
+    /// is all 0xFF (no successor).
+    /// </summary>
+    private static byte[]? StringSuccessor(byte[] prefix)
+    {
+        for (int i = prefix.Length - 1; i >= 0; i--)
+        {
+            if (prefix[i] != 0xFF)
+            {
+                var result = new byte[i + 1];
+                Buffer.BlockCopy(prefix, 0, result, 0, i + 1);
+                result[i]++;
+                return result;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns true and sets <paramref name="prefix"/> when <paramref name="like"/> is
+    /// eligible for the LIKE/GLOB → range rewrite. The rewrite is exact when the
+    /// pattern is <c>literal_prefix + '%'</c> (LIKE) or <c>literal_prefix + '*'</c>
+    /// (GLOB), the prefix has no other meta chars or escape sequences, the operator is
+    /// not negated, and (for LIKE only) the prefix contains no ASCII letters.
+    /// </summary>
+    private static bool TryExtractLikePrefix(LikeExpr like, out byte[]? prefix)
+    {
+        prefix = null;
+        if (like.Negated) return false;
+        if (like.Op != LikeOp.Like && like.Op != LikeOp.Glob) return false;
+        if (like.Operand is not ColumnRefExpr) return false;
+        if (like.Pattern is not ResolvedLiteralExpr patLit) return false;
+        if (patLit.Value.IsNull || patLit.Value.Type != DbType.Text) return false;
+
+        char? escape = null;
+        if (like.Op == LikeOp.Like && like.Escape is not null)
+        {
+            if (like.Escape is not ResolvedLiteralExpr escLit) return false;
+            if (escLit.Value.IsNull || escLit.Value.Type != DbType.Text) return false;
+            var escSpan = escLit.Value.AsText().Span;
+            if (escSpan.Length != 1) return false;
+            escape = (char)escSpan[0];
+        }
+
+        var patternSpan = patLit.Value.AsText().Span;
+        byte wild = like.Op == LikeOp.Glob ? (byte)'*' : (byte)'%';
+        byte single = like.Op == LikeOp.Glob ? (byte)'?' : (byte)'_';
+
+        // Pattern must end with the trailing wildcard and contain no other meta chars
+        // before that. ESCAPE sequences in the prefix decode to literal bytes.
+        int len = patternSpan.Length;
+        if (len < 2) return false;
+        if (patternSpan[len - 1] != wild) return false;
+
+        var buf = new List<byte>(len - 1);
+        for (int i = 0; i < len - 1; i++)
+        {
+            byte b = patternSpan[i];
+            if (escape.HasValue && b == (byte)escape.Value)
+            {
+                if (i + 1 >= len - 1) return false; // escape at end of prefix
+                buf.Add(patternSpan[i + 1]);
+                i++;
+                continue;
+            }
+            if (b == wild || b == single) return false;
+            if (like.Op == LikeOp.Glob && b == (byte)'[') return false;
+            buf.Add(b);
+        }
+
+        if (buf.Count == 0) return false; // bare wildcard
+
+        if (like.Op == LikeOp.Like)
+        {
+            foreach (var b in buf)
+            {
+                if ((b >= (byte)'a' && b <= (byte)'z') || (b >= (byte)'A' && b <= (byte)'Z'))
+                    return false; // ASCII case-insensitivity makes byte ranges unsafe
+            }
+        }
+
+        prefix = buf.ToArray();
+        return true;
+    }
 }

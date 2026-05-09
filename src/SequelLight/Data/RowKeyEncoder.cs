@@ -164,6 +164,15 @@ public static class RowKeyEncoder
         }
     }
 
+    // Variable-length encoding contract:
+    //   embedded 0x00     → 0x00 0x01
+    //   end of value      → 0x00 0x00 (terminator)
+    // Bumping the trailing 0x00 of the terminator to 0x01 yields the smallest byte
+    // sequence strictly greater than every key starting with this encoded value —
+    // exploited by `QueryPlanner.EncodeIndexColumnSuccessor` for `>` and `<=` bounds
+    // on secondary indexes (where index keys carry a PK suffix after the column
+    // encoding). If this contract changes (different terminator length, escape
+    // byte, etc.), update that helper to match.
     private static int EncodeBytes(Span<byte> dest, ReadOnlySpan<byte> data)
     {
         // Use IndexOf to find 0x00 positions and bulk-copy runs between them.

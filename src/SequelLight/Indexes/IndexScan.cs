@@ -84,14 +84,20 @@ internal sealed class IndexScan : IDbEnumerator
 
             var indexKey = _cursor.CurrentKey.Span;
 
-            // Check prefix still matches (index Oid + seek values)
-            if (indexKey.Length < _seekPrefix.Length ||
-                !indexKey[.._seekPrefix.Length].SequenceEqual(_seekPrefix))
-                return false;
-
-            // Check upper bound (for range scans)
-            if (_upperBound is not null && indexKey.SequenceCompareTo(_upperBound) >= 0)
-                return false;
+            // Termination: an explicit upperBound (range scan) is the sole stop signal —
+            // the seek prefix may be a strict lower bound that doesn't match every row.
+            // Without an upperBound we fall back to prefix-match (equality / equality-prefix scan).
+            if (_upperBound is not null)
+            {
+                if (indexKey.SequenceCompareTo(_upperBound) >= 0)
+                    return false;
+            }
+            else
+            {
+                if (indexKey.Length < _seekPrefix.Length ||
+                    !indexKey[.._seekPrefix.Length].SequenceEqual(_seekPrefix))
+                    return false;
+            }
 
             // Skip tombstones
             if (_cursor.IsTombstone)

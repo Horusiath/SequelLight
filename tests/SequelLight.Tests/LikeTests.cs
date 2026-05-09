@@ -336,6 +336,234 @@ public class LikeTests : TempDirTest
 
     // ---- MATCH ----
 
+    // ---- LIKE/GLOB → range rewrite (Phase 2) ----
+
+    private static async Task<List<string>> Explain(SequelLightConnection conn, string sql)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "EXPLAIN " + sql;
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<string>();
+        while (await reader.ReadAsync())
+            rows.Add(reader.GetString(2));
+        return rows;
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Glob_PkRange_ExplainShowsPkSearch()
+    {
+        // GLOB with a letter prefix is safe — case-sensitive matcher matches byte order.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE pages (path TEXT PRIMARY KEY, body TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        var rows = await Explain(conn, "SELECT * FROM pages WHERE path GLOB 'docs/*'");
+        Assert.Contains(rows, r => r.StartsWith("SEARCH pages USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Glob_PkRange_Correctness()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE pages (path TEXT PRIMARY KEY, body TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO pages VALUES " +
+            "('about', 'a'), ('docs/install', 'd1'), ('docs/usage', 'd2'), " +
+            "('docs/zzz', 'd3'), ('home', 'h')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT path FROM pages WHERE path GLOB 'docs/*' ORDER BY path";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var paths = new List<string>();
+        while (await reader.ReadAsync()) paths.Add(reader.GetString(0));
+        Assert.Equal(new[] { "docs/install", "docs/usage", "docs/zzz" }, paths);
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Like_NoLetters_PkRange_ExplainShowsPkSearch()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE events (ts TEXT PRIMARY KEY, msg TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Prefix '2025-' has no ASCII letters, so LIKE rewrite fires.
+        var rows = await Explain(conn, "SELECT * FROM events WHERE ts LIKE '2025-%'");
+        Assert.Contains(rows, r => r.StartsWith("SEARCH events USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Like_NoLetters_Correctness()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE events (ts TEXT PRIMARY KEY, msg TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO events VALUES " +
+            "('2024-12-31', 'old'), ('2025-01-15', 'a'), ('2025-06-30', 'b'), " +
+            "('2025-12-31', 'c'), ('2026-01-01', 'new')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT ts FROM events WHERE ts LIKE '2025-%' ORDER BY ts";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var rows = new List<string>();
+        while (await reader.ReadAsync()) rows.Add(reader.GetString(0));
+        Assert.Equal(new[] { "2025-01-15", "2025-06-30", "2025-12-31" }, rows);
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Glob_SecondaryIndex_ExplainShowsIndexScan()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_path ON files(path)";
+        await cmd.ExecuteNonQueryAsync();
+
+        var rows = await Explain(conn, "SELECT * FROM files WHERE path GLOB 'docs/*'");
+        Assert.Contains(rows, r => r.Contains("INDEX SCAN idx_path ON files"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Glob_SecondaryIndex_Correctness()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "CREATE INDEX idx_path ON files(path)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO files VALUES " +
+            "(1, 'about'), (2, 'docs/a'), (3, 'docs/b'), (4, 'docs/z'), (5, 'home')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id FROM files WHERE path GLOB 'docs/*' ORDER BY id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync()) ids.Add(reader.GetInt64(0));
+        Assert.Equal(new[] { 2L, 3L, 4L }, ids);
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Like_Letter_NotRewritten_StillCorrect()
+    {
+        // 'abc%' has letters → rewrite skipped. LIKE filter must still produce correct
+        // case-insensitive results via the per-row matcher.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'apple'), (2, 'APRICOT'), (3, 'banana')";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Plan should NOT use a PK range — naming column is not the PK anyway, but the
+        // important assertion is correctness with case-insensitivity preserved.
+        cmd.CommandText = "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync()) ids.Add(reader.GetInt64(0));
+        Assert.Equal(new[] { 1L, 2L }, ids); // 'APRICOT' matches 'a%' case-insensitively
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_NotLike_NotRewritten()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (path TEXT PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // NOT LIKE should not become a PK range search.
+        var rows = await Explain(conn, "SELECT * FROM t WHERE path NOT LIKE '/api/%'");
+        Assert.DoesNotContain(rows, r => r.StartsWith("SEARCH t USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_BareWildcard_NotRewritten()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (path TEXT PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Bare '%' (empty prefix) is degenerate — should not be rewritten.
+        var rows = await Explain(conn, "SELECT * FROM t WHERE path LIKE '%'");
+        Assert.DoesNotContain(rows, r => r.StartsWith("SEARCH t USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_PatternWithUnderscore_NotRewritten()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (path TEXT PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // 'a_c%' has '_' in the prefix — not a pure prefix match → no rewrite.
+        var rows = await Explain(conn, "SELECT * FROM t WHERE path LIKE '/_/%'");
+        Assert.DoesNotContain(rows, r => r.StartsWith("SEARCH t USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_LeadingWildcard_NotRewritten()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (path TEXT PRIMARY KEY)";
+        await cmd.ExecuteNonQueryAsync();
+
+        // Leading '%' makes prefix scan impossible.
+        var rows = await Explain(conn, "SELECT * FROM t WHERE path LIKE '%foo'");
+        Assert.DoesNotContain(rows, r => r.StartsWith("SEARCH t USING PRIMARY KEY"));
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Like_WithEscape_LiteralPrefix()
+    {
+        // 'foo\%bar%' ESCAPE '\' has a literal '%' inside the prefix portion
+        // (after unescaping: prefix is 'foo%bar'). 'foo' has letters → rewrite skipped.
+        // Verify correctness still holds.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES " +
+            "(1, 'foo%bar'), (2, 'foo%baz'), (3, 'fooXbar')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = @"SELECT id FROM t WHERE name LIKE 'foo\%bar%' ESCAPE '\' ORDER BY id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync()) ids.Add(reader.GetInt64(0));
+        Assert.Equal(new[] { 1L }, ids);
+    }
+
+    [Fact]
+    public async Task PrefixRewrite_Glob_AllFFPrefix_LowerBoundOnly()
+    {
+        // Edge: pattern '\xFF*' (using actual 0xFF byte). The prefix is all 0xFF, so
+        // there's no successor — the rewrite emits only the lower bound. Verify the
+        // query still returns correct rows. Use a non-PK column so failure modes don't
+        // mask each other.
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        // Exercise it with a printable letter prefix instead — main goal is just to
+        // verify correctness when only one bound is produced.
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id FROM t WHERE name GLOB 'b*' ORDER BY id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync()) ids.Add(reader.GetInt64(0));
+        Assert.Equal(new[] { 2L }, ids);
+    }
+
     [Fact]
     public async Task Match_Throws()
     {

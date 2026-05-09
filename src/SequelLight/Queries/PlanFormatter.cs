@@ -358,6 +358,12 @@ internal static class PlanFormatter
         },
         InExpr inExpr => UnresolveIn(inExpr, projection),
         CastExpr c => c with { Operand = UnresolveExpr(c.Operand, projection) },
+        LikeExpr l => l with
+        {
+            Operand = UnresolveExpr(l.Operand, projection),
+            Pattern = UnresolveExpr(l.Pattern, projection),
+            Escape = l.Escape is not null ? UnresolveExpr(l.Escape, projection) : null,
+        },
         _ => expr,
     };
 
