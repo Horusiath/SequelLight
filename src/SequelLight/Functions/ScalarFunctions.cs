@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using SequelLight.Data;
@@ -264,61 +265,118 @@ internal static class ScalarFunctions
     public static DbValue Like(ReadOnlySpan<DbValue> args)
     {
         if (args[0].IsNull || args[1].IsNull) return DbValue.Null;
-        var pattern = Encoding.UTF8.GetString(args[0].AsText().Span);
-        var str = Encoding.UTF8.GetString(args[1].AsText().Span);
-        return DbValue.Integer(LikeMatch(pattern, str) ? 1 : 0);
+        return DbValue.Integer(LikeMatch(args[0].AsText().Span, args[1].AsText().Span) ? 1 : 0);
     }
 
     public static DbValue Glob(ReadOnlySpan<DbValue> args)
     {
         if (args[0].IsNull || args[1].IsNull) return DbValue.Null;
-        var pattern = Encoding.UTF8.GetString(args[0].AsText().Span);
-        var str = Encoding.UTF8.GetString(args[1].AsText().Span);
-        return DbValue.Integer(GlobMatch(pattern, str) ? 1 : 0);
+        return DbValue.Integer(GlobMatch(args[0].AsText().Span, args[1].AsText().Span) ? 1 : 0);
     }
 
     // ---- Pattern matching helpers ----
+    //
+    // Matchers operate on UTF-8 byte spans directly (no per-row string allocation).
+    // LIKE: case-insensitive on ASCII (`A-Z` ↔ `a-z`); other bytes compare exactly. This
+    //       matches SQLite's documented default behavior. `_` advances one UTF-8 codepoint
+    //       in the input; `%` and literal compare are byte-level (correct for valid UTF-8
+    //       since multi-byte sequences only match identical byte sequences).
+    // GLOB: case-sensitive byte-for-byte. `?` advances one UTF-8 codepoint. `[…]` /
+    //       `[^…]` character classes operate on bytes, with hyphen ranges; `]` is treated
+    //       as literal when it appears immediately after `[` or `[^`.
 
-    internal static bool LikeMatch(string pattern, string str, char? escape = null)
+    /// <summary>ASCII-fold helper: maps `A-Z` to `a-z`; all other bytes pass through.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte FoldAscii(byte b) => (b >= (byte)'A' && b <= (byte)'Z') ? (byte)(b + 32) : b;
+
+    /// <summary>Length in bytes of the UTF-8 codepoint starting at <paramref name="lead"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int Utf8CodepointLen(byte lead)
     {
-        // Case-insensitive (ASCII), % = any sequence, _ = any single char.
-        // ESCAPE: when escape char is followed by %, _, or itself, the next char matches literally.
-        var foldedPattern = pattern.ToUpperInvariant();
-        var foldedStr = str.ToUpperInvariant();
-        char? foldedEscape = escape.HasValue ? char.ToUpperInvariant(escape.Value) : null;
-        return LikeMatchRecursive(foldedPattern, 0, foldedStr, 0, foldedEscape);
+        if (lead < 0x80) return 1;
+        if ((lead & 0xE0) == 0xC0) return 2;
+        if ((lead & 0xF0) == 0xE0) return 3;
+        if ((lead & 0xF8) == 0xF0) return 4;
+        return 1; // invalid lead byte — treat as 1 to make forward progress
     }
 
-    private static bool LikeMatchRecursive(string pattern, int pi, string str, int si, char? escape)
+    internal static bool LikeMatch(ReadOnlySpan<byte> pattern, ReadOnlySpan<byte> str, byte? escape = null)
+    {
+        // Pre-fold the pattern once at entry (typically <100 bytes); during the inner
+        // recursion only the input bytes are folded per comparison. Pre-folding the
+        // input would force allocation for long blobs and dominate the deep-backtracking
+        // benchmarks. The pattern fold cost is paid once and the recursion's hot path is
+        // a single-byte fold + compare.
+        Span<byte> foldedPattern = pattern.Length <= 256
+            ? stackalloc byte[pattern.Length]
+            : new byte[pattern.Length];
+        for (int i = 0; i < pattern.Length; i++)
+            foldedPattern[i] = FoldAscii(pattern[i]);
+        byte? foldedEscape = escape.HasValue ? FoldAscii(escape.Value) : null;
+        return LikeMatchRecursive(foldedPattern, 0, str, 0, foldedEscape);
+    }
+
+    private static bool LikeMatchRecursive(ReadOnlySpan<byte> pattern, int pi, ReadOnlySpan<byte> str, int si, byte? escape)
     {
         while (pi < pattern.Length)
         {
-            char pc = pattern[pi];
+            byte pc = pattern[pi];
 
-            // ESCAPE: next char is taken literally
+            // ESCAPE: the next pattern codepoint is taken literally and must match the
+            // input codepoint exactly (case fold applies to ASCII bytes only).
             if (escape.HasValue && pc == escape.Value)
             {
                 pi++;
                 if (pi >= pattern.Length)
                     throw new InvalidOperationException("LIKE pattern: ESCAPE character at end of pattern.");
                 if (si >= str.Length) return false;
-                if (pattern[pi] != str[si]) return false;
-                pi++; si++;
+                int patLen = Utf8CodepointLen(pattern[pi]);
+                int strLen = Utf8CodepointLen(str[si]);
+                if (pi + patLen > pattern.Length || si + strLen > str.Length) return false;
+                if (patLen != strLen) return false;
+                // For ASCII single-byte chars compare folded; multi-byte sequences compare exact.
+                if (patLen == 1)
+                {
+                    if (pattern[pi] != FoldAscii(str[si])) return false;
+                }
+                else
+                {
+                    if (!pattern.Slice(pi, patLen).SequenceEqual(str.Slice(si, strLen))) return false;
+                }
+                pi += patLen;
+                si += strLen;
                 continue;
             }
 
-            if (pc == '%')
+            if (pc == (byte)'%')
             {
                 pi++;
                 if (pi >= pattern.Length) return true;
+                // Try every byte position in str as a candidate match start. Mid-codepoint
+                // positions may briefly be tested but byte-for-byte literal compare ensures
+                // they only succeed when the bytes line up — which only happens at codepoint
+                // boundaries for valid UTF-8.
                 for (int k = si; k <= str.Length; k++)
                     if (LikeMatchRecursive(pattern, pi, str, k, escape)) return true;
                 return false;
             }
+
             if (si >= str.Length) return false;
-            if (pc == '_') { pi++; si++; continue; }
-            if (pc != str[si]) return false;
-            pi++; si++;
+
+            if (pc == (byte)'_')
+            {
+                // Match exactly one UTF-8 codepoint in the input.
+                int strLen = Utf8CodepointLen(str[si]);
+                if (si + strLen > str.Length) return false;
+                pi++;
+                si += strLen;
+                continue;
+            }
+
+            // Pattern is pre-folded; only the input byte needs folding here.
+            if (pc != FoldAscii(str[si])) return false;
+            pi++;
+            si++;
         }
         return si >= str.Length;
     }
@@ -357,18 +415,16 @@ internal static class ScalarFunctions
         return DbValue.Integer(RegexMatch(pattern, str) ? 1 : 0);
     }
 
-    internal static bool GlobMatch(string pattern, string str)
-    {
-        // Case-sensitive, * = any sequence, ? = any single char, [...] not implemented
-        return GlobMatchRecursive(pattern, 0, str, 0);
-    }
+    internal static bool GlobMatch(ReadOnlySpan<byte> pattern, ReadOnlySpan<byte> str)
+        => GlobMatchRecursive(pattern, 0, str, 0);
 
-    private static bool GlobMatchRecursive(string pattern, int pi, string str, int si)
+    private static bool GlobMatchRecursive(ReadOnlySpan<byte> pattern, int pi, ReadOnlySpan<byte> str, int si)
     {
         while (pi < pattern.Length)
         {
-            char pc = pattern[pi];
-            if (pc == '*')
+            byte pc = pattern[pi];
+
+            if (pc == (byte)'*')
             {
                 pi++;
                 if (pi >= pattern.Length) return true;
@@ -376,11 +432,83 @@ internal static class ScalarFunctions
                     if (GlobMatchRecursive(pattern, pi, str, k)) return true;
                 return false;
             }
+
             if (si >= str.Length) return false;
-            if (pc == '?') { pi++; si++; continue; }
+
+            if (pc == (byte)'?')
+            {
+                int strLen = Utf8CodepointLen(str[si]);
+                if (si + strLen > str.Length) return false;
+                pi++;
+                si += strLen;
+                continue;
+            }
+
+            if (pc == (byte)'[')
+            {
+                if (!MatchGlobCharClass(pattern, ref pi, str[si])) return false;
+                si++;
+                continue;
+            }
+
             if (pc != str[si]) return false;
             pi++; si++;
         }
         return si >= str.Length;
+    }
+
+    /// <summary>
+    /// Matches a single byte <paramref name="c"/> against a GLOB character class
+    /// starting at <c>pattern[pi]</c> (the <c>'['</c>). On success, advances <paramref name="pi"/>
+    /// past the closing <c>']'</c>. SQLite grammar: <c>[abc]</c>, <c>[^abc]</c>, <c>[a-z]</c>,
+    /// <c>[]abc]</c> (literal <c>]</c> when first), and a trailing <c>-</c> is literal.
+    /// Ranges and members compare byte-for-byte (correct for ASCII; multi-byte chars
+    /// inside a class are matched only as exact byte sequences, never as codepoints).
+    /// </summary>
+    private static bool MatchGlobCharClass(ReadOnlySpan<byte> pattern, ref int pi, byte c)
+    {
+        int start = pi;
+        pi++; // consume '['
+        if (pi >= pattern.Length) { pi = start; return false; }
+
+        bool negated = pattern[pi] == (byte)'^';
+        if (negated)
+        {
+            pi++;
+            if (pi >= pattern.Length) { pi = start; return false; }
+        }
+
+        bool matched = false;
+        bool firstChar = true;
+        while (pi < pattern.Length)
+        {
+            byte b = pattern[pi];
+
+            // Closing ']' — but allowed as literal when first inside the class
+            if (b == (byte)']' && !firstChar)
+            {
+                pi++;
+                return negated ? !matched : matched;
+            }
+            firstChar = false;
+
+            // Range a-b: only if hyphen has a non-']' char following it
+            if (pi + 2 < pattern.Length && pattern[pi + 1] == (byte)'-' && pattern[pi + 2] != (byte)']')
+            {
+                byte lo = b;
+                byte hi = pattern[pi + 2];
+                if (c >= lo && c <= hi) matched = true;
+                pi += 3;
+            }
+            else
+            {
+                if (c == b) matched = true;
+                pi++;
+            }
+        }
+
+        // Pattern ended without closing ']' — unterminated character class. Roll back.
+        pi = start;
+        return false;
     }
 }

@@ -564,6 +564,151 @@ public class LikeTests : TempDirTest
         Assert.Equal(new[] { 2L }, ids);
     }
 
+    // ---- Phase 3: byte-span matchers, GLOB character classes, UTF-8 ----
+
+    [Fact]
+    public async Task Glob_CharClass_Set()
+    {
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'cat' GLOB '[bc]at'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'bat' GLOB '[bc]at'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'rat' GLOB '[bc]at'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_Range_LowercaseLetters()
+    {
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'a' GLOB '[a-z]'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'm' GLOB '[a-z]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_Range_RejectsOutOfRange()
+    {
+        await using var conn = await OpenConnectionAsync();
+        // GLOB is case-sensitive; uppercase letters are outside [a-z].
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'X' GLOB '[a-z]'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT '?' GLOB '[a-z]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_Range_Digits()
+    {
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT '5' GLOB '[0-9]'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'x' GLOB '[0-9]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_Negated()
+    {
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'rat' GLOB '[^bc]at'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'bat' GLOB '[^bc]at'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'cat' GLOB '[^bc]at'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_RangeAndSet_Combined()
+    {
+        await using var conn = await OpenConnectionAsync();
+        // [a-z0-9] = ranges + multiple ranges concatenated
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'g' GLOB '[a-z0-9]'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT '7' GLOB '[a-z0-9]'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'A' GLOB '[a-z0-9]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_TrailingHyphenLiteral()
+    {
+        await using var conn = await OpenConnectionAsync();
+        // Trailing '-' before ']' is treated as literal '-'
+        Assert.Equal(1L, await QueryLong(conn, "SELECT '-' GLOB '[a-]'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'a' GLOB '[a-]'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'b' GLOB '[a-]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_LiteralClosingBracket_FirstChar()
+    {
+        await using var conn = await OpenConnectionAsync();
+        // ']' as the first char inside [] is treated as literal
+        Assert.Equal(1L, await QueryLong(conn, "SELECT ']' GLOB '[]a]'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'a' GLOB '[]a]'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'b' GLOB '[]a]'"));
+    }
+
+    [Fact]
+    public async Task Glob_CharClass_InWhereClause()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, code TEXT)";
+        await cmd.ExecuteNonQueryAsync();
+        cmd.CommandText = "INSERT INTO t VALUES " +
+            "(1, 'A1'), (2, 'B2'), (3, 'C3'), (4, 'XY'), (5, '99')";
+        await cmd.ExecuteNonQueryAsync();
+
+        cmd.CommandText = "SELECT id FROM t WHERE code GLOB '[A-C][0-9]' ORDER BY id";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var ids = new List<long>();
+        while (await reader.ReadAsync()) ids.Add(reader.GetInt64(0));
+        Assert.Equal(new[] { 1L, 2L, 3L }, ids);
+    }
+
+    // ---- UTF-8 codepoint advance for `_` and `?` ----
+
+    [Fact]
+    public async Task Like_UnderscoreAdvancesOneCodepoint_NonAscii()
+    {
+        // 'café' has 5 bytes (c=0x63, a=0x61, f=0x66, é=0xC3 0xA9) but 4 codepoints.
+        // With '_' meaning "one character", 'caf_' (4 chars) should match 'café'.
+        // The byte-span matcher advances by codepoint for '_'.
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'café' LIKE 'caf_'"));
+        // 'naïve' = 5 codepoints, 6 bytes. Single '_' between 'na' and 've' covers ï.
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'naïve' LIKE 'na_ve'"));
+    }
+
+    [Fact]
+    public async Task Glob_QuestionAdvancesOneCodepoint_NonAscii()
+    {
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'café' GLOB 'caf?'"));
+    }
+
+    [Fact]
+    public async Task Like_AsciiCaseInsensitive_AsciiPart()
+    {
+        // ASCII letter case-insensitivity around a non-ASCII char that's the same
+        // byte sequence on both sides. The non-ASCII byte sequences (0xC3 0xA9 = 'é')
+        // compare exactly while the ASCII letters fold.
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'CAFé' LIKE 'café'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 'café' LIKE 'CAFé'"));
+    }
+
+    [Fact]
+    public async Task Like_NonAsciiNotCaseFolded()
+    {
+        // SQLite default: ASCII letters fold; non-ASCII letters do not. é (0xC3 0xA9)
+        // and É (0xC3 0x89) are different byte sequences and don't match each other
+        // even though their Unicode case-fold would equate them.
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'caféX' LIKE 'CAFéY'"));
+        Assert.Equal(0L, await QueryLong(conn, "SELECT 'cafÉ' LIKE 'café'"));
+    }
+
+    [Fact]
+    public async Task Like_NumericCoercion()
+    {
+        // Numeric values get formatted as text without an intermediate string allocation.
+        await using var conn = await OpenConnectionAsync();
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 12345 LIKE '123%'"));
+        Assert.Equal(1L, await QueryLong(conn, "SELECT 3.14 LIKE '3._4'"));
+    }
+
     [Fact]
     public async Task Match_Throws()
     {

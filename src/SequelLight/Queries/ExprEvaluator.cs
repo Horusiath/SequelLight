@@ -526,31 +526,41 @@ public static class ExprEvaluator
         if (op == LikeOp.Match)
             throw new NotSupportedException("MATCH requires a virtual-table module — not supported.");
 
-        var operandStr = ToText(operand);
-        var patternStr = ToText(pattern);
+        // Pull UTF-8 spans from text/blob values directly. Numeric coercion happens
+        // through a small stack buffer so we never allocate a string per row.
+        Span<byte> opNumBuf = stackalloc byte[32];
+        Span<byte> patNumBuf = stackalloc byte[32];
+        var operandSpan = AsUtf8Span(operand, opNumBuf, out int operandLen);
+        var patternSpan = AsUtf8Span(pattern, patNumBuf, out int patternLen);
+        operandSpan = operandSpan[..operandLen];
+        patternSpan = patternSpan[..patternLen];
 
         bool matched;
         switch (op)
         {
             case LikeOp.Like:
-                char? escChar = null;
+                byte? escByte = null;
                 if (hasEscape)
                 {
-                    var escStr = ToText(escape);
-                    if (escStr.Length != 1)
+                    Span<byte> escNumBuf = stackalloc byte[32];
+                    var escSpan = AsUtf8Span(escape, escNumBuf, out int escLen);
+                    if (escLen != 1)
                         throw new InvalidOperationException(
-                            $"LIKE ESCAPE must be a single character, got {escStr.Length}.");
-                    escChar = escStr[0];
+                            $"LIKE ESCAPE must be a single byte, got {escLen}.");
+                    escByte = escSpan[0];
                 }
-                matched = ScalarFunctions.LikeMatch(patternStr, operandStr, escChar);
+                matched = ScalarFunctions.LikeMatch(patternSpan, operandSpan, escByte);
                 break;
 
             case LikeOp.Glob:
-                matched = ScalarFunctions.GlobMatch(patternStr, operandStr);
+                matched = ScalarFunctions.GlobMatch(patternSpan, operandSpan);
                 break;
 
             case LikeOp.Regexp:
-                matched = ScalarFunctions.RegexMatch(patternStr, operandStr);
+                // Regex needs string input. Allocate only on this path.
+                var patStr = Encoding.UTF8.GetString(patternSpan);
+                var opStr = Encoding.UTF8.GetString(operandSpan);
+                matched = ScalarFunctions.RegexMatch(patStr, opStr);
                 break;
 
             default:
@@ -561,13 +571,38 @@ public static class ExprEvaluator
         return DbValue.Integer(matched ? 1 : 0);
     }
 
-    private static string ToText(DbValue v)
+    /// <summary>
+    /// Returns a UTF-8 byte span view of <paramref name="v"/>. Text/blob values reuse
+    /// their backing memory (no copy). Numeric values are formatted into the caller's
+    /// <paramref name="numericBuf"/> stack span and the written length returned via
+    /// <paramref name="length"/>. Null values produce an empty span.
+    /// </summary>
+    private static ReadOnlySpan<byte> AsUtf8Span(DbValue v, Span<byte> numericBuf, out int length)
     {
-        if (v.Type == DbType.Text) return Encoding.UTF8.GetString(v.AsText().Span);
-        if (v.Type.IsInteger()) return v.AsInteger().ToString(CultureInfo.InvariantCulture);
-        if (v.Type == DbType.Float64) return v.AsReal().ToString(CultureInfo.InvariantCulture);
-        if (v.Type == DbType.Bytes) return Encoding.UTF8.GetString(v.AsBlob().Span);
-        return string.Empty;
+        if (v.Type == DbType.Text)
+        {
+            var span = v.AsText().Span;
+            length = span.Length;
+            return span;
+        }
+        if (v.Type == DbType.Bytes)
+        {
+            var span = v.AsBlob().Span;
+            length = span.Length;
+            return span;
+        }
+        if (v.Type.IsInteger())
+        {
+            v.AsInteger().TryFormat(numericBuf, out length, default, CultureInfo.InvariantCulture);
+            return numericBuf;
+        }
+        if (v.Type == DbType.Float64)
+        {
+            v.AsReal().TryFormat(numericBuf, out length, default, CultureInfo.InvariantCulture);
+            return numericBuf;
+        }
+        length = 0;
+        return ReadOnlySpan<byte>.Empty;
     }
 
     private static ValueTask<DbValue> EvaluateCast(CastExpr cast, DbValue[] row, Projection projection)
