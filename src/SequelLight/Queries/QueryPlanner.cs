@@ -38,16 +38,22 @@ public sealed class QueryPlanner
 {
     private readonly DatabaseSchema _schema;
     private readonly IReadOnlyDictionary<string, DbValue>? _parameters;
+    private readonly int _recursiveCteMaxDepth;
     private DbValue[]? _parameterValues;
     private readonly Stack<Dictionary<string, CteBinding>> _cteScopes = new();
 
-    private readonly record struct CteBinding(LogicalPlan Inner, OrderingTerm[]? OrderBy, string[]? ColumnNames);
+    private abstract record CteBinding;
+    private sealed record InlineCteBinding(LogicalPlan Inner, OrderingTerm[]? OrderBy, string[]? ColumnNames) : CteBinding;
+    private sealed record RecursiveRefCteBinding(string[] ColumnNames, WorkingSetHandle Handle) : CteBinding;
 
-    public QueryPlanner(DatabaseSchema schema, IReadOnlyDictionary<string, DbValue>? parameters = null)
+    public QueryPlanner(DatabaseSchema schema, IReadOnlyDictionary<string, DbValue>? parameters = null, int recursiveCteMaxDepth = 10_000)
     {
         _schema = schema;
         _parameters = parameters;
+        _recursiveCteMaxDepth = recursiveCteMaxDepth;
     }
+
+    internal int RecursiveCteMaxDepth => _recursiveCteMaxDepth;
 
     /// <summary>
     /// Full pipeline for one-shot use (INSERT ... SELECT subqueries).
@@ -164,36 +170,147 @@ public sealed class QueryPlanner
 
     /// <summary>
     /// Pushes a CTE scope on entry to a SELECT with a WITH clause. Each CTE's body is built
-    /// in declaration order so later siblings can reference earlier ones; a CTE is not visible
-    /// inside its own body (non-recursive CTE — RECURSIVE is rejected).
+    /// in declaration order so later siblings can reference earlier ones; a non-recursive
+    /// CTE is not visible inside its own body. When <c>WITH RECURSIVE</c> is set and a CTE
+    /// body self-references, the recursive shape is validated and a <see cref="RecursiveCtePlan"/>
+    /// is constructed; the working-set placeholder is visible only while building the step body.
     /// </summary>
     private void PushCteScope(WithClause with)
     {
-        if (with.Recursive)
-            throw new NotSupportedException("Recursive CTEs are not supported.");
-
         var scope = new Dictionary<string, CteBinding>(StringComparer.OrdinalIgnoreCase);
         _cteScopes.Push(scope);
 
         foreach (var cte in with.Tables)
         {
-            // The MATERIALIZED hint is parsed but ignored — we always inline.
-            var (inner, orderBy) = BuildSelectStmtPlan(cte.Query);
-            if (!scope.TryAdd(cte.Name, new CteBinding(inner, orderBy, cte.ColumnNames)))
+            CteBinding binding;
+            if (with.Recursive && CteBodyReferences(cte.Query, cte.Name))
+                binding = new InlineCteBinding(BuildRecursiveCtePlan(cte), null, null);
+            else
+                binding = BuildInlineCteBinding(cte);
+
+            if (!scope.TryAdd(cte.Name, binding))
                 throw new InvalidOperationException($"Duplicate CTE name '{cte.Name}'.");
         }
     }
 
-    private bool TryGetCte(string name, out CteBinding binding)
+    private InlineCteBinding BuildInlineCteBinding(CommonTableExpression cte)
+    {
+        // The MATERIALIZED hint is parsed but ignored — we always inline.
+        var (inner, orderBy) = BuildSelectStmtPlan(cte.Query);
+        return new InlineCteBinding(inner, orderBy, cte.ColumnNames);
+    }
+
+    private RecursiveCtePlan BuildRecursiveCtePlan(CommonTableExpression cte)
+    {
+        if (cte.ColumnNames is not { Length: > 0 } columnNames)
+            throw new InvalidOperationException(
+                $"Recursive CTE '{cte.Name}' must declare an explicit column list, e.g. 'WITH RECURSIVE {cte.Name}(c1, c2) AS (...)'.");
+
+        var stmt = cte.Query;
+        if (stmt.With is not null)
+            throw new NotSupportedException($"Recursive CTE '{cte.Name}' must not have a nested WITH clause.");
+        if (stmt.OrderBy is { Length: > 0 } || stmt.Limit is not null || stmt.Offset is not null)
+            throw new NotSupportedException(
+                $"Recursive CTE '{cte.Name}' body must not have ORDER BY/LIMIT/OFFSET — apply those on the consuming SELECT instead.");
+
+        if (stmt.Compounds.Length != 1)
+            throw new InvalidOperationException(
+                $"Recursive CTE '{cte.Name}' must have the form '<anchor> UNION [ALL] <recursive-step>'.");
+
+        var op = stmt.Compounds[0].Op;
+        bool unionAll = op switch
+        {
+            CompoundOp.UnionAll => true,
+            CompoundOp.Union => false,
+            _ => throw new InvalidOperationException(
+                $"Recursive CTE '{cte.Name}' must use UNION or UNION ALL — '{op}' is not supported."),
+        };
+
+        if (stmt.First is not SelectCore anchorCore)
+            throw new InvalidOperationException($"Recursive CTE '{cte.Name}' anchor must be a SELECT (not VALUES).");
+        if (stmt.Compounds[0].Body is not SelectCore stepCore)
+            throw new InvalidOperationException($"Recursive CTE '{cte.Name}' recursive step must be a SELECT (not VALUES).");
+
+        // The anchor must not reference the CTE — it's the non-recursive seed.
+        if (SelectCoreReferences(anchorCore, cte.Name))
+            throw new InvalidOperationException(
+                $"Recursive CTE '{cte.Name}': the anchor (left side of UNION) must not reference '{cte.Name}'.");
+
+        // Build anchor — outside the recursive scope so any incidental name match goes to the catalog.
+        var anchorPlan = HeuristicOptimizer.Optimize(BuildLogicalPlan(anchorCore));
+
+        // Build step — push a recursive-ref placeholder so self-references resolve to the
+        // shared working-set handle.
+        var handle = new WorkingSetHandle();
+        var refScope = new Dictionary<string, CteBinding>(StringComparer.OrdinalIgnoreCase)
+        {
+            [cte.Name] = new RecursiveRefCteBinding(columnNames, handle),
+        };
+        LogicalPlan stepPlan;
+        _cteScopes.Push(refScope);
+        try
+        {
+            stepPlan = HeuristicOptimizer.Optimize(BuildLogicalPlan(stepCore));
+        }
+        finally
+        {
+            _cteScopes.Pop();
+        }
+
+        return new RecursiveCtePlan(anchorPlan, stepPlan, cte.Name, columnNames, handle, unionAll, _recursiveCteMaxDepth);
+    }
+
+    private bool TryGetCte(string name, out CteBinding? binding)
     {
         // Stack<T> iterates from top to bottom — innermost scope wins.
         foreach (var scope in _cteScopes)
         {
-            if (scope.TryGetValue(name, out binding))
+            if (scope.TryGetValue(name, out var found))
+            {
+                binding = found;
                 return true;
+            }
         }
-        binding = default;
+        binding = null;
         return false;
+    }
+
+    private static bool CteBodyReferences(SelectStmt stmt, string cteName)
+    {
+        if (stmt.First is SelectCore core && SelectCoreReferences(core, cteName)) return true;
+        foreach (var c in stmt.Compounds)
+            if (c.Body is SelectCore cc && SelectCoreReferences(cc, cteName))
+                return true;
+        return false;
+    }
+
+    private static bool SelectCoreReferences(SelectCore core, string cteName)
+    {
+        return core.From is not null && JoinClauseReferences(core.From, cteName);
+    }
+
+    private static bool JoinClauseReferences(JoinClause join, string cteName)
+    {
+        if (TableOrSubqueryReferences(join.Left, cteName)) return true;
+        foreach (var item in join.Joins)
+            if (TableOrSubqueryReferences(item.Right, cteName))
+                return true;
+        return false;
+    }
+
+    private static bool TableOrSubqueryReferences(TableOrSubquery tos, string cteName)
+    {
+        switch (tos)
+        {
+            case TableRef tr:
+                return tr.Schema is null && string.Equals(tr.Table, cteName, StringComparison.OrdinalIgnoreCase);
+            case SubqueryRef sr:
+                return CteBodyReferences(sr.Query, cteName);
+            case ParenJoinRef pj:
+                return JoinClauseReferences(pj.Join, cteName);
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -394,6 +511,17 @@ public sealed class QueryPlanner
                 return ReferenceEquals(inner, sub.Inner) && ReferenceEquals(orderBy, sub.OrderBy)
                     ? plan : new SubqueryPlan(inner, orderBy, sub.Alias, sub.ColumnNames);
             }
+            case RecursiveCtePlan rec:
+            {
+                var newAnchor = ResolveParameterOrdinals(rec.Anchor, paramMap);
+                var newStep = ResolveParameterOrdinals(rec.RecursiveStep, paramMap);
+                return ReferenceEquals(newAnchor, rec.Anchor) && ReferenceEquals(newStep, rec.RecursiveStep)
+                    ? plan
+                    : new RecursiveCtePlan(newAnchor, newStep, rec.CteName, rec.ColumnNames,
+                        rec.Handle, rec.UnionAll, rec.MaxDepth);
+            }
+            case RecursiveCteRefPlan:
+                return plan; // working-set scan — no expressions to resolve
             default:
                 return plan; // ScanPlan, DualPlan — no expressions
         }
@@ -712,7 +840,12 @@ public sealed class QueryPlanner
         if (tableRef.Schema is null && TryGetCte(tableRef.Table, out var cte))
         {
             var cteAlias = tableRef.Alias ?? tableRef.Table;
-            return new SubqueryPlan(cte.Inner, cte.OrderBy, cteAlias, cte.ColumnNames);
+            return cte switch
+            {
+                InlineCteBinding inline => new SubqueryPlan(inline.Inner, inline.OrderBy, cteAlias, inline.ColumnNames),
+                RecursiveRefCteBinding recRef => new RecursiveCteRefPlan(cteAlias, recRef.ColumnNames, recRef.Handle),
+                _ => throw new InvalidOperationException($"Unknown CTE binding for '{tableRef.Table}'."),
+            };
         }
 
         var table = _schema.GetTable(tableRef.Table)
@@ -793,6 +926,17 @@ public sealed class QueryPlanner
 
             case SubqueryPlan sub:
                 return BuildSubqueryPhysical(sub, tx);
+
+            case RecursiveCtePlan rec:
+                return new RecursiveCteEnumerator(BuildPhysical, rec, tx);
+
+            case RecursiveCteRefPlan recRef:
+            {
+                var names = new QualifiedName[recRef.ColumnNames.Length];
+                for (int i = 0; i < recRef.ColumnNames.Length; i++)
+                    names[i] = new QualifiedName(recRef.Alias, recRef.ColumnNames[i]);
+                return new RecursiveCteRefEnumerator(recRef.Handle, new Projection(names));
+            }
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");
@@ -2413,6 +2557,9 @@ public sealed class QueryPlanner
 
             case SubqueryPlan sub:
                 return (BuildSubqueryPhysical(sub, tx), Array.Empty<SortKey>());
+
+            case RecursiveCtePlan or RecursiveCteRefPlan:
+                return (BuildPhysical(plan, tx), Array.Empty<SortKey>());
 
             default:
                 throw new NotSupportedException($"Logical plan '{plan.GetType().Name}' is not supported.");

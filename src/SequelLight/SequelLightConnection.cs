@@ -13,6 +13,7 @@ public sealed class SequelLightConnection : DbConnection
     private string _directory = string.Empty;
     private int _queryCacheSize = 256;
     private long _operatorMemoryBudgetBytes;
+    private int _recursiveCteMaxDepth = 10_000;
     private Database? _database;
     private ConnectionState _state = ConnectionState.Closed;
 
@@ -37,6 +38,7 @@ public sealed class SequelLightConnection : DbConnection
             _directory = ParseDirectory(_connectionString);
             _queryCacheSize = ParseQueryCacheSize(_connectionString);
             _operatorMemoryBudgetBytes = ParseOperatorMemoryBudget(_connectionString);
+            _recursiveCteMaxDepth = ParseRecursiveCteMaxDepth(_connectionString);
         }
     }
 
@@ -56,7 +58,7 @@ public sealed class SequelLightConnection : DbConnection
         _state = ConnectionState.Connecting;
         try
         {
-            _database = await DatabasePool.Shared.AcquireAsync(_directory, _queryCacheSize, _operatorMemoryBudgetBytes).ConfigureAwait(false);
+            _database = await DatabasePool.Shared.AcquireAsync(_directory, _queryCacheSize, _operatorMemoryBudgetBytes, _recursiveCteMaxDepth).ConfigureAwait(false);
             _state = ConnectionState.Open;
         }
         catch
@@ -219,5 +221,33 @@ public sealed class SequelLightConnection : DbConnection
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Parses the recursive-CTE iteration cap from a connection string. Each iteration of the
+    /// recursive step counts toward this limit; exceeding it throws. Supports
+    /// "Recursive CTE Max Depth=N". Defaults to 10000 when unspecified or unparseable.
+    /// </summary>
+    internal static int ParseRecursiveCteMaxDepth(string connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+            return 10_000;
+
+        foreach (var part in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = part.AsSpan().Trim();
+            var eqIdx = trimmed.IndexOf('=');
+            if (eqIdx < 0) continue;
+
+            var key = trimmed[..eqIdx].Trim();
+            var value = trimmed[(eqIdx + 1)..].Trim();
+
+            if (key.Equals("Recursive CTE Max Depth", StringComparison.OrdinalIgnoreCase))
+            {
+                return int.TryParse(value, out int depth) && depth > 0 ? depth : 10_000;
+            }
+        }
+
+        return 10_000;
     }
 }

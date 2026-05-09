@@ -22,18 +22,20 @@ public sealed class Database : IAsyncDisposable
     private readonly ConcurrentDictionary<string, SqlStmt> _stmtCache = new(StringComparer.Ordinal);
     private bool _schemaDirty;
 
-    internal Database(LsmStore store, string directory, int queryCacheCapacity = 256)
+    internal Database(LsmStore store, string directory, int queryCacheCapacity = 256, int recursiveCteMaxDepth = 10_000)
     {
         _store = store;
         Directory = directory;
         Schema = new DatabaseSchema();
         _queryCache = new QueryCache(queryCacheCapacity);
+        RecursiveCteMaxDepth = recursiveCteMaxDepth;
     }
 
     public string Directory { get; }
     public DatabaseSchema Schema { get; }
     internal LsmStore Store => _store;
     internal bool SchemaDirty => _schemaDirty;
+    internal int RecursiveCteMaxDepth { get; }
 
     public ReadOnlyTransaction BeginReadOnly() => _store.BeginReadOnly();
     public ReadWriteTransaction BeginReadWrite() => _store.BeginReadWrite();
@@ -82,7 +84,7 @@ public sealed class Database : IAsyncDisposable
         var tx = transaction ?? _store.BeginReadOnly();
         try
         {
-            var planner = new QueryPlanner(Schema, parameters);
+            var planner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
             var compiled = planner.Compile(stmt);
             await using var enumerator = compiled is not null
                 ? planner.Execute(compiled, tx)
@@ -395,7 +397,7 @@ public sealed class Database : IAsyncDisposable
             }
 
             // ---- General path: multi-row, INSERT...SELECT, complex expressions, DO UPDATE ----
-            var planner = new QueryPlanner(Schema, parameters);
+            var planner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
             await using var source = planner.Plan(selectSource.Query, rw);
 
             if (source.Projection.ColumnCount != columnMap.Length)
@@ -418,7 +420,7 @@ public sealed class Database : IAsyncDisposable
                 }
                 upsertProjection = new Projection(names);
 
-                var upsertPlanner = new QueryPlanner(Schema, parameters);
+                var upsertPlanner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
                 upsertSetExprs = new SqlExpr[doUpdate.Setters.Length];
                 upsertSetIndices = new int[doUpdate.Setters.Length];
                 for (int i = 0; i < doUpdate.Setters.Length; i++)
@@ -594,7 +596,7 @@ public sealed class Database : IAsyncDisposable
         var scanProjection = new Projection(columnNames);
 
         // Resolve bind parameters and column refs in WHERE and SET expressions
-        var planner = new QueryPlanner(Schema, parameters);
+        var planner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
         SqlExpr? resolvedWhere = stmt.Where is not null
             ? planner.ResolveColumns(planner.ResolveBindParametersFromDict(stmt.Where), scanProjection)
             : null;
@@ -709,7 +711,7 @@ public sealed class Database : IAsyncDisposable
             columnNames[i] = new QualifiedName(null, table.Columns[i].Name);
         var scanProjection = new Projection(columnNames);
 
-        var planner = new QueryPlanner(Schema, parameters);
+        var planner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
         SqlExpr? resolvedWhere = stmt.Where is not null
             ? planner.ResolveColumns(planner.ResolveBindParametersFromDict(stmt.Where), scanProjection)
             : null;
@@ -941,7 +943,7 @@ public sealed class Database : IAsyncDisposable
                 throw new NotSupportedException("EXPLAIN is only supported for SELECT statements.");
 
             using var explainTx = _store.BeginReadOnly();
-            var explainPlanner = new QueryPlanner(Schema, parameters);
+            var explainPlanner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
             await using var physicalPlan = explainPlanner.BuildExplainPlan(explainSelect, explainTx);
             var planRows = PlanFormatter.Format(physicalPlan);
             return new SequelLightDataReader(new ExplainEnumerator(planRows), null);
@@ -954,7 +956,7 @@ public sealed class Database : IAsyncDisposable
         var tx = transaction ?? _store.BeginReadOnly();
         bool ownsTx = transaction is null;
 
-        var planner = new QueryPlanner(Schema, parameters);
+        var planner = new QueryPlanner(Schema, parameters, RecursiveCteMaxDepth);
         IDbEnumerator enumerator;
 
         if (_queryCache.TryGet(sql, out var compiled))
@@ -1008,13 +1010,13 @@ public sealed class DatabasePool
     /// already-open store.
     /// </para>
     /// </summary>
-    internal async ValueTask<Database> AcquireAsync(string directory, int queryCacheCapacity = 256, long operatorMemoryBudgetBytes = 0)
+    internal async ValueTask<Database> AcquireAsync(string directory, int queryCacheCapacity = 256, long operatorMemoryBudgetBytes = 0, int recursiveCteMaxDepth = 10_000)
     {
         var fullPath = Path.GetFullPath(directory);
 
         while (true)
         {
-            var slot = _databases.GetOrAdd(fullPath, path => new DatabaseSlot(path, queryCacheCapacity, operatorMemoryBudgetBytes));
+            var slot = _databases.GetOrAdd(fullPath, path => new DatabaseSlot(path, queryCacheCapacity, operatorMemoryBudgetBytes, recursiveCteMaxDepth));
             var acquired = slot.Acquire();
 
             if (acquired <= 0)
@@ -1065,15 +1067,17 @@ public sealed class DatabasePool
         private readonly string _directory;
         private readonly int _queryCacheCapacity;
         private readonly long _operatorMemoryBudgetBytes;
+        private readonly int _recursiveCteMaxDepth;
         private readonly TaskCompletionSource<Database> _initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _refCount;
         private int _initializing;
 
-        public DatabaseSlot(string directory, int queryCacheCapacity, long operatorMemoryBudgetBytes)
+        public DatabaseSlot(string directory, int queryCacheCapacity, long operatorMemoryBudgetBytes, int recursiveCteMaxDepth)
         {
             _directory = directory;
             _queryCacheCapacity = queryCacheCapacity;
             _operatorMemoryBudgetBytes = operatorMemoryBudgetBytes;
+            _recursiveCteMaxDepth = recursiveCteMaxDepth;
         }
 
         /// <summary>
@@ -1106,7 +1110,7 @@ public sealed class DatabasePool
                         }
                         : new LsmStoreOptions { Directory = _directory };
                     var store = await LsmStore.OpenAsync(options).ConfigureAwait(false);
-                    var db = new Database(store, _directory, _queryCacheCapacity);
+                    var db = new Database(store, _directory, _queryCacheCapacity, _recursiveCteMaxDepth);
                     await db.LoadSchemaAsync().ConfigureAwait(false);
                     _initialized.TrySetResult(db);
                 }

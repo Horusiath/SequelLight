@@ -117,6 +117,74 @@ public sealed class LimitPlan : LogicalPlan
 }
 
 /// <summary>
+/// Mutable handle holding the most recent iteration's rows for a recursive CTE.
+/// Shared between <see cref="RecursiveCtePlan"/> (which writes) and one or more
+/// <see cref="RecursiveCteRefPlan"/> nodes inside the recursive step (which read).
+/// </summary>
+public sealed class WorkingSetHandle
+{
+    /// <summary>
+    /// Current working set rows. Replaced atomically per iteration; reads happen while a step
+    /// physical plan is draining the previous iteration's rows.
+    /// </summary>
+    public List<SequelLight.Data.DbValue[]> Rows { get; set; } = new();
+}
+
+/// <summary>
+/// Drives a recursive CTE via iterative worklist evaluation. The plan tree is bounded:
+/// one anchor sub-plan plus one recursive-step sub-plan. At runtime the anchor produces the
+/// initial working set; subsequent iterations evaluate the step against the previous working
+/// set, terminating when an iteration produces no new rows or <see cref="MaxDepth"/> is hit.
+/// Output rows are streamed — only the most recent working set (and a seen-set for UNION) is held.
+/// </summary>
+public sealed class RecursiveCtePlan : LogicalPlan
+{
+    public LogicalPlan Anchor { get; }
+    public LogicalPlan RecursiveStep { get; }
+    public string CteName { get; }
+    public string[] ColumnNames { get; }
+    public WorkingSetHandle Handle { get; }
+    public bool UnionAll { get; }
+    public int MaxDepth { get; }
+
+    public RecursiveCtePlan(
+        LogicalPlan anchor,
+        LogicalPlan recursiveStep,
+        string cteName,
+        string[] columnNames,
+        WorkingSetHandle handle,
+        bool unionAll,
+        int maxDepth)
+    {
+        Anchor = anchor;
+        RecursiveStep = recursiveStep;
+        CteName = cteName;
+        ColumnNames = columnNames;
+        Handle = handle;
+        UnionAll = unionAll;
+        MaxDepth = maxDepth;
+    }
+}
+
+/// <summary>
+/// Placeholder plan for a self-reference inside a recursive CTE's step body. At physical
+/// build it becomes an enumerator that scans the shared <see cref="WorkingSetHandle"/>.
+/// </summary>
+public sealed class RecursiveCteRefPlan : LogicalPlan
+{
+    public string Alias { get; }
+    public string[] ColumnNames { get; }
+    public WorkingSetHandle Handle { get; }
+
+    public RecursiveCteRefPlan(string alias, string[] columnNames, WorkingSetHandle handle)
+    {
+        Alias = alias;
+        ColumnNames = columnNames;
+        Handle = handle;
+    }
+}
+
+/// <summary>
 /// Wraps an inner SELECT plan so it appears as an aliased relation to the outer query.
 /// At physical build the inner plan executes through the same pipeline used for top-level
 /// queries (so ORDER BY/LIMIT honored), then its output projection is qualified with

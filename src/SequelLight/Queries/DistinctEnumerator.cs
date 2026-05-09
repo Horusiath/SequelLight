@@ -180,33 +180,38 @@ internal sealed class DistinctEnumerator : IDbEnumerator
         await _source.DisposeAsync().ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Immutable snapshot of a row's values for use as a hash set key (in-memory mode only).
-    /// </summary>
-    private readonly struct RowKey : IEquatable<RowKey>
+}
+
+/// <summary>
+/// Immutable snapshot of a row's values for use as a hash set key. Constructor clones the
+/// source array so callers can reuse their row buffer freely.
+/// </summary>
+internal readonly struct RowKey : IEquatable<RowKey>
+{
+    private readonly DbValue[] _values;
+    private readonly int _hash;
+
+    public RowKey(DbValue[] source)
     {
-        private readonly DbValue[] _values;
-        private readonly int _hash;
-
-        public RowKey(DbValue[] source)
-        {
-            _values = new DbValue[source.Length];
-            Array.Copy(source, _values, source.Length);
-            var h = new HashCode();
-            for (int i = 0; i < _values.Length; i++)
-                h.Add(DbValueEqualityComparer.Instance.GetHashCode(_values[i]));
-            _hash = h.ToHashCode();
-        }
-
-        public bool Equals(RowKey other)
-        {
-            if (_values.Length != other._values.Length) return false;
-            for (int i = 0; i < _values.Length; i++)
-                if (DbValueComparer.Compare(_values[i], other._values[i]) != 0) return false;
-            return true;
-        }
-
-        public override bool Equals(object? obj) => obj is RowKey other && Equals(other);
-        public override int GetHashCode() => _hash;
+        _values = new DbValue[source.Length];
+        Array.Copy(source, _values, source.Length);
+        var h = new HashCode();
+        for (int i = 0; i < _values.Length; i++)
+            h.Add(DbValueEqualityComparer.Instance.GetHashCode(_values[i]));
+        _hash = h.ToHashCode();
     }
+
+    /// <summary>The cloned values backing this key. Treat as read-only.</summary>
+    internal DbValue[] Values => _values;
+
+    public bool Equals(RowKey other)
+    {
+        if (_values.Length != other._values.Length) return false;
+        for (int i = 0; i < _values.Length; i++)
+            if (DbValueComparer.Compare(_values[i], other._values[i]) != 0) return false;
+        return true;
+    }
+
+    public override bool Equals(object? obj) => obj is RowKey other && Equals(other);
+    public override int GetHashCode() => _hash;
 }

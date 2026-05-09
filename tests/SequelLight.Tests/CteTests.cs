@@ -171,20 +171,19 @@ public class CteTests : TempDirTest
     }
 
     [Fact]
-    public async Task Recursive_Flag_Rejected()
+    public async Task Recursive_Flag_Without_Self_Reference_Behaves_Like_Inline()
     {
+        // Per SQLite/Postgres: RECURSIVE is permissive — if no CTE in the WITH actually
+        // self-references, the WITH still works as a non-recursive CTE.
         await using var conn = await OpenConnectionAsync();
         await SeedAsync(conn);
 
         var cmd = conn.CreateCommand();
-        cmd.CommandText =
-            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5) " +
-            "SELECT n FROM seq";
-        await Assert.ThrowsAnyAsync<Exception>(async () =>
-        {
-            await using var reader = await cmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync()) { }
-        });
+        cmd.CommandText = "WITH RECURSIVE x AS (SELECT id, name FROM t WHERE id = 2) SELECT * FROM x";
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(2L, reader.GetInt64(0));
+        Assert.Equal("bob", reader.GetString(1));
     }
 
     [Fact]
