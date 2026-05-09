@@ -21,14 +21,8 @@ internal sealed class IndexScan : IDbEnumerator
     private readonly byte[]? _upperBound;
     private bool _seeked;
 
-    // Preallocated decode buffers (reused per row — zero per-row allocation)
-    private readonly int _columnCount;
-    private readonly DbValue[] _pkBuf;
-    private readonly DbValue[] _valueBuf;
-    private readonly ColumnSchema[] _pkColumns;
-    private readonly int[] _pkColumnIndices;
-    private readonly ColumnSchema[] _valueColumns;
-    private readonly int[] _valueColumnOutputIndices;
+    // Shared row-decode state — buffers, column metadata, Current output, Projection.
+    private readonly IndexRowDecoder _decoder;
 
     private const int OidSize = 4;
 
@@ -40,8 +34,8 @@ internal sealed class IndexScan : IDbEnumerator
     internal IndexSchema Index => _index;
     internal TableSchema Table => _table;
 
-    public Projection Projection { get; }
-    public DbValue[] Current { get; }
+    public Projection Projection => _decoder.Projection;
+    public DbValue[] Current => _decoder.Current;
 
     public IndexScan(
         Cursor cursor,
@@ -58,49 +52,13 @@ internal sealed class IndexScan : IDbEnumerator
         _seekPrefix = seekPrefix;
         _upperBound = upperBound;
 
-        _columnCount = table.Columns.Length;
+        _decoder = new IndexRowDecoder(table);
 
-        // Build projection identical to TableScan
-        var names = new QualifiedName[_columnCount];
-        for (int i = 0; i < _columnCount; i++)
-            names[i] = new QualifiedName(null, table.Columns[i].Name);
-        Projection = new Projection(names);
-
-        // Precompute PK and value column metadata
-        int pkCount = 0, valCount = 0;
-        for (int i = 0; i < _columnCount; i++)
-        {
+        // Preallocate table key buffer: oid(4) + max pk bytes (8 per integer PK col + slack for variable).
+        // Sized using the PK column count; derived from the decoder's projection.
+        int pkCount = 0;
+        for (int i = 0; i < table.Columns.Length; i++)
             if (table.Columns[i].IsPrimaryKey) pkCount++;
-            else valCount++;
-        }
-
-        _pkColumnIndices = new int[pkCount];
-        _pkColumns = new ColumnSchema[pkCount];
-        _valueColumns = new ColumnSchema[valCount];
-        _valueColumnOutputIndices = new int[valCount];
-
-        int pk = 0, val = 0;
-        for (int i = 0; i < _columnCount; i++)
-        {
-            if (table.Columns[i].IsPrimaryKey)
-            {
-                _pkColumnIndices[pk] = i;
-                _pkColumns[pk] = table.Columns[i];
-                pk++;
-            }
-            else
-            {
-                _valueColumns[val] = table.Columns[i];
-                _valueColumnOutputIndices[val] = i;
-                val++;
-            }
-        }
-
-        _pkBuf = new DbValue[pkCount];
-        _valueBuf = new DbValue[valCount];
-        Current = new DbValue[_columnCount];
-
-        // Preallocate table key buffer: oid(4) + max pk bytes (8 per integer PK col + slack for variable)
         _tableKeyBuf = new byte[OidSize + pkCount * 16];
         BinaryPrimitives.WriteUInt32BigEndian(_tableKeyBuf, table.Oid.Value);
     }
@@ -164,26 +122,8 @@ internal sealed class IndexScan : IDbEnumerator
             if (rowValue is null)
                 continue;
 
-            // Decode PK columns from table key (schema-aware: tags date PKs as DbValue.DateTime)
-            RowKeyEncoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), out _, _pkBuf, _pkColumns);
-
-            // Decode value columns — zero-copy: text/blob reference the returned byte[]
-            var rowValueMem = (ReadOnlyMemory<byte>)rowValue;
-            ushort storedSlotCount = RowValueEncoder.ReadSlotCount(rowValueMem.Span);
-            RowValueEncoder.Decode(rowValueMem, _valueBuf, _valueColumns);
-
-            // Fill defaults for columns absent from the stored row (added after the row was written).
-            for (int i = 0; i < _valueColumns.Length; i++)
-            {
-                if (_valueBuf[i].IsNull && _valueColumns[i].SeqNo >= storedSlotCount && _valueColumns[i].DefaultValue is { } def)
-                    _valueBuf[i] = Database.EvaluateDefault(def, _valueColumns[i]);
-            }
-
-            // Assemble full row
-            for (int i = 0; i < _pkColumnIndices.Length; i++)
-                Current[_pkColumnIndices[i]] = _pkBuf[i];
-            for (int i = 0; i < _valueColumnOutputIndices.Length; i++)
-                Current[_valueColumnOutputIndices[i]] = _valueBuf[i];
+            // Decode PK from the reconstructed table key + value bytes via the shared decoder.
+            _decoder.Decode(tableKeyBuf.AsSpan(0, tableKeyLen), rowValue.AsMemory());
 
             return true;
         }

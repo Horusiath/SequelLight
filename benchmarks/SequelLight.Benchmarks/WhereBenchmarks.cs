@@ -64,6 +64,22 @@ public class WhereBenchmarks
         tx.CommitAsync().AsTask().GetAwaiter().GetResult();
         tx.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
+        // Secondary indexes on the non-PK columns. Created after data load for parity with
+        // SQLite's setup below — both engines build the index from the existing rows in
+        // bulk rather than maintaining it per-insert.
+        //
+        // NOTE: creating these indexes also has a side effect on the SequelLight numbers
+        // unrelated to indexing: each CREATE INDEX allocates ~10k extra skip-list nodes,
+        // which crosses a Gen0→Gen1 GC threshold and compacts the original 10k row nodes
+        // into a more cache-friendly layout. Sequential scans of the memtable then run
+        // ~4× faster (≈1 ms vs ≈4 ms at 10k rows). A previous "full-scan baseline gap"
+        // measured before these indexes existed was actually a cold-GC layout artifact —
+        // see benchmark_where_secondary_index_2026_04.md.
+        _db.ExecuteNonQueryAsync("CREATE INDEX idx_category ON t(category)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+        _db.ExecuteNonQueryAsync("CREATE INDEX idx_score ON t(score)", null, null)
+            .AsTask().GetAwaiter().GetResult();
+
         // ---- SQLite setup ----
         _sqlite = new SqliteConnection($"Data Source={Path.Combine(_tempDir, "sqlite.db")}");
         _sqlite.Open();
@@ -94,6 +110,14 @@ public class WhereBenchmarks
             }
 
             txn.Commit();
+        }
+
+        // Secondary indexes on the same columns as SequelLight, created after the bulk
+        // load so SQLite builds them in one pass.
+        using (var idxCmd = _sqlite.CreateCommand())
+        {
+            idxCmd.CommandText = "CREATE INDEX idx_category ON t(category); CREATE INDEX idx_score ON t(score)";
+            idxCmd.ExecuteNonQuery();
         }
     }
 
@@ -190,6 +214,124 @@ public class WhereBenchmarks
         return count;
     }
 
+    // ---- Multi-index scan benchmarks (AND → intersection, OR → union) ----
+    // Both queries are equality-only on columns covered by single-column secondary
+    // indexes (idx_category, idx_score) and are designed so the intersection/union path
+    // visibly wins over a single-index scan with residual filter:
+    //   - category = 3: ~1000 matches out of 10k rows (10%).
+    //   - score = 21:   ~10 matches (i*7 % 1000 = 21 → i ∈ {3, 1003, 2003, ...}).
+    //   - score = 7:    ~10 matches (i*7 % 1000 = 7  → i ∈ {1, 1001, 2001, ...}).
+    //
+    // Intersection (category=3 AND score=21): all score=21 rows have i%10=3, so the
+    // intersection is exactly the 10 score=21 rows. Without the intersection path, the
+    // planner picks idx_category first and does ~1000 bookmark lookups.
+    //
+    // Union (category=3 OR score=7): score=7 rows have i%10=1 (no overlap with category=3),
+    // so the union is 1000 + 10 = 1010 distinct rows. Without the union path, the
+    // planner falls through to a full table scan + residual filter.
+
+    [Benchmark(Description = "WHERE two non-pk equality (intersection)")]
+    public async Task<int> Where_Intersection()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category = 3 AND score = 21", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE two non-pk equality (union)")]
+    public async Task<int> Where_Union()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category = 3 OR score = 7", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    // ---- Nested AND/OR shapes (recursive multi-index path) ----
+    // Both queries use only the existing idx_category and idx_score.
+    //
+    // Query 1: (category=3 AND score=21) OR (category=5 AND score=35)
+    //   - Disjunct 1: category=3 AND score=21 → 10 rows (i ∈ {3, 1003, ..., 9003}).
+    //     For these rows i*7 % 1000 = 21 because (3 + 1000k) * 7 = 21 + 7000k ≡ 21 (mod 1000).
+    //   - Disjunct 2: category=5 AND score=35 → 10 rows (i ∈ {5, 1005, ..., 9005}).
+    //   - Union: 20 distinct rows (the two disjuncts don't overlap because the categories differ).
+    //   - Before recursive: top-level OR with nested ANDs → multi-index planner bails →
+    //     full scan + residual filter → ~4 ms / ~400 KB at 10k rows.
+    //   - After recursive: Union(Intersect(idx_cat=3, idx_score=21), Intersect(idx_cat=5, idx_score=35)).
+    //
+    // Query 2: (category=3 OR category=5) AND score=21
+    //   - Same-column OR — currently bails for two reasons (same-column AND nested
+    //     under an AND). Equivalent to `category IN (3,5) AND score=21`.
+    //   - score=21 → 10 rows (i ∈ {3, 1003, ..., 9003}, all with category=3).
+    //   - Intersection of (category=3 OR category=5) with score=21 → 10 rows (only the
+    //     category=3 ones, none of category=5 happen to have score=21).
+    //   - Before recursive: bails → full scan + filter → ~4 ms / ~400 KB.
+    //   - After recursive: Intersect(Union(idx_cat=3, idx_cat=5), idx_score=21).
+    //     Two cursors on idx_category, one on idx_score, sorted-merge intersection.
+
+    [Benchmark(Description = "WHERE nested AND-inside-OR")]
+    public async Task<int> Where_NestedAndInsideOr()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE (category = 3 AND score = 21) OR (category = 5 AND score = 35)",
+            null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE nested OR-inside-AND (same-column OR)")]
+    public async Task<int> Where_NestedOrInsideAnd()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE (category = 3 OR category = 5) AND score = 21",
+            null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    // ---- IN-list benchmarks ----
+    // The IN-list path is the planner-aware variant of same-column OR. The recursive
+    // multi-index planner expands `col IN (v1, v2, ...)` into N union leaves on the
+    // same single-column index — structurally identical to writing the OR by hand.
+    //
+    // - `category IN (3, 5)` alone is the union case (~2000 rows).
+    // - `category IN (3, 5) AND score = 21` exercises the same-column-OR-inside-AND
+    //   shape that's the documented regression: the recursive plan walks the union
+    //   first then intersects with score=21 (10 rows). The IN form should produce
+    //   the SAME plan as the hand-written OR — confirming that IN integration is
+    //   purely a syntactic feature and does NOT fix the regression by itself.
+
+    [Benchmark(Description = "WHERE col IN (v1, v2) — single index")]
+    public async Task<int> Where_InList()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category IN (3, 5)", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
+    [Benchmark(Description = "WHERE col IN (v1, v2) AND other = ? (regression shape)")]
+    public async Task<int> Where_InListAndSelective()
+    {
+        var reader = await _db.ExecuteReaderAsync(
+            "SELECT * FROM t WHERE category IN (3, 5) AND score = 21", null, null);
+        int count = 0;
+        while (await reader.ReadAsync()) count++;
+        await reader.CloseAsync();
+        return count;
+    }
+
     // ---- SQLite baseline benchmarks ----
 
     [Benchmark(Baseline = true, Description = "SQLite: Full scan (no WHERE)")]
@@ -277,6 +419,72 @@ public class WhereBenchmarks
     {
         using var cmd = _sqlite.CreateCommand();
         cmd.CommandText = "SELECT * FROM t WHERE name IS NULL";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE two non-pk equality (intersection)")]
+    public int Sqlite_Where_Intersection()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 3 AND score = 21";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE two non-pk equality (union)")]
+    public int Sqlite_Where_Union()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category = 3 OR score = 7";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE nested AND-inside-OR")]
+    public int Sqlite_Where_NestedAndInsideOr()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE (category = 3 AND score = 21) OR (category = 5 AND score = 35)";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE nested OR-inside-AND (same-column OR)")]
+    public int Sqlite_Where_NestedOrInsideAnd()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE (category = 3 OR category = 5) AND score = 21";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE col IN (v1, v2)")]
+    public int Sqlite_Where_InList()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category IN (3, 5)";
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read()) count++;
+        return count;
+    }
+
+    [Benchmark(Description = "SQLite: WHERE col IN (v1, v2) AND other = ?")]
+    public int Sqlite_Where_InListAndSelective()
+    {
+        using var cmd = _sqlite.CreateCommand();
+        cmd.CommandText = "SELECT * FROM t WHERE category IN (3, 5) AND score = 21";
         using var reader = cmd.ExecuteReader();
         int count = 0;
         while (reader.Read()) count++;

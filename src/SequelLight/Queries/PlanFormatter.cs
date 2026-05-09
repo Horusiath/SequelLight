@@ -37,6 +37,11 @@ internal static class PlanFormatter
                 rows.Add((id, parentId, $"INDEX SCAN {idxScan.Index.Name} ON {idxScan.Table.Name}"));
                 break;
 
+            case Indexes.MultiIndexScan multi:
+                rows.Add((id, parentId, FormatMultiIndexRoot(multi)));
+                VisitPkStream(multi.RootStream, id, rows, multi.Projection);
+                break;
+
             case Filter filter:
                 rows.Add((id, parentId, FormatFilter(filter)));
                 Visit(filter.Source, id, rows);
@@ -123,20 +128,115 @@ internal static class PlanFormatter
 
     private static string FormatScan(TableScan scan)
     {
-        // Check if projection has a qualified table alias that differs from the table name
+        // Discover the optional alias once — used by both the unbounded and the bounded
+        // formatting branches.
+        string? alias = null;
         if (scan.Projection.ColumnCount > 0)
         {
             var qn = scan.Projection.GetQualifiedName(0);
             if (qn.Table is not null && !string.Equals(qn.Table, scan.Table.Name, StringComparison.OrdinalIgnoreCase))
-                return $"SCAN {scan.Table.Name} AS {qn.Table}";
+                alias = qn.Table;
         }
-        return $"SCAN {scan.Table.Name}";
+
+        // Bounded scans (PK seek / PK range) are rendered with SQLite's "SEARCH ... USING"
+        // vocabulary so the EXPLAIN output is directly comparable across the two engines.
+        if (scan.IsBounded)
+        {
+            var sb = new StringBuilder("SEARCH ");
+            sb.Append(scan.Table.Name);
+            if (alias is not null) sb.Append(" AS ").Append(alias);
+            sb.Append(" USING PRIMARY KEY");
+            if (scan.BoundPredicate is not null)
+            {
+                sb.Append(" (");
+                SqlWriter.AppendExpr(sb, UnresolveExpr(scan.BoundPredicate, scan.Projection));
+                sb.Append(')');
+            }
+            return sb.ToString();
+        }
+
+        return alias is not null
+            ? $"SCAN {scan.Table.Name} AS {alias}"
+            : $"SCAN {scan.Table.Name}";
     }
 
     private static string FormatFilter(Filter filter)
     {
         var sb = new StringBuilder("FILTER ");
         SqlWriter.AppendExpr(sb, UnresolveExpr(filter.Predicate, filter.Projection));
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Top-level row for the recursive multi-index scan: <c>MULTI-INDEX SCAN ON t (...)</c>
+    /// where the parenthesized portion is the matched-conjunct predicate (PK bounds plus
+    /// the conjuncts the IPkStream tree consumed). The IPkStream tree itself is rendered
+    /// as child rows by <see cref="VisitPkStream"/>.
+    /// </summary>
+    private static string FormatMultiIndexRoot(Indexes.MultiIndexScan multi)
+    {
+        var sb = new StringBuilder("MULTI-INDEX SCAN ON ");
+        sb.Append(multi.Table.Name);
+        if (multi.BoundPredicate is not null)
+        {
+            sb.Append(" (");
+            SqlWriter.AppendExpr(sb, UnresolveExpr(multi.BoundPredicate, multi.Projection));
+            sb.Append(')');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Recursively walks the IPkStream tree and emits one EXPLAIN row per node.
+    /// Internal nodes (intersection, union) become <c>INDEX INTERSECTION</c> /
+    /// <c>INDEX UNION</c> rows; leaves become <c>INDEX SEEK idx_x ("col" = value)</c>.
+    /// Each child gets <paramref name="parentId"/> as its parent so the tree shape is
+    /// visible in the parent/child relationship column.
+    /// </summary>
+    private static void VisitPkStream(
+        Indexes.IPkStream node,
+        int parentId,
+        List<(int, int, string)> rows,
+        Projection projection)
+    {
+        int id = rows.Count + 1;
+        switch (node)
+        {
+            case Indexes.IndexIntersectionPkStream intersect:
+                rows.Add((id, parentId, "INDEX INTERSECTION"));
+                foreach (var child in intersect.Children)
+                    VisitPkStream(child, id, rows, projection);
+                break;
+
+            case Indexes.IndexUnionPkStream union:
+                rows.Add((id, parentId, "INDEX UNION"));
+                foreach (var child in union.Children)
+                    VisitPkStream(child, id, rows, projection);
+                break;
+
+            case Indexes.IndexLeafPkStream leaf:
+                rows.Add((id, parentId, FormatLeafPkStream(leaf, projection)));
+                break;
+
+            default:
+                rows.Add((id, parentId, node.GetType().Name));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Renders a leaf as <c>INDEX SEEK idx_a ("a" = 1)</c>.
+    /// </summary>
+    private static string FormatLeafPkStream(Indexes.IndexLeafPkStream leaf, Projection projection)
+    {
+        var sb = new StringBuilder("INDEX SEEK ");
+        sb.Append(leaf.Index.Name);
+        if (leaf.BoundPredicate is not null)
+        {
+            sb.Append(" (");
+            SqlWriter.AppendExpr(sb, UnresolveExpr(leaf.BoundPredicate, projection));
+            sb.Append(')');
+        }
         return sb.ToString();
     }
 
@@ -256,9 +356,22 @@ internal static class PlanFormatter
             Low = UnresolveExpr(bt.Low, projection),
             High = UnresolveExpr(bt.High, projection),
         },
+        InExpr inExpr => UnresolveIn(inExpr, projection),
         CastExpr c => c with { Operand = UnresolveExpr(c.Operand, projection) },
         _ => expr,
     };
+
+    private static InExpr UnresolveIn(InExpr inExpr, Projection projection)
+    {
+        var operand = UnresolveExpr(inExpr.Operand, projection);
+        if (inExpr.Target is not InExprList list)
+            return inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        for (int i = 0; i < list.Expressions.Length; i++)
+            elements[i] = UnresolveExpr(list.Expressions[i], projection);
+        return new InExpr(operand, inExpr.Negated, new InExprList(elements));
+    }
 
     private static LiteralExpr UnresolveLiteral(DbValue value)
     {

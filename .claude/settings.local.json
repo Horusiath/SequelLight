@@ -10,7 +10,8 @@
       "Bash(grep:*)",
       "Bash(ls:*)",
       "WebSearch",
-      "Bash(dotnet build:*)"
+      "Bash(dotnet build:*)",
+      "Bash(dotnet run:*)"
     ]
   }
 }

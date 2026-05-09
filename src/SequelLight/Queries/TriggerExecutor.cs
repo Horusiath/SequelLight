@@ -239,8 +239,21 @@ internal static class TriggerExecutor
                 Low = ResolveExpr(bt.Low, table, oldRow, newRow),
                 High = ResolveExpr(bt.High, table, oldRow, newRow),
             },
+            InExpr inExpr => ResolveInExpr(inExpr, table, oldRow, newRow),
             CastExpr c => c with { Operand = ResolveExpr(c.Operand, table, oldRow, newRow) },
             _ => expr,
         };
+    }
+
+    private static InExpr ResolveInExpr(InExpr inExpr, TableSchema table, DbValue[]? oldRow, DbValue[]? newRow)
+    {
+        var operand = ResolveExpr(inExpr.Operand, table, oldRow, newRow);
+        if (inExpr.Target is not InExprList list)
+            return inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        for (int i = 0; i < list.Expressions.Length; i++)
+            elements[i] = ResolveExpr(list.Expressions[i], table, oldRow, newRow);
+        return new InExpr(operand, inExpr.Negated, new InExprList(elements));
     }
 }

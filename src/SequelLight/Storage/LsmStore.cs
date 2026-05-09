@@ -26,6 +26,15 @@ public sealed class LsmStoreOptions
     /// Modeled after Postgres <c>work_mem</c>.
     /// </summary>
     public long OperatorMemoryBudgetBytes { get; init; } = 16 * 1024 * 1024; // 16 MiB
+
+    /// <summary>
+    /// Compression codec applied to data blocks in main-LSM SSTables (memtable flushes and
+    /// compaction output). Defaults to <see cref="CompressionCodec.Lz4"/> for reasonable
+    /// on-disk size savings with cheap decode. Spill SSTables ignore this setting and are
+    /// always written uncompressed — they're short-lived scan-only files where the
+    /// per-block decompression overhead isn't worth the space savings.
+    /// </summary>
+    public CompressionCodec BlockCompression { get; init; } = CompressionCodec.Lz4;
 }
 
 /// <summary>
@@ -452,7 +461,8 @@ public sealed class LsmStore : IAsyncDisposable
         int fileId = Interlocked.Increment(ref _nextFileId);
         string sstPath = Path.Combine(_options.Directory, $"{fileId:D10}_L0.sst");
 
-        await using (var writer = SSTableWriter.Create(sstPath, _options.SSTableBlockSize))
+        await using (var writer = SSTableWriter.Create(sstPath, _options.SSTableBlockSize,
+            compressionCodec: _options.BlockCompression))
         {
             foreach (var kvp in frozen.GetEntries())
                 await writer.WriteEntryAsync(kvp.Key, kvp.Value.Value).ConfigureAwait(false);
@@ -533,7 +543,8 @@ public sealed class LsmStore : IAsyncDisposable
         }
 
         await using (var merger = KWayMerger<byte[], ReadOnlyMemory<byte>>.Create(sources, KeyComparer.Instance))
-        await using (var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize))
+        await using (var writer = SSTableWriter.Create(outputPath, _options.SSTableBlockSize,
+            compressionCodec: _options.BlockCompression))
         {
             while (await merger.MoveNextAsync().ConfigureAwait(false))
             {
@@ -849,25 +860,27 @@ public sealed class ReadWriteTransaction : ReadOnlyTransaction
         }
         else
         {
-            // In-memory commit path: iterate the in-memory map to build the legacy mutations
-            // + walWrites lists and let the existing CommitAsync apply them to the memtable.
-            // Sequence numbers are assigned per unique key — overwrites within the txn don't
-            // bump the counter.
-            var memory = _spill.Memory;
-            var walWrites = new List<(byte[], byte[]?)>(memory.Count);
-            var mutations = new List<(byte[], MemEntry)>(memory.Count);
+            // In-memory commit path: iterate the in-memory entries (sorted on demand by
+            // SpillBuffer) to build the legacy mutations + walWrites lists and let the
+            // existing CommitAsync apply them to the memtable. Sequence numbers are
+            // assigned per unique key — the SpillBuffer's hash dedup index has already
+            // collapsed in-txn overwrites into one entry per key.
+            var memory = _spill.SortedInMemorySpan();
+            var walWrites = new List<(byte[], byte[]?)>(memory.Length);
+            var mutations = new List<(byte[], MemEntry)>(memory.Length);
             int sizeDelta = 0;
             long seq = 0;
-            foreach (var kvp in memory)
+            for (int i = 0; i < memory.Length; i++)
             {
-                walWrites.Add((kvp.Key, kvp.Value));
-                mutations.Add((kvp.Key, new MemEntry(kvp.Value, ++seq)));
+                ref readonly var entry = ref memory[i];
+                walWrites.Add((entry.Key, entry.Value));
+                mutations.Add((entry.Key, new MemEntry(entry.Value, ++seq)));
 
                 // Adjust the memtable's approximate-size counter for any pre-existing entry
                 // that this txn replaces or deletes.
-                if (Snapshot.TryGetValue(kvp.Key, out var existing))
-                    sizeDelta -= kvp.Key.Length + (existing.Value?.Length ?? 0);
-                sizeDelta += kvp.Key.Length + (kvp.Value?.Length ?? 0);
+                if (Snapshot.TryGetValue(entry.Key, out var existing))
+                    sizeDelta -= entry.Key.Length + (existing.Value?.Length ?? 0);
+                sizeDelta += entry.Key.Length + (entry.Value?.Length ?? 0);
             }
 
             await Store.CommitAsync(mutations, walWrites, sizeDelta).ConfigureAwait(false);

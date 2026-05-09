@@ -563,10 +563,27 @@ public sealed class QueryPlanner
                 Low = ResolveParamExpr(bt.Low, paramMap)!,
                 High = ResolveParamExpr(bt.High, paramMap)!,
             },
+            InExpr inExpr => ResolveParamExprInIn(inExpr, paramMap),
             CastExpr c => c with { Operand = ResolveParamExpr(c.Operand, paramMap)! },
             FunctionCallExpr func => ResolveParamExprInFunction(func, paramMap),
             _ => expr,
         };
+    }
+
+    private static InExpr ResolveParamExprInIn(InExpr inExpr, Dictionary<string, int> paramMap)
+    {
+        var operand = ResolveParamExpr(inExpr.Operand, paramMap)!;
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = ResolveParamExpr(list.Expressions[i], paramMap)!;
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     private static FunctionCallExpr ResolveParamExprInFunction(FunctionCallExpr func, Dictionary<string, int> paramMap)
@@ -801,6 +818,12 @@ public sealed class QueryPlanner
             BinaryExpr b => ContainsAggregateExpr(b.Left) || ContainsAggregateExpr(b.Right),
             UnaryExpr u => ContainsAggregateExpr(u.Operand),
             CastExpr c => ContainsAggregateExpr(c.Operand),
+            BetweenExpr bt => ContainsAggregateExpr(bt.Operand)
+                || ContainsAggregateExpr(bt.Low) || ContainsAggregateExpr(bt.High),
+            InExpr inExpr => ContainsAggregateExpr(inExpr.Operand)
+                || (inExpr.Target is InExprList inList && inList.Expressions.Any(ContainsAggregateExpr)),
+            IsExpr i => ContainsAggregateExpr(i.Left) || ContainsAggregateExpr(i.Right),
+            NullTestExpr n => ContainsAggregateExpr(n.Operand),
             _ => false,
         };
     }
@@ -921,13 +944,56 @@ public sealed class QueryPlanner
 
             case FilterPlan filter:
             {
-                // Try index scan when filtering a table scan
-                if (filter.Source is ScanPlan scanForIndex && scanForIndex.Table.IndexCount > 0)
+                // Dispatch order (rationale in comments):
+                //   1. PK point seek — when the whole PK is pinned by equality, this is
+                //      guaranteed to return at most one row and always beats anything else.
+                //   2. Multi-index scan (intersection/union) — when the shape fits AND no
+                //      single composite index covers the matched equalities. PK range
+                //      conjuncts become pre-lookup filters inside the operator (the InnoDB
+                //      rule), so multi-index and TryBuildPrimaryKeyScan don't compete for
+                //      the same PK predicates.
+                //   3. Single secondary index scan — composite-aware path for cases the
+                //      multi-index path either can't handle or deferred to composites.
+                //   4. PK range bounded scan — when only PK range predicates are present.
+                //   5. Fallback: full scan + filter.
+
+                if (filter.Source is ScanPlan scanForPk)
                 {
-                    var indexResult = TryBuildIndexScan(scanForIndex, filter, tx);
-                    if (indexResult is not null)
-                        return indexResult;
+                    // 1. PK fully pinned → point seek wins unconditionally.
+                    if (HasFullPkEqualityMatch(filter.Predicate, scanForPk.Table))
+                    {
+                        var pkResult = TryBuildPrimaryKeyScan(scanForPk, filter, tx);
+                        if (pkResult is not null)
+                            return pkResult;
+                    }
+
+                    // 2. Multi-index intersection / union (recursive). The recursive
+                    //    plan can fire even with a single secondary index when the WHERE
+                    //    has multiple equality predicates on the same indexed column
+                    //    (e.g., `a = 1 OR a = 2` becomes a Union over two leaves on the
+                    //    same index — correct, though suboptimal vs an IN-list seek).
+                    if (scanForPk.Table.IndexCount >= 1)
+                    {
+                        var multi = TryBuildMultiIndexScan(scanForPk, filter, tx);
+                        if (multi is not null)
+                            return multi;
+                    }
+
+                    // 3. Single secondary index scan (composite-aware).
+                    if (scanForPk.Table.IndexCount > 0)
+                    {
+                        var indexResult = TryBuildIndexScan(scanForPk, filter, tx);
+                        if (indexResult is not null)
+                            return indexResult;
+                    }
+
+                    // 4. PK range bounded scan (partial PK match, no multi-index match).
+                    var pkRange = TryBuildPrimaryKeyScan(scanForPk, filter, tx);
+                    if (pkRange is not null)
+                        return pkRange;
                 }
+
+                // 5. Fallback: full scan + filter.
                 var child = BuildPhysical(filter.Source, tx);
                 var resolved = ResolveColumnsSync(filter.Predicate, child.Projection, tx);
                 return new Filter(child, resolved);
@@ -1427,6 +1493,1051 @@ public sealed class QueryPlanner
     }
 
     /// <summary>
+    /// Tries to convert a WHERE filter on a table scan into a bounded <see cref="TableScan"/>
+    /// that uses the primary key for an exact-row seek or a key-range scan, instead of
+    /// scanning every row in the table and applying the filter.
+    /// <para>
+    /// Matches a leading run of equality conjuncts on PK columns; if every PK column has an
+    /// equality predicate the result is a single-row point seek. If the equality run stops
+    /// short and the next PK column has a comparison conjunct (<c>&lt;</c>, <c>&lt;=</c>,
+    /// <c>&gt;</c>, <c>&gt;=</c>), that becomes a half-/closed range. Conjuncts that don't
+    /// participate in the bound are kept as a residual <see cref="Filter"/> wrapping the
+    /// bounded scan.
+    /// </para>
+    /// </summary>
+    private IDbEnumerator? TryBuildPrimaryKeyScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        table.EnsureEncodingMetadata();
+        var pkIndices = table.PkColumnIndices;
+        var pkTypes = table.PkColumnTypes;
+        if (pkIndices.Length == 0)
+            return null;
+
+        // Build a projection over the table columns so the conjunct extractors can resolve
+        // column references.
+        var names = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(names);
+
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+
+        // Phase 1: leading equality match against the PK column prefix.
+        var eqValues = new DbValue[pkIndices.Length];
+        int eqMatched = 0;
+        // Tracks conjunct indices that have been folded into the bound (so they don't end
+        // up in the residual Filter).
+        Span<bool> usedConjuncts = conjuncts.Count <= 32
+            ? stackalloc bool[conjuncts.Count]
+            : new bool[conjuncts.Count];
+
+        for (int pk = 0; pk < pkIndices.Length; pk++)
+        {
+            var pkColName = table.Columns[pkIndices[pk]].Name;
+            bool found = false;
+            for (int ci = 0; ci < conjuncts.Count; ci++)
+            {
+                if (usedConjuncts[ci]) continue;
+                if (TryExtractEquality(conjuncts[ci], pkColName, scanProjection, out var value))
+                {
+                    if (TypeAffinity.IsDateAffinity(table.Columns[pkIndices[pk]].TypeName) &&
+                        value.Type == DbType.Text &&
+                        DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                    {
+                        value = DbValue.Integer(ticks);
+                    }
+                    if (!CanEncodeAsPkValue(value, pkTypes[pk]))
+                        return null;
+                    eqValues[eqMatched] = value;
+                    usedConjuncts[ci] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break;
+            eqMatched++;
+        }
+
+        // Phase 2: optional range conjuncts on the column right after the equality prefix.
+        // We accept up to two range conjuncts (e.g. `id >= lo AND id < hi`) on the same
+        // column, and combine them into [lower, upper) bounds.
+        DbValue? rangeLowValue = null;
+        bool rangeLowInclusive = true;
+        DbValue? rangeHighValue = null;
+        bool rangeHighInclusive = false;
+        DbType rangeColType = default;
+
+        if (eqMatched < pkIndices.Length)
+        {
+            int rangePkOrdinal = eqMatched;
+            var rangeColName = table.Columns[pkIndices[rangePkOrdinal]].Name;
+            rangeColType = pkTypes[rangePkOrdinal];
+
+            for (int ci = 0; ci < conjuncts.Count; ci++)
+            {
+                if (usedConjuncts[ci]) continue;
+                if (!TryExtractComparison(conjuncts[ci], rangeColName, scanProjection,
+                        out var op, out var rhs))
+                    continue;
+
+                if (TypeAffinity.IsDateAffinity(table.Columns[pkIndices[rangePkOrdinal]].TypeName) &&
+                    rhs.Type == DbType.Text &&
+                    DateTimeHelper.TryParseToTicks(rhs.AsText().Span, out long ticks))
+                {
+                    rhs = DbValue.Integer(ticks);
+                }
+                if (!CanEncodeAsPkValue(rhs, rangeColType))
+                    continue;
+
+                switch (op)
+                {
+                    case BinaryOp.GreaterEqual:
+                        if (rangeLowValue is null || DbValueComparer.Compare(rhs, rangeLowValue.Value) > 0)
+                        { rangeLowValue = rhs; rangeLowInclusive = true; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.GreaterThan:
+                        if (rangeLowValue is null || DbValueComparer.Compare(rhs, rangeLowValue.Value) >= 0)
+                        { rangeLowValue = rhs; rangeLowInclusive = false; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.LessEqual:
+                        if (rangeHighValue is null || DbValueComparer.Compare(rhs, rangeHighValue.Value) < 0)
+                        { rangeHighValue = rhs; rangeHighInclusive = true; }
+                        usedConjuncts[ci] = true;
+                        break;
+                    case BinaryOp.LessThan:
+                        if (rangeHighValue is null || DbValueComparer.Compare(rhs, rangeHighValue.Value) <= 0)
+                        { rangeHighValue = rhs; rangeHighInclusive = false; }
+                        usedConjuncts[ci] = true;
+                        break;
+                }
+            }
+        }
+
+        bool haveBounds = eqMatched > 0 || rangeLowValue is not null || rangeHighValue is not null;
+        if (!haveBounds)
+            return null;
+
+        // Build the encoded bounds. The lower bound replaces the table-prefix seek; the
+        // upper bound is exclusive (so callers can express inclusive semantics by appending
+        // a single 0x00 byte to lex-order successor — works for any encoded type because
+        // every encoded column ends in a non-extending byte).
+        byte[] lowerBound;
+        byte[]? upperBound;
+
+        if (eqMatched == pkIndices.Length)
+        {
+            // Full equality match → single-row point seek.
+            lowerBound = RowKeyEncoder.Encode(table.Oid, eqValues, pkTypes);
+            upperBound = LexSuccessor(lowerBound);
+        }
+        else
+        {
+            // Partial prefix (eqMatched columns) plus optional range on the next column.
+            // Build the encoded equality prefix once and append the range bounds (or, when
+            // no range is present, use the prefix as both lower and (lex-successor) upper
+            // — this gives a "scan all rows whose first eqMatched PK columns equal these
+            // values" half-open range.
+            var eqPrefixTypes = pkTypes.AsSpan(0, eqMatched);
+            var eqPrefixValues = eqValues.AsSpan(0, eqMatched);
+            var prefixBytes = RowKeyEncoder.Encode(table.Oid, eqPrefixValues, eqPrefixTypes);
+
+            if (rangeLowValue is null && rangeHighValue is null)
+            {
+                // Pure equality prefix on a composite PK — bound the scan to "all rows
+                // sharing this leading-key prefix" via the lex successor.
+                lowerBound = prefixBytes;
+                upperBound = LexSuccessor(prefixBytes);
+            }
+            else
+            {
+                lowerBound = rangeLowValue is { } lv
+                    ? AppendEncodedColumn(prefixBytes, lv, rangeColType, rangeLowInclusive)
+                    : prefixBytes;
+
+                if (rangeHighValue is { } hv)
+                {
+                    upperBound = AppendEncodedColumnUpper(prefixBytes, hv, rangeColType, rangeHighInclusive);
+                }
+                else if (eqMatched > 0)
+                {
+                    // Open-ended high bound but the equality prefix still bounds us to
+                    // rows that share those leading PK values.
+                    upperBound = LexSuccessor(prefixBytes);
+                }
+                else
+                {
+                    // Open-ended high bound and no equality prefix — rely on TableScan's
+                    // built-in Oid-prefix termination to stop at the next table.
+                    upperBound = null;
+                }
+            }
+        }
+
+        // Build a "matched predicate" from the conjuncts we folded — purely for EXPLAIN,
+        // so users can tell which part of the WHERE was rolled into the seek bounds.
+        var matchedConjuncts = new List<SqlExpr>();
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (usedConjuncts[i]) matchedConjuncts.Add(conjuncts[i]);
+        var boundPredicate = matchedConjuncts.Count > 0
+            ? HeuristicOptimizer.CombineAnd(matchedConjuncts)
+            : null;
+
+        var cursor = tx.CreateCursor();
+        var bounded = new TableScan(cursor, table, lowerBound, upperBound, boundPredicate);
+
+        // Build the residual filter from any conjunct we didn't fold into the bound.
+        int residualCount = 0;
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (!usedConjuncts[i]) residualCount++;
+
+        if (residualCount == 0)
+            return bounded;
+
+        var residuals = new List<SqlExpr>(residualCount);
+        for (int i = 0; i < conjuncts.Count; i++)
+            if (!usedConjuncts[i]) residuals.Add(conjuncts[i]);
+        var residual = HeuristicOptimizer.CombineAnd(residuals);
+        var resolved = ResolveColumns(residual, bounded.Projection);
+        return new Filter(bounded, resolved);
+    }
+
+    /// <summary>
+    /// Returns true if a constant value can be safely encoded as a PK key column of the
+    /// given declared type. Filters out type mismatches that would otherwise throw inside
+    /// the encoder (e.g. text constant against an INTEGER PK).
+    /// </summary>
+    private static bool CanEncodeAsPkValue(DbValue value, DbType pkType)
+    {
+        if (value.IsNull) return false;
+        if (pkType.IsInteger()) return value.Type.IsInteger();
+        if (pkType == DbType.Float64) return value.Type == DbType.Float64 || value.Type.IsInteger();
+        if (pkType.IsVariableLength()) return value.Type.IsVariableLength();
+        return false;
+    }
+
+    /// <summary>
+    /// Appends a single 0x00 byte to <paramref name="key"/> to produce a byte sequence that
+    /// is lexicographically greater than the original but less than any longer key sharing
+    /// the same prefix that has a non-zero next byte. Combined with the row encoding's
+    /// fixed-length integer/float columns and length-prefixed variable columns this works
+    /// as a universal exclusive successor.
+    /// </summary>
+    private static byte[] LexSuccessor(byte[] key)
+    {
+        var result = new byte[key.Length + 1];
+        Buffer.BlockCopy(key, 0, result, 0, key.Length);
+        return result;
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="value"/> as the next PK column of <paramref name="prefix"/>
+    /// and returns the new key. Used to build the lower bound of a range scan; if the
+    /// caller's predicate was strict (<c>&gt;</c>) the result is bumped via
+    /// <see cref="LexSuccessor"/> so seek skips the equal row.
+    /// </summary>
+    private static byte[] AppendEncodedColumn(byte[] prefix, DbValue value, DbType type, bool inclusive)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+        return inclusive ? combined : LexSuccessor(combined);
+    }
+
+    /// <summary>
+    /// Encodes <paramref name="value"/> as the next PK column of <paramref name="prefix"/>
+    /// and returns it as the exclusive upper bound: the encoded key for an exclusive bound
+    /// (<c>&lt;</c>), or the encoded key plus a sentinel byte for an inclusive bound
+    /// (<c>&lt;=</c>).
+    /// </summary>
+    private static byte[] AppendEncodedColumnUpper(byte[] prefix, DbValue value, DbType type, bool inclusive)
+    {
+        int colSize = RowKeyEncoder.ColumnKeySize(value, type);
+        var combined = new byte[prefix.Length + colSize];
+        Buffer.BlockCopy(prefix, 0, combined, 0, prefix.Length);
+        RowKeyEncoder.EncodeColumn(combined.AsSpan(prefix.Length), value, type);
+        return inclusive ? LexSuccessor(combined) : combined;
+    }
+
+    /// <summary>
+    /// Recognizes a binary comparison `column &lt; constant`, `column &gt; constant`, etc.
+    /// Returns the operator with the column normalized to the left-hand side, swapping the
+    /// operator direction when the literal is on the left.
+    /// </summary>
+    private static bool TryExtractComparison(SqlExpr expr, string columnName, Projection projection,
+        out BinaryOp op, out DbValue value)
+    {
+        op = default;
+        value = default;
+        if (expr is not BinaryExpr be) return false;
+        if (be.Op is not (BinaryOp.LessThan or BinaryOp.LessEqual
+                          or BinaryOp.GreaterThan or BinaryOp.GreaterEqual))
+            return false;
+
+        // column op constant
+        if (be.Left is ColumnRefExpr colL &&
+            string.Equals(colL.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            be.Right is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = be.Right is ResolvedLiteralExpr rl
+                ? rl.Value
+                : ExprEvaluator.EvaluateLiteral((LiteralExpr)be.Right);
+            op = be.Op;
+            return true;
+        }
+
+        // constant op column → flip the operator so the column is conceptually on the left
+        if (be.Right is ColumnRefExpr colR &&
+            string.Equals(colR.Column, columnName, StringComparison.OrdinalIgnoreCase) &&
+            be.Left is LiteralExpr or ResolvedLiteralExpr)
+        {
+            value = be.Left is ResolvedLiteralExpr rl2
+                ? rl2.Value
+                : ExprEvaluator.EvaluateLiteral((LiteralExpr)be.Left);
+            op = be.Op switch
+            {
+                BinaryOp.LessThan => BinaryOp.GreaterThan,
+                BinaryOp.LessEqual => BinaryOp.GreaterEqual,
+                BinaryOp.GreaterThan => BinaryOp.LessThan,
+                BinaryOp.GreaterEqual => BinaryOp.LessEqual,
+                _ => be.Op,
+            };
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether every PK column of <paramref name="table"/> is bound by an equality
+    /// predicate somewhere in <paramref name="predicate"/>. When true, a PK point seek
+    /// via <see cref="TryBuildPrimaryKeyScan"/> is guaranteed to return at most one row
+    /// and should always win — the multi-index path runs only when the PK is not fully
+    /// pinned (mirroring the InnoDB / SQL Server convention where a full PK equality
+    /// short-circuits everything else).
+    /// </summary>
+    private static bool HasFullPkEqualityMatch(SqlExpr predicate, TableSchema table)
+    {
+        table.EnsureEncodingMetadata();
+        var pkIndices = table.PkColumnIndices;
+        if (pkIndices.Length == 0) return false;
+
+        var names = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        var projection = new Projection(names);
+
+        var conjuncts = HeuristicOptimizer.SplitAnd(predicate);
+        for (int pk = 0; pk < pkIndices.Length; pk++)
+        {
+            var pkColName = table.Columns[pkIndices[pk]].Name;
+            bool found = false;
+            for (int ci = 0; ci < conjuncts.Count; ci++)
+            {
+                if (TryExtractEquality(conjuncts[ci], pkColName, projection, out _))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Tries to build a multi-index scan from a <see cref="FilterPlan"/> over a
+    /// <see cref="ScanPlan"/>. Returns null if the shape doesn't fit or a single index
+    /// would cover the predicate better.
+    /// <para>
+    /// Recursive: AND/OR can nest arbitrarily over <c>col = literal</c> leaves on
+    /// secondary indexes. The result is a tree of <see cref="IPkStream"/> nodes
+    /// (<see cref="IndexLeafPkStream"/>, <see cref="IndexIntersectionPkStream"/>,
+    /// <see cref="IndexUnionPkStream"/>) wrapped by a single
+    /// <see cref="MultiIndexScan"/> operator that does one bookmark lookup per yielded PK.
+    /// </para>
+    /// <para>
+    /// PK conjuncts on the primary key are extracted at the TOP level only (the InnoDB
+    /// rule: never intersection inputs, only filter-only bounds). Anything not consumed
+    /// by the IPkStream tree or the PK bounds becomes a residual <see cref="Filter"/>
+    /// wrapper.
+    /// </para>
+    /// <para>
+    /// TODO: PK predicates that appear inside nested OR/AND structures (rather than at
+    /// the top level of the WHERE) are not currently consumed. The recursive descent
+    /// bails as soon as it sees a PK column reference. Lifting this would need a
+    /// "PkSeekPkStream" leaf so PK conditions can become first-class participants in
+    /// the recursive tree alongside secondary-index leaves.
+    /// </para>
+    /// </summary>
+    private IDbEnumerator? TryBuildMultiIndexScan(ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+        => TryBuildMultiIndexScanWithOrder(scan, filter, tx)?.Enumerator;
+
+    private (IDbEnumerator Enumerator, SortKey[] ProvidedOrder)? TryBuildMultiIndexScanWithOrder(
+        ScanPlan scan, FilterPlan filter, ReadOnlyTransaction tx)
+    {
+        var table = scan.Table;
+        table.EnsureEncodingMetadata();
+
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        if (indexes.Count == 0)
+            return null;
+
+        var names = new QualifiedName[table.Columns.Length];
+        for (int i = 0; i < table.Columns.Length; i++)
+            names[i] = new QualifiedName(null, table.Columns[i].Name);
+        var scanProjection = new Projection(names);
+
+        // Phase 1: split top-level AND, separate PK-bound conjuncts (filter-only) from
+        // the rest. PK bounds are computed once here and passed to the operator wrapper —
+        // they never participate in the recursive tree.
+        var conjuncts = HeuristicOptimizer.SplitAnd(filter.Predicate);
+        var pkBoundUsed = new bool[conjuncts.Count];
+        var pkRangeBounds = ExtractPkRangeBounds(table, conjuncts, scanProjection, pkBoundUsed);
+
+        // Phase 2: classify each non-PK conjunct as either consumable (we can build a
+        // PkStream from it) or residual (post-bookmark filter). The dry-run accumulates
+        // a flat list of leaves so we can apply the leaf-count and composite-preference
+        // guards before allocating any cursors.
+        var consumableConjuncts = new List<int>();
+        var residualConjunctIdxs = new List<int>();
+        var allLeaves = new List<MultiIndexLeaf>();
+
+        for (int ci = 0; ci < conjuncts.Count; ci++)
+        {
+            if (pkBoundUsed[ci]) continue;
+
+            int leavesBefore = allLeaves.Count;
+            if (DryRunPkStream(conjuncts[ci], table, scanProjection, indexes, allLeaves, ci))
+            {
+                consumableConjuncts.Add(ci);
+            }
+            else
+            {
+                // Roll back any leaves added during the failed dry-run.
+                if (allLeaves.Count > leavesBefore)
+                    allLeaves.RemoveRange(leavesBefore, allLeaves.Count - leavesBefore);
+                residualConjunctIdxs.Add(ci);
+            }
+        }
+
+        if (consumableConjuncts.Count == 0)
+            return null;
+
+        // Phase 3: defer to single-index scan when the multi-index plan would be a single
+        // bare leaf (TryBuildIndexScan handles that case better — no IPkStream indirection,
+        // no MultiIndexScan wrapper overhead).
+        if (allLeaves.Count < 2)
+            return null;
+
+        // Phase 3.5: same-column-OR-vs-selective-conjunct deferral (Option C).
+        // Detect the regression shape: exactly two consumable conjuncts, one being a
+        // same-column OR / IN-list (≥2 leaves all on the same column), the other a
+        // single-leaf equality on a different column. In that case the single-leaf
+        // conjunct is a strictly better driver — defer to TryBuildIndexScan, which
+        // will use it as the seek and apply the same-col OR/IN as a residual filter.
+        // This is the documented 12× regression (see
+        // benchmark_recursive_multi_index_2026_04_11.md).
+        if (ShouldDeferToSelectiveSingleIndex(consumableConjuncts, allLeaves))
+            return null;
+
+        // Phase 4: composite-preference guard. If any single index covers ≥2 of the
+        // collected leaf columns as a contiguous leading prefix, the composite single-
+        // index path beats the recursive plan. Defer to TryBuildIndexScan.
+        if (CompositeCoversTwoOrMoreLeaves(indexes, allLeaves, table))
+            return null;
+
+        // Phase 5: build the IPkStream tree for real. Cursors get created here. We're
+        // committed at this point — guards have already passed.
+        var consumableStreams = new IPkStream[consumableConjuncts.Count];
+        for (int k = 0; k < consumableConjuncts.Count; k++)
+        {
+            consumableStreams[k] = BuildPkStream(
+                conjuncts[consumableConjuncts[k]], table, scanProjection, indexes, tx)!;
+        }
+
+        IPkStream rootStream = consumableStreams.Length == 1
+            ? consumableStreams[0]
+            : new IndexIntersectionPkStream(consumableStreams);
+
+        // Phase 6: matched-predicate tree for EXPLAIN — top-level conjuncts that the
+        // operator consumed (PK bounds + everything that became a leaf).
+        var matched = new List<SqlExpr>();
+        for (int ci = 0; ci < conjuncts.Count; ci++)
+            if (pkBoundUsed[ci] || consumableConjuncts.Contains(ci))
+                matched.Add(conjuncts[ci]);
+        var boundPredicate = matched.Count > 0 ? HeuristicOptimizer.CombineAnd(matched) : null;
+
+        // Phase 7: wrap the root stream in MultiIndexScan and a residual Filter (if any).
+        var op = new Indexes.MultiIndexScan(
+            rootStream,
+            table,
+            tx,
+            pkLowerBoundInclusive: pkRangeBounds.Lower,
+            pkUpperBoundExclusive: pkRangeBounds.Upper,
+            boundPredicate: boundPredicate);
+
+        IDbEnumerator result = op;
+        if (residualConjunctIdxs.Count > 0)
+        {
+            var residuals = new List<SqlExpr>(residualConjunctIdxs.Count);
+            foreach (var ci in residualConjunctIdxs)
+                residuals.Add(conjuncts[ci]);
+            var residual = HeuristicOptimizer.CombineAnd(residuals);
+            var resolved = ResolveColumns(residual, op.Projection);
+            result = new Filter(op, resolved);
+        }
+
+        // Provided order: PK ascending (the IPkStream tree emits PKs in order, and
+        // MultiIndexScan does one bookmark lookup per PK in that order).
+        var sortKeys = BuildPkSortKeys(table);
+        return (result, sortKeys);
+    }
+
+    /// <summary>
+    /// Compact representation of a single leaf in a hypothetical IPkStream tree —
+    /// used by the dry-run / guard phase before any cursors are created.
+    /// <see cref="ConjunctIdx"/> tracks which top-level WHERE conjunct produced this
+    /// leaf, so the structural deferral guards (Phase 2.5) can group leaves by their
+    /// originating conjunct without re-parsing the AST.
+    /// </summary>
+    private readonly record struct MultiIndexLeaf(
+        int ConjunctIdx, int ColumnIdx, IndexSchema Index, DbValue Value);
+
+    /// <summary>
+    /// Dry-run pass that walks <paramref name="expr"/> as if building an IPkStream tree.
+    /// Returns true if the entire subtree is consumable (every leaf is a
+    /// <c>col = literal</c> on a single-column secondary index, every internal node is an
+    /// AND or OR). Appends the discovered leaves to <paramref name="leaves"/> tagged with
+    /// <paramref name="conjunctIdx"/> so the structural guards can group them by
+    /// originating top-level conjunct. PK column references inside the subtree cause it
+    /// to bail (TODO: lift this restriction by introducing a PkSeekPkStream leaf).
+    /// </summary>
+    private bool DryRunPkStream(
+        SqlExpr expr,
+        TableSchema table,
+        Projection projection,
+        List<IndexSchema> indexes,
+        List<MultiIndexLeaf> leaves,
+        int conjunctIdx)
+    {
+        if (expr is BinaryExpr { Op: BinaryOp.And } binAnd)
+        {
+            var children = HeuristicOptimizer.SplitAnd(binAnd);
+            if (children.Count < 2) return false;
+            int before = leaves.Count;
+            foreach (var child in children)
+            {
+                if (!DryRunPkStream(child, table, projection, indexes, leaves, conjunctIdx))
+                {
+                    if (leaves.Count > before)
+                        leaves.RemoveRange(before, leaves.Count - before);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (expr is BinaryExpr { Op: BinaryOp.Or } binOr)
+        {
+            var children = HeuristicOptimizer.SplitOr(binOr);
+            if (children.Count < 2) return false;
+            int before = leaves.Count;
+            foreach (var child in children)
+            {
+                if (!DryRunPkStream(child, table, projection, indexes, leaves, conjunctIdx))
+                {
+                    if (leaves.Count > before)
+                        leaves.RemoveRange(before, leaves.Count - before);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Leaf candidate: col = literal on a non-PK column with a single-column secondary index.
+        if (TryExtractSecondaryIndexEquality(expr, table, projection, out int colIdx, out var value))
+        {
+            // Find a single-column index covering this column.
+            for (int ii = 0; ii < indexes.Count; ii++)
+            {
+                indexes[ii].EnsureEncodingMetadata(table);
+                var idxCols = indexes[ii].ResolvedColumnIndices!;
+                if (idxCols.Length == 1 && idxCols[0] == colIdx)
+                {
+                    // Date-affinity coercion mirrors TryBuildIndexScan / the original method.
+                    if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
+                        value.Type == DbType.Text &&
+                        DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+                    {
+                        value = DbValue.Integer(ticks);
+                    }
+                    leaves.Add(new MultiIndexLeaf(conjunctIdx, colIdx, indexes[ii], value));
+                    return true;
+                }
+            }
+        }
+
+        // IN-list candidate: col IN (lit1, ..., litN) with a single-column secondary
+        // index on col. Each element becomes a separate leaf — treated as syntactic
+        // sugar for col=lit1 OR col=lit2 OR ... NOT IN can never narrow the result set
+        // and is left as a residual filter.
+        if (TryExtractSecondaryIndexInList(expr, table, projection, out int inColIdx, out var inValues))
+        {
+            for (int ii = 0; ii < indexes.Count; ii++)
+            {
+                indexes[ii].EnsureEncodingMetadata(table);
+                var idxCols = indexes[ii].ResolvedColumnIndices!;
+                if (idxCols.Length == 1 && idxCols[0] == inColIdx)
+                {
+                    bool dateAffinity = TypeAffinity.IsDateAffinity(table.Columns[inColIdx].TypeName);
+                    for (int v = 0; v < inValues.Length; v++)
+                    {
+                        var iv = inValues[v];
+                        if (dateAffinity && iv.Type == DbType.Text &&
+                            DateTimeHelper.TryParseToTicks(iv.AsText().Span, out long ticks))
+                        {
+                            iv = DbValue.Integer(ticks);
+                            inValues[v] = iv;
+                        }
+                        leaves.Add(new MultiIndexLeaf(conjunctIdx, inColIdx, indexes[ii], iv));
+                    }
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Materializes the IPkStream subtree corresponding to <paramref name="expr"/>. Must
+    /// only be called after <see cref="DryRunPkStream"/> succeeded — guarantees we don't
+    /// half-build a tree and leak cursors. Mirrors the dry-run shape exactly.
+    /// </summary>
+    private IPkStream? BuildPkStream(
+        SqlExpr expr,
+        TableSchema table,
+        Projection projection,
+        List<IndexSchema> indexes,
+        ReadOnlyTransaction tx)
+    {
+        if (expr is BinaryExpr { Op: BinaryOp.And } binAnd)
+        {
+            var children = HeuristicOptimizer.SplitAnd(binAnd);
+            var built = new IPkStream[children.Count];
+            for (int i = 0; i < children.Count; i++)
+                built[i] = BuildPkStream(children[i], table, projection, indexes, tx)!;
+            return new IndexIntersectionPkStream(built);
+        }
+
+        if (expr is BinaryExpr { Op: BinaryOp.Or } binOr)
+        {
+            var children = HeuristicOptimizer.SplitOr(binOr);
+            var built = new IPkStream[children.Count];
+            for (int i = 0; i < children.Count; i++)
+                built[i] = BuildPkStream(children[i], table, projection, indexes, tx)!;
+            return new IndexUnionPkStream(built);
+        }
+
+        // IN-list leaf — N-way union over the same single-column index.
+        if (TryExtractSecondaryIndexInList(expr, table, projection, out int inColIdx, out var inValues))
+        {
+            IndexSchema? inMatch = null;
+            for (int ii = 0; ii < indexes.Count; ii++)
+            {
+                indexes[ii].EnsureEncodingMetadata(table);
+                var idxCols = indexes[ii].ResolvedColumnIndices!;
+                if (idxCols.Length == 1 && idxCols[0] == inColIdx)
+                {
+                    inMatch = indexes[ii];
+                    break;
+                }
+            }
+            if (inMatch is null) return null;
+
+            bool inDateAffinity = TypeAffinity.IsDateAffinity(table.Columns[inColIdx].TypeName);
+            var leafStreams = new IPkStream[inValues.Length];
+            for (int v = 0; v < inValues.Length; v++)
+            {
+                var iv = inValues[v];
+                if (inDateAffinity && iv.Type == DbType.Text &&
+                    DateTimeHelper.TryParseToTicks(iv.AsText().Span, out long inTicks))
+                {
+                    iv = DbValue.Integer(inTicks);
+                }
+                var prefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
+                    inMatch.Oid,
+                    new[] { iv },
+                    new[] { inMatch.ResolvedColumnTypes![0] });
+                leafStreams[v] = new IndexLeafPkStream(tx.CreateCursor(), inMatch, prefix, expr);
+            }
+            return leafStreams.Length == 1
+                ? leafStreams[0]
+                : new IndexUnionPkStream(leafStreams);
+        }
+
+        // Leaf — must succeed because the dry-run already validated.
+        if (!TryExtractSecondaryIndexEquality(expr, table, projection, out int colIdx, out var value))
+            return null;
+
+        IndexSchema? match = null;
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length == 1 && idxCols[0] == colIdx)
+            {
+                match = indexes[ii];
+                break;
+            }
+        }
+        if (match is null) return null;
+
+        if (TypeAffinity.IsDateAffinity(table.Columns[colIdx].TypeName) &&
+            value.Type == DbType.Text &&
+            DateTimeHelper.TryParseToTicks(value.AsText().Span, out long ticks))
+        {
+            value = DbValue.Integer(ticks);
+        }
+
+        var seekPrefix = Indexes.IndexKeyEncoder.EncodeSeekPrefix(
+            match.Oid,
+            new[] { value },
+            new[] { match.ResolvedColumnTypes![0] });
+
+        return new IndexLeafPkStream(tx.CreateCursor(), match, seekPrefix, expr);
+    }
+
+    /// <summary>
+    /// Same-column-OR-vs-selective-conjunct guard (Option C). Returns true when we
+    /// should defer to <see cref="TryBuildIndexScan"/> instead of building the recursive
+    /// multi-index plan, because the single-leaf side is a strictly better driver and
+    /// the recursive plan would walk far more index entries than necessary.
+    /// <para>
+    /// Fires only on this exact structural shape: exactly two consumable conjuncts,
+    /// one producing N≥2 leaves all on the same column (a same-column OR or an
+    /// IN-list), the other producing exactly one leaf on a different column. The fix
+    /// is provably safe because the deferral target — single-index seek on the
+    /// selective conjunct + residual filter on the same-column-OR conjunct — is the
+    /// plan the pre-recursive code already picked when it bailed out.
+    /// </para>
+    /// <para>
+    /// Does NOT fire when both sides are single equalities (the recursive intersection
+    /// is correct), when both sides are same-column ORs (no obviously better driver),
+    /// or when there are 3+ consumable conjuncts (deferral target unclear).
+    /// </para>
+    /// </summary>
+    private static bool ShouldDeferToSelectiveSingleIndex(
+        List<int> consumableConjuncts, List<MultiIndexLeaf> leaves)
+    {
+        if (consumableConjuncts.Count != 2) return false;
+
+        int firstCi = consumableConjuncts[0];
+        int secondCi = consumableConjuncts[1];
+
+        // Group leaves by their originating top-level conjunct. Track per-conjunct
+        // count, the column of the first leaf, and whether all leaves share that column.
+        int firstCount = 0, secondCount = 0;
+        int firstColumn = -1, secondColumn = -1;
+        bool firstAllSameColumn = true, secondAllSameColumn = true;
+
+        for (int li = 0; li < leaves.Count; li++)
+        {
+            var leaf = leaves[li];
+            if (leaf.ConjunctIdx == firstCi)
+            {
+                if (firstCount == 0) firstColumn = leaf.ColumnIdx;
+                else if (leaf.ColumnIdx != firstColumn) firstAllSameColumn = false;
+                firstCount++;
+            }
+            else if (leaf.ConjunctIdx == secondCi)
+            {
+                if (secondCount == 0) secondColumn = leaf.ColumnIdx;
+                else if (leaf.ColumnIdx != secondColumn) secondAllSameColumn = false;
+                secondCount++;
+            }
+        }
+
+        if (firstColumn == secondColumn) return false;
+
+        bool firstIsSameColOr = firstCount >= 2 && firstAllSameColumn;
+        bool secondIsSingleLeaf = secondCount == 1;
+        bool secondIsSameColOr = secondCount >= 2 && secondAllSameColumn;
+        bool firstIsSingleLeaf = firstCount == 1;
+
+        return (firstIsSameColOr && secondIsSingleLeaf)
+            || (secondIsSameColOr && firstIsSingleLeaf);
+    }
+
+    /// <summary>
+    /// Composite-preference guard for the recursive multi-index path. If any single index
+    /// covers ≥2 of the collected leaves as a contiguous leading prefix, the composite
+    /// single-index path beats the recursive plan — defer to <see cref="TryBuildIndexScan"/>.
+    /// </summary>
+    private static bool CompositeCoversTwoOrMoreLeaves(
+        List<IndexSchema> indexes,
+        List<MultiIndexLeaf> leaves,
+        TableSchema table)
+    {
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length < 2) continue;
+
+            int matched = 0;
+            for (int pos = 0; pos < idxCols.Length; pos++)
+            {
+                bool hit = false;
+                for (int k = 0; k < leaves.Count; k++)
+                {
+                    if (leaves[k].ColumnIdx == idxCols[pos]) { hit = true; break; }
+                }
+                if (!hit) break; // contiguous leading prefix only
+                matched++;
+            }
+            if (matched >= 2) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Classifies each conjunct as either "PK bound" (folds into the byte bounds returned
+    /// here) or "not PK bound" (flag stays false). PK bound conjuncts are removed from
+    /// intersection consideration but still applied as a pre-bookmark filter.
+    /// </summary>
+    private static (byte[]? Lower, byte[]? Upper) ExtractPkRangeBounds(
+        TableSchema table, List<SqlExpr> conjuncts, Projection projection, bool[] pkBoundUsed)
+    {
+        var pkIndices = table.PkColumnIndices;
+        var pkTypes = table.PkColumnTypes;
+        if (pkIndices.Length == 0) return (null, null);
+
+        // For now, only handle equality/range on the first PK column. A multi-column
+        // composite PK prefix is already covered by TryBuildPrimaryKeyScan when it runs;
+        // here we only need bounds that can be computed from the first PK column.
+        int pkCol = pkIndices[0];
+        var pkColName = table.Columns[pkCol].Name;
+        var pkType = pkTypes[0];
+
+        DbValue? eqValue = null;
+        DbValue? rangeLow = null;
+        bool rangeLowInclusive = true;
+        DbValue? rangeHigh = null;
+        bool rangeHighInclusive = false;
+
+        for (int ci = 0; ci < conjuncts.Count; ci++)
+        {
+            if (TryExtractEquality(conjuncts[ci], pkColName, projection, out var eqVal))
+            {
+                if (!CanEncodeAsPkValue(eqVal, pkType)) continue;
+                eqValue = eqVal;
+                pkBoundUsed[ci] = true;
+                continue;
+            }
+            if (TryExtractComparison(conjuncts[ci], pkColName, projection, out var op, out var rhs))
+            {
+                if (!CanEncodeAsPkValue(rhs, pkType)) continue;
+                switch (op)
+                {
+                    case BinaryOp.GreaterEqual:
+                        if (rangeLow is null || DbValueComparer.Compare(rhs, rangeLow.Value) > 0)
+                        { rangeLow = rhs; rangeLowInclusive = true; }
+                        pkBoundUsed[ci] = true;
+                        break;
+                    case BinaryOp.GreaterThan:
+                        if (rangeLow is null || DbValueComparer.Compare(rhs, rangeLow.Value) >= 0)
+                        { rangeLow = rhs; rangeLowInclusive = false; }
+                        pkBoundUsed[ci] = true;
+                        break;
+                    case BinaryOp.LessEqual:
+                        if (rangeHigh is null || DbValueComparer.Compare(rhs, rangeHigh.Value) < 0)
+                        { rangeHigh = rhs; rangeHighInclusive = true; }
+                        pkBoundUsed[ci] = true;
+                        break;
+                    case BinaryOp.LessThan:
+                        if (rangeHigh is null || DbValueComparer.Compare(rhs, rangeHigh.Value) <= 0)
+                        { rangeHigh = rhs; rangeHighInclusive = false; }
+                        pkBoundUsed[ci] = true;
+                        break;
+                }
+            }
+        }
+
+        // If we have a full equality, convert to point bounds and ignore the range.
+        if (eqValue is { } ev)
+        {
+            var low = RowKeyEncoder.Encode(table.Oid, new[] { ev }, new[] { pkType });
+            var high = LexSuccessor(low);
+            return (low, high);
+        }
+
+        if (rangeLow is null && rangeHigh is null)
+            return (null, null);
+
+        var prefix = RowKeyEncoder.EncodeTablePrefix(table.Oid);
+        byte[]? lowerBound = null;
+        byte[]? upperBound = null;
+
+        if (rangeLow is { } rl)
+            lowerBound = AppendEncodedColumn(prefix, rl, pkType, rangeLowInclusive);
+        if (rangeHigh is { } rh)
+            upperBound = AppendEncodedColumnUpper(prefix, rh, pkType, rangeHighInclusive);
+
+        return (lowerBound, upperBound);
+    }
+
+    /// <summary>
+    /// Extracts a <c>col = literal</c> shape where <c>col</c> is a non-PK column covered
+    /// by at least one secondary index on <paramref name="table"/>. Returns the column's
+    /// index in the table's column array plus the literal value.
+    /// </summary>
+    /// <summary>
+    /// Recognizes <c>col IN (lit1, lit2, ..., litN)</c> over a non-PK column with at
+    /// least one secondary index whose leading column is <c>col</c>. Mirrors
+    /// <see cref="TryExtractSecondaryIndexEquality"/>: rejects PK columns, requires all
+    /// list elements to be literals (so we can encode seek prefixes at plan time), and
+    /// rejects NOT IN (which can never narrow the search). Returns the column index and
+    /// the values; the caller turns each value into a leaf stream wrapped in
+    /// <see cref="IndexUnionPkStream"/>.
+    /// </summary>
+    private bool TryExtractSecondaryIndexInList(
+        SqlExpr expr, TableSchema table, Projection projection,
+        out int columnIdx, out DbValue[] values)
+    {
+        columnIdx = -1;
+        values = Array.Empty<DbValue>();
+
+        if (expr is not InExpr { Negated: false } inExpr) return false;
+        if (inExpr.Operand is not ColumnRefExpr colRef) return false;
+        if (inExpr.Target is not InExprList list) return false;
+        if (list.Expressions.Length == 0) return false;
+
+        // All elements must be literal-resolvable; otherwise we can't encode seek
+        // prefixes at plan time.
+        var extracted = new DbValue[list.Expressions.Length];
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            var e = list.Expressions[i];
+            if (e is ResolvedLiteralExpr rl) extracted[i] = rl.Value;
+            else if (e is LiteralExpr lit) extracted[i] = ExprEvaluator.EvaluateLiteral(lit);
+            else return false;
+
+            // NULL elements never participate in equality — drop the entire candidate
+            // because (a) NULL would produce a malformed seek prefix, and (b) IN with
+            // any NULL element flips the SQL semantics; safer to leave it as a residual
+            // filter for the evaluator's three-valued logic.
+            if (extracted[i].IsNull) return false;
+        }
+
+        // Resolve column to index. Reject PK columns (handled by TryBuildPrimaryKeyScan
+        // or as filter-only PK bounds in this method's caller).
+        for (int i = 0; i < table.Columns.Length; i++)
+        {
+            if (string.Equals(table.Columns[i].Name, colRef.Column, StringComparison.OrdinalIgnoreCase))
+            {
+                if (table.Columns[i].IsPrimaryKey) return false;
+                columnIdx = i;
+                break;
+            }
+        }
+        if (columnIdx < 0) return false;
+
+        // Must be covered by at least one secondary index whose leading column is
+        // this column.
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        bool covered = false;
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length > 0 && idxCols[0] == columnIdx)
+            {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) return false;
+
+        values = extracted;
+        return true;
+    }
+
+    private bool TryExtractSecondaryIndexEquality(
+        SqlExpr expr, TableSchema table, Projection projection, out int columnIdx, out DbValue value)
+    {
+        columnIdx = -1;
+        value = default;
+
+        // Identify the column name on the LHS or RHS (swap).
+        string? colName = null;
+        if (expr is BinaryExpr { Op: BinaryOp.Equal } eq)
+        {
+            if (eq.Left is ColumnRefExpr cl && (eq.Right is LiteralExpr or ResolvedLiteralExpr))
+                colName = cl.Column;
+            else if (eq.Right is ColumnRefExpr cr && (eq.Left is LiteralExpr or ResolvedLiteralExpr))
+                colName = cr.Column;
+        }
+        if (colName is null) return false;
+
+        // Resolve to column index.
+        for (int i = 0; i < table.Columns.Length; i++)
+        {
+            if (string.Equals(table.Columns[i].Name, colName, StringComparison.OrdinalIgnoreCase))
+            {
+                // Exclude PK columns — PK predicates are handled by TryBuildPrimaryKeyScan
+                // or as filter-only bounds, never as intersection inputs.
+                if (table.Columns[i].IsPrimaryKey) return false;
+                columnIdx = i;
+                break;
+            }
+        }
+        if (columnIdx < 0) return false;
+
+        // Must be covered by at least one secondary index (leading column).
+        var indexes = new List<IndexSchema>();
+        _schema.GetIndexesForTable(table.Oid, indexes);
+        bool coveredByIndex = false;
+        for (int ii = 0; ii < indexes.Count; ii++)
+        {
+            indexes[ii].EnsureEncodingMetadata(table);
+            var idxCols = indexes[ii].ResolvedColumnIndices!;
+            if (idxCols.Length > 0 && idxCols[0] == columnIdx)
+            {
+                coveredByIndex = true;
+                break;
+            }
+        }
+        if (!coveredByIndex) return false;
+
+        // Extract the literal value (either side of the equality).
+        if (!TryExtractEquality(expr, colName, projection, out value))
+            return false;
+
+        return true;
+    }
+
+
+    /// <summary>
+    /// Builds the PK-ASC sort keys for a table — used by multi-index scans to expose
+    /// their natural output order to the planner's ORDER BY elision path.
+    /// </summary>
+    private static SortKey[] BuildPkSortKeys(TableSchema table)
+    {
+        var pkIndices = table.PkColumnIndices;
+        var keys = new SortKey[pkIndices.Length];
+        for (int i = 0; i < pkIndices.Length; i++)
+            keys[i] = new SortKey(pkIndices[i], SortOrder.Asc);
+        return keys;
+    }
+
+    /// <summary>
     /// Tries to build an IndexOnlyScan for a ProjectPlan → FilterPlan → ScanPlan pattern.
     /// Returns null if no index can satisfy the query without a table lookup.
     /// </summary>
@@ -1820,6 +2931,22 @@ public sealed class QueryPlanner
                 return CollectColumnNames(b.Left, names) && CollectColumnNames(b.Right, names);
             case UnaryExpr u:
                 return CollectColumnNames(u.Operand, names);
+            case BetweenExpr bt:
+                return CollectColumnNames(bt.Operand, names)
+                    && CollectColumnNames(bt.Low, names)
+                    && CollectColumnNames(bt.High, names);
+            case InExpr inExpr:
+                if (!CollectColumnNames(inExpr.Operand, names)) return false;
+                if (inExpr.Target is not InExprList inList) return false;
+                for (int i = 0; i < inList.Expressions.Length; i++)
+                    if (!CollectColumnNames(inList.Expressions[i], names)) return false;
+                return true;
+            case IsExpr isExpr:
+                return CollectColumnNames(isExpr.Left, names) && CollectColumnNames(isExpr.Right, names);
+            case NullTestExpr nullTest:
+                return CollectColumnNames(nullTest.Operand, names);
+            case CastExpr cast:
+                return CollectColumnNames(cast.Operand, names);
             case LiteralExpr or ResolvedLiteralExpr:
                 return true;
             default:
@@ -2195,10 +3322,27 @@ public sealed class QueryPlanner
                 Low = ResolveColumns(between.Low, projection),
                 High = ResolveColumns(between.High, projection),
             },
+            InExpr inExpr => ResolveInColumns(inExpr, projection),
             CastExpr cast => cast with { Operand = ResolveColumns(cast.Operand, projection) },
             FunctionCallExpr func => ResolveFunctionColumns(func, projection),
             _ => expr,
         };
+    }
+
+    private InExpr ResolveInColumns(InExpr inExpr, Projection projection)
+    {
+        var operand = ResolveColumns(inExpr.Operand, projection);
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = ResolveColumns(list.Expressions[i], projection);
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     /// <summary>
@@ -2274,6 +3418,8 @@ public sealed class QueryPlanner
                     return new ValueTask<SqlExpr>(between with { Operand = vTask.Result, Low = loTask.Result, High = hiTask.Result });
                 return ResolveBetweenAsync(between, vTask, loTask, hiTask);
             }
+            case InExpr inExpr:
+                return ResolveInAsync(inExpr, projection, tx);
             case CastExpr cast:
             {
                 var opTask = ResolveColumnsAsync(cast.Operand, projection, tx);
@@ -2317,6 +3463,22 @@ public sealed class QueryPlanner
         var lo = loTask.IsCompletedSuccessfully ? loTask.Result : await loTask.ConfigureAwait(false);
         var hi = hiTask.IsCompletedSuccessfully ? hiTask.Result : await hiTask.ConfigureAwait(false);
         return between with { Operand = val, Low = lo, High = hi };
+    }
+
+    private async ValueTask<SqlExpr> ResolveInAsync(InExpr inExpr, Projection projection, ReadOnlyTransaction tx)
+    {
+        var operand = await ResolveColumnsAsync(inExpr.Operand, projection, tx).ConfigureAwait(false);
+        if (inExpr.Target is not InExprList list)
+            return ReferenceEquals(operand, inExpr.Operand) ? inExpr : inExpr with { Operand = operand };
+
+        var elements = new SqlExpr[list.Expressions.Length];
+        bool changed = !ReferenceEquals(operand, inExpr.Operand);
+        for (int i = 0; i < list.Expressions.Length; i++)
+        {
+            elements[i] = await ResolveColumnsAsync(list.Expressions[i], projection, tx).ConfigureAwait(false);
+            if (!ReferenceEquals(elements[i], list.Expressions[i])) changed = true;
+        }
+        return changed ? new InExpr(operand, inExpr.Negated, new InExprList(elements)) : inExpr;
     }
 
     private async ValueTask<SqlExpr> ResolveFunctionColumnsAsync(
